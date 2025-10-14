@@ -4,3 +4,7 @@
 .ipynb_checkpoints
 data/
 .git/
+.Rproj.user
+.RData
+.Rhistory
+.Rproj
