@@ -20,6 +20,7 @@ pd.set_option('display.width', 1000)
 var_order = [
     'DEMANDAPK',
     'FECHADEMANDA',
+    'PATIENTID',
     'IDTARJETASANITARIA',
     'DNIAFECTADO',
     'DNI',
@@ -86,6 +87,148 @@ var_order = [
     'NODO_TIPIFICACION_ID_PK',
     'FK_STRIA_PK_IMPACTO'
 ]
+
+rename_cols = {
+    "DEMANDAPK": "demandpk",
+    "FECHADEMANDA": "demand_date",
+    "PATIENTID": "patientid",
+    "IDTARJETASANITARIA": "healthcard_id",
+    "DNI": "national_id",
+    "NOMBRE_APELLIDOS": "full_name",
+    "EDAD": "age",
+    "TIPOEDAD": "age_type",
+    "EDAD_llamada": "call_age",
+    "TIPOEDAD_llamada": "call_age_type",
+    "SEXO": "sex",
+    "FNACIMIENTO": "birth_date",
+    "IDDEMANDA": "demand_id",
+    "IDRECURSO": "resource_id",
+    "IDASISTENCIA": "assistance_id",
+    "IDALERTANTE": "alert_receiver",
+    "COMENTARIO": "comment",
+    "IDTIPODEMANDA1": "demand_type_1",
+    "IDTIPODEMANDA2": "demand_type_2",
+    "IDTIPODEMANDA3": "demand_type_3",
+    "IDMOTIVOEXCLUSION": "exclusion_reason_id",
+    "IDTIPORECURSO": "resource_type",
+    "IDTIPORECURSOAGR": "resource_group_type_id",
+    "IDCODRESOLUCIONRECURSO": "resource_resolution_code_id",
+    "LTR": "ltr",
+    "CADREC": "cadrec",
+    "IDEMPRESA": "company_id",
+    "MOTIVOLITERAL": "literal_reason",
+    "JUICIOCLINICO1": "icd1",
+    "JUICIOCLINICO2": "icd2",
+    "JUICIOCLINICO3": "icd3",
+    "IDCODIGORESOLUCION": "resolution_code_id",
+    "IDCODRESOLDEMANDA": "demand_resolution_code_id",
+    "IDCODRESOLASISTENCIA": "assistance_resolution_code_id",
+    "IDHCEPES": "hcepes_id",
+    "IDRE": "idre",
+    "IDTARJETACORAZON": "healthcard",
+    "IDTARJETAAIRE": "aircard",
+    "ESHIPERFRECUENTADOR": "is_frequent_user",
+    "ESVULNERABLE": "is_vulnerable",
+    "PRIORIDAD": "priority",
+    "IDHCDM": "hcdm_id",
+    "IDESCENARIO": "location_patient",
+    "HORAENTRADACONTACTO": "contact_entry_time",
+    "HORACONTESTACONTACTO": "contact_answer_time",
+    "HORAACTIVACION": "activation_time",
+    "HORASALIDA": "departure_time",
+    "HORALLEGADA": "arrival_time",
+    "HORACARGA": "load_time",
+    "HORAOPERATIVA": "operative_time",
+    "HORADESTINO": "destination_time",
+    "HORADISPONIBLE": "available_time",
+    "IDPROVINCIA": "province",
+    "DIRIDLOCALIDAD": "address_locality_id",
+    "DIRIDLOCALIDADDEMANDA": "demand_locality_id",
+    "DIRIDPROVINCIAPACIENTE": "patient_province_id",
+    "DIRIDLOCALIDADPACIENTE": "patient_locality_id",
+    "AFEC_LATITUD": "incident_latitude",
+    "AFEC_LONGITUD": "incident_longitude",
+    "ALER_COORDX": "alert_coord_x",
+    "ALER_LONGITUD": "alert_longitude",
+    "ALER_OORDY": "alert_coord_y",
+    "DIRDESTINOIDPROVINCIARECURSO": "resource_dest_province_id",
+    "DIRDESTINOIDLOCALIDADRECURSO": "resource_dest_locality_id",
+    "DIRDESTINOCALLERECURSO": "resource_dest_street",
+    "NODO_TIPIFICACION_ID_PK": "node_typification_pk_id",
+    "FK_STRIA_PK_IMPACTO": "impact_fk_stria_pk"
+}
+
+dtype_cols = {
+    "demandpk": "Int32",
+    "demand_date": "datetime64[ns]",
+    "patientid": "object",
+    "healthcard_id": "object",
+    "national_id": "object",
+    "full_name": "object",
+    "age": "Int16",
+    "age_type": "category",
+    "call_age": "float64",
+    "call_age_type": "category",
+    "sex": "category",
+    "birth_date": "datetime64[ns]",
+    "demand_id": "Int32",
+    "resource_id": "object",
+    "assistance_id": "object",
+    "alert_receiver": "category",
+    "comment": "object",
+    "demand_type_1": "Int8",
+    "demand_type_2": "float64",
+    "demand_type_3": "object",
+    "exclusion_reason_id": "category",
+    "resource_type": "object",
+    "resource_group_type_id": "object",
+    "resource_resolution_code_id": "object",
+    "ltr": "object",
+    "cadrec": "object",
+    "company_id": "object",
+    "literal_reason": "object",
+    "icd1": "object",
+    "icd2": "object",
+    "icd3": "object",
+    "resolution_code_id": "object",
+    "demand_resolution_code_id": "category",
+    "assistance_resolution_code_id": "category",
+    "hcepes_id": "object",
+    "idre": "object",
+    "healthcard": "category",
+    "aircard": "category",
+    "is_frequent_user": "category",
+    "is_vulnerable": "category",
+    "priority": "category",
+    "hcdm_id": "object",
+    "location_patient": "category",
+    "contact_entry_time": "datetime64[ns]",
+    "contact_answer_time": "datetime64[ns]",
+    "activation_time": "datetime64[ns]",
+    "departure_time": "datetime64[ns]",
+    "arrival_time": "datetime64[ns]",
+    "load_time": "datetime64[ns]",
+    "operative_time": "datetime64[ns]",
+    "destination_time": "datetime64[ns]",
+    "available_time": "datetime64[ns]",
+    "province": "category",
+    "address_locality_id": "float64",
+    "demand_locality_id": "float64",
+    "patient_province_id": "float64",
+    "patient_locality_id": "float64",
+    "incident_latitude": "float64",
+    "incident_longitude": "float64",
+    "alert_coord_x": "float64",
+    "alert_longitude": "float64",
+    "alert_coord_y": "float64",
+    "resource_dest_province_id": "category",
+    "resource_dest_locality_id": "float64",
+    "resource_dest_street": "object",
+    "node_typification_pk_id": "category",
+    "impact_fk_stria_pk": "category"
+}
+
+
 
 # Functions
 ## Function to extracts information on nº of id rows from a df
@@ -160,6 +303,12 @@ def reorder_dataframe(df: pd.DataFrame, column_order: list = var_order) -> pd.Da
     # Return DataFrame with only the ordered existing columns
     return df.reindex(columns=existing_columns)
 
+## Renames DataFrame columns based on a predefined translation dictionary.
+def rename_columns(df: pd.DataFrame,
+                   rename_dict: dict = rename_cols) -> pd.DataFrame:
+
+    existing = {k: v for k, v in rename_dict.items() if k in df.columns}
+    return df.rename(columns=existing)
 
 ## Reduce the size of a dataframe depending on a flag.
 def df_pipeline_test(df: pd.DataFrame, flag: str) -> pd.DataFrame:
@@ -204,79 +353,15 @@ def count_rows_all_none(df: pd.DataFrame, columns_to_check: list) -> int:
 
 
 # Function for converting data types to reduce memory for computation
-def transform_column_dtypes(df: pd.DataFrame):
-    type_dict = {
-        "DEMANDAPK": "int64",
-        "FECHADEMANDA": "int64",
-        "IDTARJETASANITARIA": "object",
-        "DNI": "object",
-        "NOMBRE_APELLIDOS": "object",
-        "EDAD": "float64",
-        "TIPOEDAD": "object",
-        "EDAD_llamada": "float64",
-        "TIPOEDAD_llamada": "float64",
-        "SEXO": "object",
-        "FNACIMIENTO": "object",
-        "IDDEMANDA": "object",
-        "IDRECURSO": "object",
-        "IDASISTENCIA": "object",
-        "IDALERTANTE": "object",
-        "COMENTARIO": "object",
-        "IDTIPODEMANDA1": "float64",
-        "IDTIPODEMANDA2": "float64",
-        "IDTIPODEMANDA3": "object",
-        "IDMOTIVOEXCLUSION": "object",
-        "IDTIPORECURSO": "object",
-        "IDTIPORECURSOAGR": "object",
-        "IDCODRESOLUCIONRECURSO": "object",
-        "LTR": "object",
-        "CADREC": "object",
-        "IDEMPRESA": "object",
-        "MOTIVOLITERAL": "object",
-        "JUICIOCLINICO1": "object",
-        "JUICIOCLINICO2": "object",
-        "JUICIOCLINICO3": "object",
-        "IDCODIGORESOLUCION": "object",
-        "IDCODRESOLDEMANDA": "object",
-        "IDCODRESOLASISTENCIA": "object",
-        "IDHCEPES": "object",
-        "IDRE": "object",
-        "IDTARJETACORAZON": "object",
-        "IDTARJETAAIRE": "object",
-        "ESHIPERFRECUENTADOR": "Int64",
-        "ESVULNERABLE": "float64",
-        "PRIORIDAD": "object",
-        "IDHCDM": "object",
-        "IDESCENARIO": "object",
-        "HORAENTRADACONTACTO": "object",
-        "HORACONTESTACONTACTO": "object",
-        "HORAACTIVACION": "object",
-        "HORASALIDA": "object",
-        "HORALLEGADA": "object",
-        "HORACARGA": "object",
-        "HORAOPERATIVA": "object",
-        "HORADESTINO": "object",
-        "HORADISPONIBLE": "object",
-        "IDPROVINCIA": "int64",
-        "DIRIDLOCALIDAD": "float64",
-        "DIRIDLOCALIDADDEMANDA": "float64",
-        "DIRIDPROVINCIAPACIENTE": "float64",
-        "DIRIDLOCALIDADPACIENTE": "float64",
-        "AFEC_LATITUD": "float64",
-        "AFEC_LONGITUD": "float64",
-        "ALER_COORDX": "float64",
-        "ALER_LONGITUD": "float64",
-        "ALER_OORDY": "float64",
-        "DIRDESTINOIDPROVINCIARECURSO": "float64",
-        "DIRDESTINOIDLOCALIDADRECURSO": "float64",
-        "DIRDESTINOCALLERECURSO": "object",
-        "NODO_TIPIFICACION_ID_PK": "int64",
-        "FK_STRIA_PK_IMPACTO": "int64"
-}
+def transform_column_dtypes(df: pd.DataFrame, dtype_dict=dtype_cols):
+    """
+    Cast dataframe columns to the specified data types,
+    selecting only columns that exist in the dataframe.
+    """
+    applicable = {col: dtype for col, dtype in dtype_dict.items() if col in df.columns}
+    return df.astype(applicable, errors="ignore")
 
-    return {key: val for key, val in type_dict.items() if key in df.columns}
 
-    vent_df = vent_df.astype(kb.transform_column_dtypes(vent_df))
 
 
 
