@@ -234,7 +234,14 @@ dtype_cols = {
     "resource_dest_locality_id": "float64",
     "resource_dest_street": "object",
     "node_typification_pk_id": "category",
-    "impact_fk_stria_pk": "category"
+    "impact_fk_stria_pk": "category", 
+    "q1": "category",
+    "q2": "category",
+    "q3": "category",
+    "q4": "category",
+    "q5": "category",
+    "q6": "category",
+    "q7": "category"
 }
 
 # Functions
