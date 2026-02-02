@@ -78,6 +78,7 @@ def run_binary_automl_model(
     import os
     import pyarrow.parquet as pq
     import kbase.preprocessing as dp
+    from kbase.config import settings
 
     modelling_cols = [
         "age",
@@ -99,7 +100,7 @@ def run_binary_automl_model(
     ]
 
     df = pq.read_table(
-        os.path.join(dp.source_tables_path, "df_modelling/df_triaje_cleaned.parquet")
+        os.path.join(settings.source_tables_path, settings.triaje_table_cleaned_path)
     ).to_pandas()
 
     selected_cols = [c for c in modelling_cols if c in df.columns]

@@ -2,13 +2,12 @@ import pandas as pd
 import numpy as np
 import os
 import matplotlib.pyplot as plt
-
+from kbase.config import settings
 
 wd = os.getcwd()
 print(f"El directorio de trabajo actual es: {wd}")
 
-source_tables_path = '/opt/datos_compartidos/trIAje/data'
-os.chdir(source_tables_path)
+os.chdir(settings.source_tables_path)
 
 wd = os.getcwd()
 print(f"El directorio de trabajo actual es: {wd}")

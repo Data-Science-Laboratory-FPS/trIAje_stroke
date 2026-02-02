@@ -4,8 +4,14 @@
 .ipynb_checkpoints
 data/
 .git/
+.env
+
+# R specific
 .Rproj.user
 .RData
 .Rhistory
 .Rproj
-.pyc
+
+# Python cache
+__pycache__/
+*.pyc
