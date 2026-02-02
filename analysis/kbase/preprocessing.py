@@ -234,6 +234,7 @@ dtype_cols = {
     "resource_dest_street": "object",
     "node_typification_pk_id": "category",
     "impact_fk_stria_pk": "category", 
+    "triage": "category",
     "q1": "category",
     "q2": "category",
     "q3": "category",
