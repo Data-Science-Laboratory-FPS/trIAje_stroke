@@ -15,36 +15,45 @@ from sklearn.metrics import (
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.inspection import permutation_importance
 import matplotlib.pyplot as plt
+import os
+import pyarrow.parquet as pq
+from typing import Optional, List, Union
 
-
-from typing import Optional, List
-
+import kbase.preprocessing as dp 
+from kbase.config import settings
 
 def run_binary_automl_model(
     cohort_name: str,
     target_column: str,
-    demand_code: Optional[int] = None,
-    time_budget: int = 600,
+    demand_code: Optional[Union[int, List[int]]] = None,
+    triage_value: Optional[int] = None,
+    time_budget: int = 50,
     test_size: float = 0.2,
     seed: int = 42,
     min_age: Optional[int] = None,
-    drop_columns: Optional[List[str]] = None,
+    optimize_metric: Optional[str] = None,
     n_splits_cv: int = 5,
     optimize_beta: int = 2,
     plot_feature_importance: bool = True,
-):
+    use_permutation_importance: bool = False,
+) -> dict:
+
     
     """
     Runs a complete binary classification pipeline using FLAML AutoML.
 
     Parameters
     ----------
-    df : pd.DataFrame
-        Input dataframe (already loaded).
     cohort_name : str
         Name of the cohort (used for logging only).
     target_column : str
         Binary target column.
+    demand_code : Optional[Union[int, List[int]]]
+        If provided, filters df_model to demand_type_1.
+        Can be a single integer or a list of integers (e.g., [36, 58]).
+    triage_value : Optional[int]
+        If provided, filters to triage == triage_value.
+        If triage_value == 0, q1-q7 are removed from the feature set.
     time_budget : int
         FLAML training budget in seconds.
     test_size : float
@@ -52,17 +61,18 @@ def run_binary_automl_model(
     seed : int
         Random seed.
     min_age : Optional[int]
-        Optional age filter (>= min_age).
-    cohort_filter : pd.Series | None
-        Optional boolean mask to define the cohort.
-    drop_columns : Optional[List[str]]
-        Columns to drop before modelling.
+        Optional age filter (>= min_age). If None, no age filtering is applied.
+    optimize_metric : Optional[str]
+        Metric to optimize during training.
     n_splits_cv : int
         Number of CV folds.
     optimize_beta : int
-        Beta for F-beta threshold optimisation (beta > 1 favours recall).
+        Beta for F-beta threshold optimization (beta > 1 favors recall).
     plot_feature_importance : bool
-        Whether to compute and plot permutation importance.
+        Whether to compute and plot feature importance.
+    use_permutation_importance : bool
+        If True, use permutation importance (slower but more accurate).
+        If False, use built-in feature importance from the model (faster).
 
     Returns
     -------
@@ -72,14 +82,18 @@ def run_binary_automl_model(
 
     print(f"=== Running the model for {cohort_name} cohort ===")
 
+    if triage_value is None:
+        print("Triage subset: ALL patients (no triage-based filtering)")
+    elif triage_value == 1:
+        print("Triage subset: WITH structured triage information")
+    elif triage_value == 0:
+        print("Triage subset: WITHOUT structured triage information")
+    else:
+        raise ValueError("triage_value must be None, 0, or 1")
+
     # -----------------------------
     # Data loading & column selection
     # -----------------------------
-    import os
-    import pyarrow.parquet as pq
-    import kbase.preprocessing as dp
-    from kbase.config import settings
-
     modelling_cols = [
         "age",
         "sex",
@@ -90,6 +104,7 @@ def run_binary_automl_model(
         "month",
         "season",
         "year",
+        "triage",
         "q1",
         "q2",
         "q3",
@@ -106,6 +121,7 @@ def run_binary_automl_model(
     selected_cols = [c for c in modelling_cols if c in df.columns]
     df_model = df[selected_cols].copy()
 
+    df_model = dp.transform_column_dtypes(df_model)
 
     # -----------------------------
     # Basic validation
@@ -113,31 +129,70 @@ def run_binary_automl_model(
     if target_column not in df_model.columns:
         raise ValueError(f"Target column '{target_column}' not found in dataframe")
 
+    if "triage" not in df_model.columns:
+        raise ValueError("Required column 'triage' not found in dataframe")
+
     # -----------------------------
-    # Cohort filtering
+    # Cohort & triage filtering
     # -----------------------------
     if demand_code is not None:
         if "demand_type_1" not in df_model.columns:
             raise ValueError("'demand_type_1' column not found but demand_code was provided")
-        df_model = df_model[df_model["demand_type_1"] == demand_code].copy()
+        
+        # Handle both single integer and list of integers
+        if isinstance(demand_code, (list, tuple)):
+            df_model = df_model[df_model["demand_type_1"].isin(demand_code)].copy()
+            print(f"Filtering by demand_type_1 in {demand_code}")
+        else:
+            df_model = df_model[df_model["demand_type_1"] == demand_code].copy()
+            print(f"Filtering by demand_type_1 == {demand_code}")
+
+    if triage_value is not None:
+        df_model = df_model[df_model["triage"] == triage_value].copy()
+
+        # If no triage questions were asked, remove q1-q7 from the feature set
+        if triage_value == 0:
+            q_cols = [f"q{i}" for i in range(1, 8)]
+            df_model = df_model.drop(columns=[c for c in q_cols if c in df_model.columns])
 
     if min_age is not None:
         if "age" not in df_model.columns:
             raise ValueError("'age' column not found but min_age was provided")
         df_model = df_model[df_model["age"] >= min_age].copy()
+        print(f"Filtering by age >= {min_age}")
 
-    if drop_columns is not None:
-        df_model = df_model.drop(columns=drop_columns, errors="ignore")
+    # Drop columns after cohort filtering
+    cols_to_drop = ["demand_type_1"]
+    cols_to_drop = [c for c in cols_to_drop if c in df_model.columns]
+    if cols_to_drop:
+        df_model = df_model.drop(columns=cols_to_drop)
 
-    print(f"Final cohort size: {len(df_model)}")
-    print(df_model[target_column].value_counts(dropna=False))
+    print(f"\nFinal cohort size: {len(df_model)}")
+    print("Outcome: ", df_model[target_column].value_counts(dropna=False), "\n")
+    print(df_model.info())
+
+    if optimize_metric is None:
+        print("\nTraining metric to optimize: FLAML default (auto)")
+    else:
+        print(f"\nTraining metric to optimize: {optimize_metric}\n")
 
     # -----------------------------
     # Train / test split
     # -----------------------------
+
     X = df_model.drop(columns=[target_column])
     y = df_model[target_column]
 
+    # --- Ensure categorical consistency ---
+    # This prevents the 'categorical_feature do not match' error in LightGBM/FLAML
+    categorical_cols = X.select_dtypes(include=['category']).columns
+    
+    for col in categorical_cols:
+        # 1. Convert to string and then back to category to reset the label dictionary
+        # 2. This ensures that X_train and X_test share the exact same internal mapping
+        #    even if one split is missing a specific category value.
+        X[col] = X[col].astype(str).astype('category')
+        
     X_train, X_test, y_train, y_test = train_test_split(
         X,
         y,
@@ -168,7 +223,7 @@ def run_binary_automl_model(
         y_train=y_train,
         sample_weight=sample_weight,
         time_budget=time_budget,
-        metric="auto",
+        metric=optimize_metric,
         task="classification",
         eval_method="cv",
         n_splits=n_splits_cv,
@@ -182,9 +237,9 @@ def run_binary_automl_model(
     print(f"Best CV score:  {1 - automl.best_loss:.4f}")
 
     # -----------------------------
-    # Threshold optimisation (F-beta)
+    # Threshold optimization (decision threshold)
     # -----------------------------
-    print(f"\n--- Optimising decision threshold (F{optimize_beta}) ---")
+    print(f"\n--- Optimizing decision threshold ---")
 
     y_train_prob = automl.predict_proba(X_train)[:, 1]
     y_test_prob = automl.predict_proba(X_test)[:, 1]
@@ -205,70 +260,240 @@ def run_binary_automl_model(
 
     y_test_pred = (y_test_prob >= best_threshold).astype(int)
 
-    metrics = {
-        "roc_auc": roc_auc_score(y_test, y_test_prob),
-        "pr_auc": average_precision_score(y_test, y_test_prob),
-        "f1": f1_score(y_test, y_test_pred),
-        "precision": precision_score(y_test, y_test_pred),
-        "recall": recall_score(y_test, y_test_pred),
-    }
-
+    # -----------------------------
+    # Metrics computation (clinical interpretation)
+    # -----------------------------
+    # Confusion matrix components
     tn, fp, fn, tp = confusion_matrix(y_test, y_test_pred).ravel()
 
-    print(f"ROC-AUC:   {metrics['roc_auc']:.4f}")
-    print(f"PR-AUC:    {metrics['pr_auc']:.4f}")
-    print(f"F1-score:  {metrics['f1']:.4f}")
-    print(f"Precision: {metrics['precision']:.4f}")
-    print(f"Recall:    {metrics['recall']:.4f}")
-    print("-" * 40)
-    print(f"TN: {tn} | FP: {fp}")
-    print(f"FN: {fn} | TP: {tp}")
-    print("-" * 40)
-    print("\nClassification report:\n")
-    print(classification_report(y_test, y_test_pred))
+    # Core rates
+    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+    npv = tn / (tn + fn) if (tn + fn) > 0 else np.nan
+
+    precision = precision_score(y_test, y_test_pred) if (tp + fp) > 0 else np.nan
+    recall = recall_score(y_test, y_test_pred) if (tp + fn) > 0 else np.nan
+
+    # Triage-oriented metrics
+    overtriage = 1 - precision if not np.isnan(precision) else np.nan
+    undertriage = 1 - npv if not np.isnan(npv) else np.nan
+
+    # Error rates
+    fpr = fp / (fp + tn) if (fp + tn) > 0 else np.nan
+    fnr = fn / (fn + tp) if (fn + tp) > 0 else np.nan
+
+    # Likelihood ratios
+    lr_pos = recall / (1 - specificity) if specificity < 1 else np.nan
+    lr_neg = (1 - recall) / specificity if specificity > 0 else np.nan
+
+    metrics = {
+        "accuracy": accuracy,
+        "roc_auc": roc_auc_score(y_test, y_test_prob),
+        "pr_auc": average_precision_score(y_test, y_test_prob),
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "npv": npv,
+        "f1": f1_score(y_test, y_test_pred),
+        "overtriage": overtriage,
+        "undertriage": undertriage,
+        "false_positive_rate": fpr,
+        "false_negative_rate": fnr,
+        "lr_positive": lr_pos,
+        "lr_negative": lr_neg,
+    }
 
     # -----------------------------
-    # Permutation importance
+    # Print metrics in a nice format
+    # -----------------------------
+    print("\n" + "="*60)
+    print(f"{'PERFORMANCE METRICS':^60}")
+    print("="*60)
+    
+    print(f"\n{'Classification Metrics:':<30}")
+    print(f"  Accuracy:                    {metrics['accuracy']:.4f}")
+    print(f"  ROC-AUC:                     {metrics['roc_auc']:.4f}")
+    print(f"  PR-AUC:                      {metrics['pr_auc']:.4f}")
+    print(f"  F1 Score:                    {metrics['f1']:.4f}")
+    
+    print(f"\n{'Positive Class Performance:':<30}")
+    print(f"  Precision (PPV):             {metrics['precision']:.4f}")
+    print(f"  Recall (Sensitivity):        {metrics['recall']:.4f}")
+    
+    print(f"\n{'Negative Class Performance:':<30}")
+    print(f"  Specificity:                 {metrics['specificity']:.4f}")
+    print(f"  NPV:                         {metrics['npv']:.4f}")
+    
+    print(f"\n{'Triage-Specific Metrics:':<30}")
+    print(f"  Overtriage Rate:             {metrics['overtriage']:.4f}")
+    print(f"  Undertriage Rate:            {metrics['undertriage']:.4f}")
+    
+    print(f"\n{'Error Rates:':<30}")
+    print(f"  False Positive Rate:         {metrics['false_positive_rate']:.4f}")
+    print(f"  False Negative Rate:         {metrics['false_negative_rate']:.4f}")
+    
+    print(f"\n{'Likelihood Ratios:':<30}")
+    print(f"  LR+:                         {metrics['lr_positive']:.4f}")
+    print(f"  LR-:                         {metrics['lr_negative']:.4f}")
+    
+    print("\n" + "="*60 + "\n")
+
+    # -----------------------------
+    # Feature importance
     # -----------------------------
     importance_df = None
-
+    
     if plot_feature_importance:
-        print("\n--- Permutation feature importance ---")
-        perm_imp = permutation_importance(
-            automl,
-            X_test,
-            y_test,
-            scoring="average_precision",
-            n_repeats=5,
-            random_state=seed,
-            n_jobs=-1,
+        if use_permutation_importance:
+            # Option 1: Permutation Importance (slower, model-agnostic, more reliable)
+            print("--- Computing permutation importance (this may take a while) ---")
+            
+            try:
+                # Create a proper wrapper with fit method
+                class ClassifierWrapper:
+                    def __init__(self, model):
+                        self.model = model
+                        self._estimator_type = "classifier"
+                        self.classes_ = np.array([0, 1])
+                    
+                    def fit(self, X, y):
+                        # Dummy fit method (model is already trained)
+                        return self
+                    
+                    def predict(self, X):
+                        return self.model.predict(X)
+                    
+                    def predict_proba(self, X):
+                        return self.model.predict_proba(X)
+                
+                wrapped_model = ClassifierWrapper(automl)
+                
+                perm_imp = permutation_importance(
+                    wrapped_model,
+                    X_test,
+                    y_test,
+                    scoring="roc_auc",
+                    n_repeats=5,
+                    random_state=seed,
+                    n_jobs=-1,
+                )
+                
+                importance_df = (
+                    pd.DataFrame({
+                        "feature": X.columns,
+                        "importance": perm_imp.importances_mean,
+                        "importance_std": perm_imp.importances_std,
+                    })
+                    .sort_values("importance", ascending=False)
+                )
+                
+                print(f"Permutation importance computed successfully.")
+                
+            except Exception as e:
+                print(f"Warning: Permutation importance failed with error: {e}")
+                print("Falling back to built-in feature importance...")
+                use_permutation_importance = False
+        
+        if not use_permutation_importance:
+            # Option 2: Built-in Feature Importance (fast, model-specific)
+            print("--- Computing built-in feature importance ---")
+            
+            try:
+                # Get the underlying model from FLAML
+                best_model = automl.model
+                
+                # Get feature names (accounting for dropped features)
+                feature_names = X_train.columns.tolist()
+                
+                # Try to get feature importance from the model
+                if hasattr(best_model, 'feature_importances_'):
+                    # Tree-based models (LightGBM, XGBoost, RandomForest)
+                    importances = best_model.feature_importances_
+                    
+                    # Ensure the length matches
+                    if len(importances) == len(feature_names):
+                        importance_df = (
+                            pd.DataFrame({
+                                "feature": feature_names,
+                                "importance": importances,
+                            })
+                            .sort_values("importance", ascending=False)
+                        )
+                        print(f"Built-in feature importance computed successfully.")
+                    else:
+                        print(f"Warning: Importance length ({len(importances)}) doesn't match features ({len(feature_names)})")
+                        importance_df = None
+                    
+                elif hasattr(best_model, 'coef_'):
+                    # Linear models (LogisticRegression, etc.)
+                    importances = np.abs(best_model.coef_[0])
+                    
+                    if len(importances) == len(feature_names):
+                        importance_df = (
+                            pd.DataFrame({
+                                "feature": feature_names,
+                                "importance": importances,
+                            })
+                            .sort_values("importance", ascending=False)
+                        )
+                        print(f"Built-in feature importance computed successfully.")
+                    else:
+                        print(f"Warning: Coefficient length ({len(importances)}) doesn't match features ({len(feature_names)})")
+                        importance_df = None
+                    
+                else:
+                    print(f"Warning: Model type '{type(best_model).__name__}' does not have built-in feature importance.")
+                    importance_df = None
+                
+            except Exception as e:
+                print(f"Warning: Could not extract feature importance: {e}")
+                importance_df = None
+        
+        # Plotting
+        if importance_df is not None and len(importance_df) > 0:
+            top_k = min(15, len(importance_df))
+            plot_df = importance_df.head(top_k)
+            
+            plt.figure(figsize=(10, 6))
+            plt.barh(plot_df["feature"][::-1], plot_df["importance"][::-1])
+            
+            if use_permutation_importance:
+                plt.title("Top Features (Permutation Importance, ROC-AUC)")
+                plt.xlabel("Mean decrease in ROC-AUC")
+            else:
+                plt.title(f"Top Features (Built-in Importance - {automl.best_estimator})")
+                plt.xlabel("Feature Importance")
+            
+            plt.tight_layout()
+            plt.show()
+            
+            # Print top features
+            print(f"\nTop {top_k} most important features:")
+            for idx, row in plot_df.iterrows():
+                print(f"  {row['feature']:<20} {row['importance']:.6f}")
+    
+    # -----------------------------
+    # Build summary DataFrame (one-row, ready to concatenate)
+    # -----------------------------
+    summary_df = (
+        pd.DataFrame(metrics, index=[0])
+        .assign(
+            cohort=cohort_name,
+            demand_code=str(demand_code) if demand_code is not None else None,  # Convert to string for consistency
+            triage_value=triage_value,
+            optimize_metric=optimize_metric,
+            optimize_beta=optimize_beta,
+            threshold=best_threshold,
+            n_samples=len(df_model),
+            n_train=len(X_train),
+            n_test=len(X_test),
         )
-
-        importance_df = (
-            pd.DataFrame({
-                "feature": X.columns,
-                "importance": perm_imp.importances_mean,
-            })
-            .sort_values("importance", ascending=False)
-            .head(15)
-        )
-
-        print(importance_df.to_string(index=False))
-
-        plt.figure(figsize=(10, 6))
-        plt.barh(
-            importance_df["feature"][::-1],
-            importance_df["importance"][::-1],
-        )
-        plt.title("Top features (permutation importance)")
-        plt.xlabel("Importance (Δ PR-AUC)")
-        plt.tight_layout()
-        plt.show()
+    )
 
     return {
         "automl": automl,
         "threshold": best_threshold,
         "metrics": metrics,
-        "confusion_matrix": {"tn": tn, "fp": fp, "fn": fn, "tp": tp},
+        "metrics_df": summary_df,
         "feature_importance": importance_df,
     }
