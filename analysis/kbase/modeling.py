@@ -5,6 +5,7 @@
 
 import pandas as pd
 import numpy as np
+import seaborn as sns
 from flaml import AutoML
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
@@ -349,10 +350,25 @@ def run_binary_automl_model(
     y_test_pred = (y_test_prob >= best_threshold).astype(int)
 
     # -----------------------------
+    # Confusion Matrix Plot
+    # -----------------------------
+    conf_matrix = confusion_matrix(y_test, y_test_pred)
+    labels = ['Negative', 'Positive']
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(conf_matrix, annot=True, cmap='Blues', fmt='d',
+                xticklabels=labels, yticklabels=labels)
+    plt.title('Classification Pipeline Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------
     # Metrics computation (clinical interpretation)
     # -----------------------------
     # Confusion matrix components
-    tn, fp, fn, tp = confusion_matrix(y_test, y_test_pred).ravel()
+    tn, fp, fn, tp = conf_matrix.ravel()
 
     # Core rates
     accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan
@@ -395,32 +411,37 @@ def run_binary_automl_model(
     # Print metrics in a nice format
     # -----------------------------
     print("\n" + "="*60)
-    print(f"{'PERFORMANCE METRICS':^60}")
+    print(f"{'CLASSIFICATION REPORT':^60}")
+    print("="*60)
+    print(classification_report(y_test, y_test_pred, target_names=labels))
+
+    print("\n" + "="*60)
+    print(f"{'PERFORMANCE METRICS (%)':^60}")
     print("="*60)
     
     print(f"\n{'Classification Metrics:':<30}")
-    print(f"  Accuracy:                    {metrics['accuracy']:.4f}")
-    print(f"  ROC-AUC:                     {metrics['roc_auc']:.4f}")
-    print(f"  PR-AUC:                      {metrics['pr_auc']:.4f}")
-    print(f"  F1 Score:                    {metrics['f1']:.4f}")
+    print(f"  Accuracy:                    {metrics['accuracy']*100:.2f}%")
+    print(f"  ROC-AUC:                     {metrics['roc_auc']*100:.2f}%")
+    print(f"  PR-AUC:                      {metrics['pr_auc']*100:.2f}%")
+    print(f"  F1 Score:                    {metrics['f1']*100:.2f}%")
     
     print(f"\n{'Positive Class Performance:':<30}")
-    print(f"  Precision (PPV):             {metrics['precision']:.4f}")
-    print(f"  Recall (Sensitivity):        {metrics['recall']:.4f}")
+    print(f"  Precision (PPV):             {metrics['precision']*100:.2f}%")
+    print(f"  Recall (Sensitivity):        {metrics['recall']*100:.2f}%")
     
     print(f"\n{'Negative Class Performance:':<30}")
-    print(f"  Specificity:                 {metrics['specificity']:.4f}")
-    print(f"  NPV:                         {metrics['npv']:.4f}")
+    print(f"  Specificity:                 {metrics['specificity']*100:.2f}%")
+    print(f"  NPV:                         {metrics['npv']*100:.2f}%")
     
     print(f"\n{'Triage-Specific Metrics:':<30}")
-    print(f"  Overtriage Rate:             {metrics['overtriage']:.4f}")
-    print(f"  Undertriage Rate:            {metrics['undertriage']:.4f}")
+    print(f"  Overtriage Rate:             {metrics['overtriage']*100:.2f}%")
+    print(f"  Undertriage Rate:            {metrics['undertriage']*100:.2f}%")
     
     print(f"\n{'Error Rates:':<30}")
-    print(f"  False Positive Rate:         {metrics['false_positive_rate']:.4f}")
-    print(f"  False Negative Rate:         {metrics['false_negative_rate']:.4f}")
+    print(f"  False Positive Rate:         {metrics['false_positive_rate']*100:.2f}%")
+    print(f"  False Negative Rate:         {metrics['false_negative_rate']*100:.2f}%")
     
-    print(f"\n{'Likelihood Ratios:':<30}")
+    print(f"\n{'Likelihood Ratios (Abs):':<30}")
     print(f"  LR+:                         {metrics['lr_positive']:.4f}")
     print(f"  LR-:                         {metrics['lr_negative']:.4f}")
     
