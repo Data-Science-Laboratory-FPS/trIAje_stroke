@@ -22,12 +22,77 @@ from typing import Optional, List, Union
 import kbase.preprocessing as dp 
 from kbase.config import settings
 
+protocol_features = {
+    # 16: Dyspnea / Respiratory distress (Asfixia)
+    16: [
+        # 1. Asfixia start
+        'q1_a', 'q1_b',
+        # 2. Previous diseases
+        'q2_a', 'q2_b', 'q2_c', 'q2_d', 'q2_e', 'q2_f', 'q2_g', 'q2_h',
+        # 3. Speech difficulty
+        'q3_a', 'q3_b', 'q3_c',
+        # 4. Associated symptoms
+        'q4_a', 'q4_b', 'q4_c', 'q4_d', 'q4_e', 'q4_f', 'q4_g', 
+        'q4_h', 'q4_i', 'q4_j', 'q4_k', 'q4_l', 'q4_m'
+    ],
+    
+    # 23: Chest Pain (Dolor Torácico)
+    23: [
+        # 1. Heart history
+        'q1_a', 'q1_b', 'q1_c', 'q1_d',
+        # 2. Location
+        'q2_a', 'q2_b',
+        # 3. Type of pain
+        'q3_a', 'q3_b', 'q3_c', 'q3_d',
+        # 4. Relation to movement/rest
+        'q4_a', 'q4_b', 'q4_c', 
+        # 5. Associated symptoms
+        'q5_a', 'q5_b', 'q5_c', 'q5_d', 'q5_e', 'q5_f',
+        # 6. Change/Improvement with meds
+        'q6_a', 'q6_b', 'q6_c', 'q6_d'
+    ],
+
+    # 54: Stroke / ACV
+    54: [
+        # 1. Gaze / Eyes
+        'q1_a', 'q1_b',
+        # 2. Breathing
+        'q2_a', 'q2_b',
+        # 3. Main complaint (Face, Arm, Speech, etc.)
+        'q3_a', 'q3_b', 'q3_c', 'q3_d', 'q3_e', 'q3_f',
+        # 4. First time occurrence
+        'q4_a', 'q4_b',
+        # 5. Time of evolution (Numerical/String)
+        'q5_a', 
+        # 6. Lifestyle / Autonomy
+        'q6_a', 'q6_b'
+    ],
+
+    # 36 & 58: Cardiac Arrest / Unconsciousness
+    'cardiac_arrest': [
+        # 1. Can speak?
+        'q1_a', 'q1_b',
+        # 2. Eyes/Gaze
+        'q2_a', 'q2_b',
+        # 3. Breathing quality
+        'q3_a', 'q3_b', 'q3_d', # Nota: Tu protocolo salta de b a d
+        # 4. Reaction to stimulus
+        'q4_a', 'q4_b',
+        # 5. Previous diseases
+        'q5_a', 'q5_b', 'q5_c', 'q5_d', 'q5_e', 'q5_f',
+        # 6. Time of evolution
+        'q6_a',
+        # 7. Previous episodes
+        'q7_a', 'q7_b'
+    ]
+}
+
 def run_binary_automl_model(
     cohort_name: str,
     target_column: str,
     demand_code: Optional[Union[int, List[int]]] = None,
     triage_value: Optional[int] = None,
-    time_budget: int = 50,
+    time_budget: int = 600,
     test_size: float = 0.2,
     seed: int = 42,
     min_age: Optional[int] = None,
@@ -94,7 +159,14 @@ def run_binary_automl_model(
     # -----------------------------
     # Data loading & column selection
     # -----------------------------
-    modelling_cols = [
+
+    # Load preprocessed cleaned table
+    df = pq.read_table(
+        os.path.join(settings.source_tables_path, settings.triaje_table_cleaned_path)
+    ).to_pandas()
+
+    # Select base columns 
+    base_cols = [
         "age",
         "sex",
         "demand_type_1",
@@ -104,20 +176,14 @@ def run_binary_automl_model(
         "month",
         "season",
         "year",
-        "triage",
-        "q1",
-        "q2",
-        "q3",
-        "q4",
-        "q5",
-        "q6",
-        "q7",
+        "triage"
     ]
 
-    df = pq.read_table(
-        os.path.join(settings.source_tables_path, settings.triaje_table_cleaned_path)
-    ).to_pandas()
+    # Find all columns generated during One-Hot Encoding that start with 'q'
+    triage_questions_cols = [col for col in df.columns if col.startswith('q')]
+    modelling_cols = base_cols + triage_questions_cols
 
+    # Select columns for final modeling
     selected_cols = [c for c in modelling_cols if c in df.columns]
     df_model = df[selected_cols].copy()
 
@@ -150,10 +216,9 @@ def run_binary_automl_model(
     if triage_value is not None:
         df_model = df_model[df_model["triage"] == triage_value].copy()
 
-        # If no triage questions were asked, remove q1-q7 from the feature set
+        # If no triage questions were asked, remove triage questions/responses from the feature set
         if triage_value == 0:
-            q_cols = [f"q{i}" for i in range(1, 8)]
-            df_model = df_model.drop(columns=[c for c in q_cols if c in df_model.columns])
+            df_model = df_model.drop(columns=triage_questions_cols)
 
     if min_age is not None:
         if "age" not in df_model.columns:
@@ -161,8 +226,31 @@ def run_binary_automl_model(
         df_model = df_model[df_model["age"] >= min_age].copy()
         print(f"Filtering by age >= {min_age}")
 
+    # Drop triage columns not present in the specific demand type
+    if demand_code is not None and protocol_features is not None:
+            # Determine the correct key for protocol_features
+            rule_key = None
+            if isinstance(demand_code, (list, tuple)):
+                if set(demand_code) == {36, 58}:
+                    rule_key = 'cardiac_arrest'
+                # Check if it's a single-item list that matches a protocol key
+                elif len(demand_code) == 1 and demand_code[0] in protocol_features:
+                    rule_key = demand_code[0]
+            elif demand_code in protocol_features:
+                rule_key = demand_code
+    
+            # Apply pruning if a rule was found
+            if rule_key is not None:
+                allowed_cols = protocol_features[rule_key]
+                current_q_cols = [c for c in df_model.columns if c.startswith('q')]
+                cols_to_drop = [c for c in current_q_cols if c not in allowed_cols]
+                
+                if cols_to_drop:
+                    df_model = df_model.drop(columns=cols_to_drop)
+                    print(f"Pruning: Dropped {len(cols_to_drop)} columns for protocol {rule_key}")
+                    
     # Drop columns after cohort filtering
-    cols_to_drop = ["demand_type_1"]
+    cols_to_drop = ["demand_type_1", "triage"]
     cols_to_drop = [c for c in cols_to_drop if c in df_model.columns]
     if cols_to_drop:
         df_model = df_model.drop(columns=cols_to_drop)
@@ -183,7 +271,7 @@ def run_binary_automl_model(
     X = df_model.drop(columns=[target_column])
     y = df_model[target_column]
 
-    # --- Ensure categorical consistency ---
+    # Ensure categorical consistency
     # This prevents the 'categorical_feature do not match' error in LightGBM/FLAML
     categorical_cols = X.select_dtypes(include=['category']).columns
     
