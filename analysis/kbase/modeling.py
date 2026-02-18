@@ -11,7 +11,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score, f1_score, fbeta_score,
     precision_score, recall_score, confusion_matrix,
-    classification_report, average_precision_score
+    classification_report, average_precision_score, 
+    log_loss
 )
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.inspection import permutation_importance
@@ -23,7 +24,7 @@ from typing import Optional, List, Union
 import kbase.preprocessing as dp 
 from kbase.config import settings
 
-protocol_features = {
+protocol_questions = {
     # 16: Dyspnea / Respiratory distress (Asfixia)
     16: [
         # 1. Asfixia start
@@ -88,11 +89,368 @@ protocol_features = {
     ]
 }
 
+def triage_print(triage_value, cohort_name, demand_code):
+    """ Prints the initial configuration of the model run """
+    print(f"=== Running the model for {cohort_name} cohort - code {demand_code} ===")
+
+    if triage_value is None:
+        print("Triage subset: ALL patients (no triage-based filtering)")
+    elif triage_value == 1:
+        print("Triage subset: WITH structured triage information")
+    elif triage_value == 0:
+        print("Triage subset: WITHOUT structured triage information")
+    else:
+        raise ValueError("triage_value must be None, 0, or 1")
+
+def data_load_col_selection(triage_value, include_embeddings)-> pd.DataFrame:
+    """Loads data and performs initial feature selection based on settings"""
+    # Load preprocessed cleaned table
+    df = pq.read_table(
+        os.path.join(settings.source_tables_path, settings.triaje_table_cleaned_path)
+    ).to_pandas()
+
+    # Select base columns 
+    base_cols = [
+        "age",
+        "sex",
+        "demand_type_1",
+        "p1_real",
+        "day_week",
+        "time_of_day",
+        "month",
+        "season",
+        "year",
+        "triage"
+    ]
+
+    # Initialize modelling columns with base columns
+    modelling_cols = base_cols.copy()
+    # Add triage questions (One-Hot Encoded columns)
+    if triage_value != 0:
+        modelling_cols += [col for col in df.columns if col.startswith('q')]
+    # Include NLP text embeddings if flag is set to True
+    if include_embeddings:
+        embedding_cols = [col for col in df.columns if col.startswith('emb_')]
+        modelling_cols += embedding_cols
+        print(f"Feature Set: Including {len(embedding_cols)} text embedding dimensions.")
+            
+    # Select columns for final modeling
+    selected_cols = [c for c in modelling_cols if c in df.columns]
+    df_model = df[selected_cols].copy()
+    # Transform data types
+    df_model = dp.transform_column_dtypes(df_model)
+
+    return df_model
+
+def col_validation(df, target_column):
+    """Validates that essential columns are present in the dataframe"""
+    if target_column not in df.columns:
+        raise ValueError(f"Target column '{target_column}' not found in dataframe")
+
+    if "triage" not in df.columns:
+        raise ValueError("Required column 'triage' not found in dataframe")
+
+def data_filtering(df, target_column, demand_code, 
+                   triage_value, min_age, protocol_features) -> pd.DataFrame:
+    """Applies cohort, triage, age, and protocol-specific filters"""
+    # Filter by demand_code
+    if demand_code is not None:
+        if "demand_type_1" not in df.columns:
+            raise ValueError("'demand_type_1' column not found but demand_code was provided")
+        
+        # Handle both single integer and list of integers
+        if isinstance(demand_code, (list, tuple)):
+            df = df[df["demand_type_1"].isin(demand_code)].copy()
+            print(f"Filtering by demand_type_1 in {demand_code}")
+        else:
+            df = df[df["demand_type_1"] == demand_code].copy()
+            print(f"Filtering by demand_type_1 == {demand_code}")
+
+    # Filter by triage patients
+    if triage_value is not None:
+        df = df[df["triage"] == triage_value].copy()
+
+    # Filter by min age
+    if min_age is not None:
+        if "age" not in df.columns:
+            raise ValueError("'age' column not found but min_age was provided")
+        df = df[df["age"] >= min_age].copy()
+        print(f"Filtering by age >= {min_age}")
+
+    # Drop triage columns not present in the specific demand type
+    if demand_code is not None and protocol_features is not None:
+        # Determine the correct key for protocol_features
+        rule_key = None
+        
+        # Normalize demand_code to a list for consistent comparison
+        codes_list = demand_code if isinstance(demand_code, (list, tuple)) else [demand_code]
+
+        # Case 1: Cardiac Arrest (Multiple codes)
+        if set(codes_list) == {36, 58}:
+            rule_key = 'cardiac_arrest'
+        # Case 2: Single code protocols (16, 23, 54)
+        elif len(codes_list) == 1 and codes_list[0] in protocol_features:
+            rule_key = codes_list[0]
+
+        # Apply pruning if a rule was found
+        if rule_key is not None:
+            allowed_cols = protocol_features[rule_key]
+            current_q_cols = [c for c in df.columns if c.startswith('q')]
+            cols_to_drop = [c for c in current_q_cols if c not in allowed_cols]
+            
+            if cols_to_drop:
+                df = df.drop(columns=cols_to_drop)
+                print(f"Pruning: Dropped {len(cols_to_drop)} columns for protocol {rule_key}")
+        # Integrated warning if no protocol matches the demand_code
+        else:
+            print(f"⚠️ Warning: No specific protocol found for demand_code {demand_code}")
+                    
+    # Drop columns after cohort filtering
+    cols_to_drop = ["demand_type_1", "triage"]
+    cols_to_drop = [c for c in cols_to_drop if c in df.columns]
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop)
+
+    print(f"\nFinal cohort size for {target_column}: {len(df)}")
+    print("Outcome distribution: ", df[target_column].value_counts(dropna=False), "\n")
+    print(df.info(verbose=True, show_counts=True))
+
+    return df
+
+def train_test_split_weights(df, target_column, test_size, seed):
+    """Splits data into train/test sets and computes sample weights for imbalance"""
+    X = df.drop(columns=[target_column])
+    y = df[target_column]
+
+    # Ensure categorical consistency
+    # This prevents the 'categorical_feature do not match' error in LightGBM/FLAML
+    categorical_cols = X.select_dtypes(include=['category']).columns
+    
+    for col in categorical_cols:
+        # 1. Convert to string and then back to category to reset the label dictionary
+        # 2. This ensures that X_train and X_test share the exact same internal mapping
+        #    even if one split is missing a specific category value.
+        X[col] = X[col].astype(str).astype('category')
+        
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=test_size,
+        random_state=seed,
+        stratify=y,
+    )
+
+    print(f"Train samples: {len(X_train)}")
+    print(f"Test samples:  {len(X_test)}")
+
+    # Sample weights (class imbalance)
+    sample_weight = compute_sample_weight(
+        class_weight="balanced",
+        y=y_train,
+    )
+
+    return X_train, X_test, y_train, y_test, sample_weight
+
+def run_automl_training(X_train, y_train, sample_weight, time_budget, 
+                        optimize_metric, n_splits_cv, seed, task):
+    """Executes the FLAML AutoML optimization process"""
+    print(f"\n--- Starting AutoML ({task.upper()}) | Budget: {time_budget}s ---")
+    if optimize_metric is None:
+        print("Training metric: FLAML default")
+    else:
+        print(f"Training metric: {optimize_metric}")
+        
+    automl = AutoML()
+    automl.fit(
+        X_train=X_train, 
+        y_train=y_train, 
+        sample_weight=sample_weight,
+        time_budget=time_budget, 
+        metric=optimize_metric, 
+        task=task,
+        eval_method="cv", 
+        n_splits=n_splits_cv, 
+        seed=seed, 
+        verbose=1,
+        log_training_metric=True,
+    )
+    
+    print("\n--- Training completed ---")
+    print(f"Best estimator: {automl.best_estimator}")
+    print(f"Best CV score:  {1 - automl.best_loss:.4f}")
+    
+    return automl
+
+def optimize_threshold(y_train, y_train_prob, optimize_beta):
+    """Finds the optimal decision threshold based on F-beta score"""
+    print(f"\n--- Optimizing decision threshold (Beta={optimize_beta}) ---")
+    thresholds = np.arange(0.05, 0.95, 0.01)
+    fbeta_scores = [
+        fbeta_score(y_train, (y_train_prob >= t).astype(int), beta=optimize_beta)
+        for t in thresholds
+    ]
+    best_threshold = thresholds[np.argmax(fbeta_scores)]
+    print(f"Optimal threshold found: {best_threshold:.3f}")
+    
+    return best_threshold
+
+def plot_feature_importances(automl, X_train, use_permutation_importance, 
+                             X_test, y_test, seed, task="classification"):
+    """Computes and plots feature importance using built-in or permutation methods"""
+    importance_df = None
+
+    # Scoring adapted to type of prediction (binary or multiclass)
+    if task == "multiclass":
+        perm_scoring = "roc_auc_ovr_weighted"
+    else:
+        perm_scoring = "roc_auc"
+    
+    if use_permutation_importance:
+        # Option 1: Permutation Importance (slower, model-agnostic, more reliable)
+        print("--- Computing permutation importance (this may take a while) ---")
+        
+        try:
+            # Create a proper wrapper with fit method
+            class ClassifierWrapper:
+                def __init__(self, model):
+                    self.model = model
+                    self._estimator_type = "classifier"
+                    # Use automl.classes_ directly instead of model.X_val
+                    self.classes_ = np.array(model.classes_)
+                
+                def fit(self, X, y):
+                    # Dummy fit method (model is already trained)
+                    return self
+                
+                def predict(self, X):
+                    return self.model.predict(X)
+                
+                def predict_proba(self, X):
+                    proba = self.model.predict_proba(X)
+                    # Guarantee 2D array for both binary and multiclass
+                    if proba.ndim == 1:
+                        proba = np.column_stack([1 - proba, proba])
+                    return proba
+            
+            wrapped_model = ClassifierWrapper(automl)
+            
+            perm_imp = permutation_importance(
+                wrapped_model,
+                X_test,
+                y_test,
+                scoring=perm_scoring,
+                n_repeats=5,
+                random_state=seed,
+                n_jobs=-1,
+            )
+            
+            importance_df = (
+                pd.DataFrame({
+                    "feature": X_train.columns,
+                    "importance": perm_imp.importances_mean,
+                    "importance_std": perm_imp.importances_std,
+                })
+                .sort_values("importance", ascending=False)
+            )
+            
+            print("Permutation importance computed successfully.")
+            
+        except Exception as e:
+            print(f"Warning: Permutation importance failed with error: {e}")
+            print("Falling back to built-in feature importance...")
+            use_permutation_importance = False
+        
+        if not use_permutation_importance:
+            # Option 2: Built-in Feature Importance (fast, model-specific)
+            print("--- Computing built-in feature importance ---")
+            
+            try:
+                # Get the underlying model from FLAML
+                best_model = automl.model
+                
+                # Get feature names (accounting for dropped features)
+                feature_names = automl.feature_names_in_.tolist()
+                
+                # Try to get feature importance from the model
+                if hasattr(best_model, 'feature_importances_'):
+                    # Tree-based models (LightGBM, XGBoost, RandomForest)
+                    importances = best_model.feature_importances_
+                    
+                    if len(importances) == len(feature_names):
+                        importance_df = (
+                            pd.DataFrame({
+                                "feature": feature_names,
+                                "importance": importances,
+                            })
+                            .sort_values("importance", ascending=False)
+                        )
+                        print("Built-in feature importance computed successfully.")
+                    else:
+                        print(f"Warning: Importance length ({len(importances)}) doesn't match features ({len(feature_names)})")
+                        importance_df = None
+                    
+                elif hasattr(best_model, 'coef_'):
+                    # Linear models (LogisticRegression, etc.)
+                    # coef_ is 2D for multiclass → use mean of absolute values across classes
+                    coef = best_model.coef_
+                    importances = np.abs(coef).mean(axis=0) if coef.ndim > 1 else np.abs(coef[0])
+                    
+                    if len(importances) == len(feature_names):
+                        importance_df = (
+                            pd.DataFrame({
+                                "feature": feature_names,
+                                "importance": importances,
+                            })
+                            .sort_values("importance", ascending=False)
+                        )
+                        print("Built-in feature importance computed successfully.")
+                    else:
+                        print(f"Warning: Coefficient length ({len(importances)}) doesn't match features ({len(feature_names)})")
+                        importance_df = None
+                    
+                else:
+                    print(f"Warning: Model type '{type(best_model).__name__}' does not have built-in feature importance.")
+                    importance_df = None
+                
+            except Exception as e:
+                print(f"Warning: Could not extract feature importance: {e}")
+                importance_df = None
+        
+        # Plotting
+        if importance_df is not None and len(importance_df) > 0:
+            top_k = min(15, len(importance_df))
+            plot_df = importance_df.head(top_k)
+            
+            plt.figure(figsize=(10, 6))
+            plt.barh(plot_df["feature"][::-1], plot_df["importance"][::-1])
+            
+            if use_permutation_importance:
+                if task == "multiclass":
+                    plt.title("Top Features (Permutation Importance, ROC-AUC OvR Weighted)")
+                    plt.xlabel("Mean decrease in ROC-AUC (OvR)")
+                else:
+                    plt.title("Top Features (Permutation Importance, ROC-AUC)")
+                    plt.xlabel("Mean decrease in ROC-AUC")
+            else:
+                plt.title(f"Top Features (Built-in Importance - {automl.best_estimator})")
+                plt.xlabel("Feature Importance")
+            
+            plt.tight_layout()
+            plt.show()
+            
+            # Print top features
+            print(f"\nTop {top_k} most important features:")
+            for idx, row in plot_df.iterrows():
+                print(f"  {row['feature']:<20} {row['importance']:.6f}")
+
+    return importance_df
+    
 def run_binary_automl_model(
     cohort_name: str,
     target_column: str,
     demand_code: Optional[Union[int, List[int]]] = None,
     triage_value: Optional[int] = None,
+    include_embeddings: bool = True,
     time_budget: int = 600,
     test_size: float = 0.2,
     seed: int = 42,
@@ -115,7 +473,7 @@ def run_binary_automl_model(
     target_column : str
         Binary target column.
     demand_code : Optional[Union[int, List[int]]]
-        If provided, filters df_model to demand_type_1.
+        If provided, filters df to demand_type_1.
         Can be a single integer or a list of integers (e.g., [36, 58]).
     triage_value : Optional[int]
         If provided, filters to triage == triage_value.
@@ -146,207 +504,50 @@ def run_binary_automl_model(
         Dictionary with model, metrics, threshold and feature importance.
     """
 
-    print(f"=== Running the model for {cohort_name} cohort ===")
-
-    if triage_value is None:
-        print("Triage subset: ALL patients (no triage-based filtering)")
-    elif triage_value == 1:
-        print("Triage subset: WITH structured triage information")
-    elif triage_value == 0:
-        print("Triage subset: WITHOUT structured triage information")
-    else:
-        raise ValueError("triage_value must be None, 0, or 1")
+    # -----------------------------
+    # Print type of triage-specific cohort
+    # -----------------------------
+    triage_print(triage_value, cohort_name, demand_code)
 
     # -----------------------------
     # Data loading & column selection
     # -----------------------------
-
-    # Load preprocessed cleaned table
-    df = pq.read_table(
-        os.path.join(settings.source_tables_path, settings.triaje_table_cleaned_path)
-    ).to_pandas()
-
-    # Select base columns 
-    base_cols = [
-        "age",
-        "sex",
-        "demand_type_1",
-        "p1_real",
-        "day_week",
-        "time_of_day",
-        "month",
-        "season",
-        "year",
-        "triage"
-    ]
-
-    # Find all columns generated during One-Hot Encoding that start with 'q'
-    triage_questions_cols = [col for col in df.columns if col.startswith('q')]
-    modelling_cols = base_cols + triage_questions_cols
-
-    # Select columns for final modeling
-    selected_cols = [c for c in modelling_cols if c in df.columns]
-    df_model = df[selected_cols].copy()
-
-    df_model = dp.transform_column_dtypes(df_model)
+    df = data_load_col_selection(triage_value, include_embeddings)
 
     # -----------------------------
     # Basic validation
     # -----------------------------
-    if target_column not in df_model.columns:
-        raise ValueError(f"Target column '{target_column}' not found in dataframe")
-
-    if "triage" not in df_model.columns:
-        raise ValueError("Required column 'triage' not found in dataframe")
+    col_validation(df, target_column)
 
     # -----------------------------
     # Cohort & triage filtering
     # -----------------------------
-    if demand_code is not None:
-        if "demand_type_1" not in df_model.columns:
-            raise ValueError("'demand_type_1' column not found but demand_code was provided")
-        
-        # Handle both single integer and list of integers
-        if isinstance(demand_code, (list, tuple)):
-            df_model = df_model[df_model["demand_type_1"].isin(demand_code)].copy()
-            print(f"Filtering by demand_type_1 in {demand_code}")
-        else:
-            df_model = df_model[df_model["demand_type_1"] == demand_code].copy()
-            print(f"Filtering by demand_type_1 == {demand_code}")
-
-    if triage_value is not None:
-        df_model = df_model[df_model["triage"] == triage_value].copy()
-
-        # If no triage questions were asked, remove triage questions/responses from the feature set
-        if triage_value == 0:
-            df_model = df_model.drop(columns=triage_questions_cols)
-
-    if min_age is not None:
-        if "age" not in df_model.columns:
-            raise ValueError("'age' column not found but min_age was provided")
-        df_model = df_model[df_model["age"] >= min_age].copy()
-        print(f"Filtering by age >= {min_age}")
-
-    # Drop triage columns not present in the specific demand type
-    if demand_code is not None and protocol_features is not None:
-            # Determine the correct key for protocol_features
-            rule_key = None
-            if isinstance(demand_code, (list, tuple)):
-                if set(demand_code) == {36, 58}:
-                    rule_key = 'cardiac_arrest'
-                # Check if it's a single-item list that matches a protocol key
-                elif len(demand_code) == 1 and demand_code[0] in protocol_features:
-                    rule_key = demand_code[0]
-            elif demand_code in protocol_features:
-                rule_key = demand_code
-    
-            # Apply pruning if a rule was found
-            if rule_key is not None:
-                allowed_cols = protocol_features[rule_key]
-                current_q_cols = [c for c in df_model.columns if c.startswith('q')]
-                cols_to_drop = [c for c in current_q_cols if c not in allowed_cols]
-                
-                if cols_to_drop:
-                    df_model = df_model.drop(columns=cols_to_drop)
-                    print(f"Pruning: Dropped {len(cols_to_drop)} columns for protocol {rule_key}")
-                    
-    # Drop columns after cohort filtering
-    cols_to_drop = ["demand_type_1", "triage"]
-    cols_to_drop = [c for c in cols_to_drop if c in df_model.columns]
-    if cols_to_drop:
-        df_model = df_model.drop(columns=cols_to_drop)
-
-    print(f"\nFinal cohort size: {len(df_model)}")
-    print("Outcome: ", df_model[target_column].value_counts(dropna=False), "\n")
-    print(df_model.info())
-
-    if optimize_metric is None:
-        print("\nTraining metric to optimize: FLAML default (auto)")
-    else:
-        print(f"\nTraining metric to optimize: {optimize_metric}\n")
+    df = data_filtering(df, target_column, demand_code, 
+                        triage_value, min_age, protocol_features=protocol_questions)
 
     # -----------------------------
     # Train / test split
     # -----------------------------
-
-    X = df_model.drop(columns=[target_column])
-    y = df_model[target_column]
-
-    # Ensure categorical consistency
-    # This prevents the 'categorical_feature do not match' error in LightGBM/FLAML
-    categorical_cols = X.select_dtypes(include=['category']).columns
-    
-    for col in categorical_cols:
-        # 1. Convert to string and then back to category to reset the label dictionary
-        # 2. This ensures that X_train and X_test share the exact same internal mapping
-        #    even if one split is missing a specific category value.
-        X[col] = X[col].astype(str).astype('category')
-        
-    X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
-        test_size=test_size,
-        random_state=seed,
-        stratify=y,
-    )
-
-    print(f"Train samples: {len(X_train)}")
-    print(f"Test samples:  {len(X_test)}")
-
-    # -----------------------------
-    # Sample weights (class imbalance)
-    # -----------------------------
-    sample_weight = compute_sample_weight(
-        class_weight="balanced",
-        y=y_train,
-    )
+    X_train, X_test, y_train, y_test, sample_weight = train_test_split_weights(
+        df, target_column, test_size, seed)
 
     # -----------------------------
     # AutoML training
     # -----------------------------
-    print(f"\n--- Starting AutoML (Budget: {time_budget}s) ---")
-
-    automl = AutoML()
-    automl.fit(
-        X_train=X_train,
-        y_train=y_train,
-        sample_weight=sample_weight,
-        time_budget=time_budget,
-        metric=optimize_metric,
-        task="classification",
-        eval_method="cv",
-        n_splits=n_splits_cv,
-        seed=seed,
-        verbose=1,
-        log_training_metric=True,
-    )
-
-    print("\n--- Training completed ---")
-    print(f"Best estimator: {automl.best_estimator}")
-    print(f"Best CV score:  {1 - automl.best_loss:.4f}")
+    automl = run_automl_training(X_train, y_train, sample_weight, time_budget, 
+                                 optimize_metric, n_splits_cv, seed, task = "classification")
 
     # -----------------------------
     # Threshold optimization (decision threshold)
     # -----------------------------
-    print(f"\n--- Optimizing decision threshold ---")
-
     y_train_prob = automl.predict_proba(X_train)[:, 1]
     y_test_prob = automl.predict_proba(X_test)[:, 1]
-
-    thresholds = np.arange(0.05, 0.95, 0.01)
-    fbeta_scores = [
-        fbeta_score(y_train, (y_train_prob >= t).astype(int), beta=optimize_beta)
-        for t in thresholds
-    ]
-
-    best_threshold = thresholds[np.argmax(fbeta_scores)]
-    print(f"Optimal threshold: {best_threshold:.3f}")
-
+    best_threshold = optimize_threshold(y_train, y_train_prob, optimize_beta)
+    
     # -----------------------------
     # Test set evaluation
     # -----------------------------
     print("\n--- Test set results ---")
-
     y_test_pred = (y_test_prob >= best_threshold).astype(int)
 
     # -----------------------------
@@ -451,135 +652,9 @@ def run_binary_automl_model(
     # Feature importance
     # -----------------------------
     importance_df = None
-    
     if plot_feature_importance:
-        if use_permutation_importance:
-            # Option 1: Permutation Importance (slower, model-agnostic, more reliable)
-            print("--- Computing permutation importance (this may take a while) ---")
-            
-            try:
-                # Create a proper wrapper with fit method
-                class ClassifierWrapper:
-                    def __init__(self, model):
-                        self.model = model
-                        self._estimator_type = "classifier"
-                        self.classes_ = np.array([0, 1])
-                    
-                    def fit(self, X, y):
-                        # Dummy fit method (model is already trained)
-                        return self
-                    
-                    def predict(self, X):
-                        return self.model.predict(X)
-                    
-                    def predict_proba(self, X):
-                        return self.model.predict_proba(X)
-                
-                wrapped_model = ClassifierWrapper(automl)
-                
-                perm_imp = permutation_importance(
-                    wrapped_model,
-                    X_test,
-                    y_test,
-                    scoring="roc_auc",
-                    n_repeats=5,
-                    random_state=seed,
-                    n_jobs=-1,
-                )
-                
-                importance_df = (
-                    pd.DataFrame({
-                        "feature": X.columns,
-                        "importance": perm_imp.importances_mean,
-                        "importance_std": perm_imp.importances_std,
-                    })
-                    .sort_values("importance", ascending=False)
-                )
-                
-                print(f"Permutation importance computed successfully.")
-                
-            except Exception as e:
-                print(f"Warning: Permutation importance failed with error: {e}")
-                print("Falling back to built-in feature importance...")
-                use_permutation_importance = False
-        
-        if not use_permutation_importance:
-            # Option 2: Built-in Feature Importance (fast, model-specific)
-            print("--- Computing built-in feature importance ---")
-            
-            try:
-                # Get the underlying model from FLAML
-                best_model = automl.model
-                
-                # Get feature names (accounting for dropped features)
-                feature_names = X_train.columns.tolist()
-                
-                # Try to get feature importance from the model
-                if hasattr(best_model, 'feature_importances_'):
-                    # Tree-based models (LightGBM, XGBoost, RandomForest)
-                    importances = best_model.feature_importances_
-                    
-                    # Ensure the length matches
-                    if len(importances) == len(feature_names):
-                        importance_df = (
-                            pd.DataFrame({
-                                "feature": feature_names,
-                                "importance": importances,
-                            })
-                            .sort_values("importance", ascending=False)
-                        )
-                        print(f"Built-in feature importance computed successfully.")
-                    else:
-                        print(f"Warning: Importance length ({len(importances)}) doesn't match features ({len(feature_names)})")
-                        importance_df = None
-                    
-                elif hasattr(best_model, 'coef_'):
-                    # Linear models (LogisticRegression, etc.)
-                    importances = np.abs(best_model.coef_[0])
-                    
-                    if len(importances) == len(feature_names):
-                        importance_df = (
-                            pd.DataFrame({
-                                "feature": feature_names,
-                                "importance": importances,
-                            })
-                            .sort_values("importance", ascending=False)
-                        )
-                        print(f"Built-in feature importance computed successfully.")
-                    else:
-                        print(f"Warning: Coefficient length ({len(importances)}) doesn't match features ({len(feature_names)})")
-                        importance_df = None
-                    
-                else:
-                    print(f"Warning: Model type '{type(best_model).__name__}' does not have built-in feature importance.")
-                    importance_df = None
-                
-            except Exception as e:
-                print(f"Warning: Could not extract feature importance: {e}")
-                importance_df = None
-        
-        # Plotting
-        if importance_df is not None and len(importance_df) > 0:
-            top_k = min(15, len(importance_df))
-            plot_df = importance_df.head(top_k)
-            
-            plt.figure(figsize=(10, 6))
-            plt.barh(plot_df["feature"][::-1], plot_df["importance"][::-1])
-            
-            if use_permutation_importance:
-                plt.title("Top Features (Permutation Importance, ROC-AUC)")
-                plt.xlabel("Mean decrease in ROC-AUC")
-            else:
-                plt.title(f"Top Features (Built-in Importance - {automl.best_estimator})")
-                plt.xlabel("Feature Importance")
-            
-            plt.tight_layout()
-            plt.show()
-            
-            # Print top features
-            print(f"\nTop {top_k} most important features:")
-            for idx, row in plot_df.iterrows():
-                print(f"  {row['feature']:<20} {row['importance']:.6f}")
+        importance_df = plot_feature_importances(automl, X_train, use_permutation_importance, 
+                                                 X_test, y_test, seed, task="classification")
     
     # -----------------------------
     # Build summary DataFrame (one-row, ready to concatenate)
@@ -593,7 +668,7 @@ def run_binary_automl_model(
             optimize_metric=optimize_metric,
             optimize_beta=optimize_beta,
             threshold=best_threshold,
-            n_samples=len(df_model),
+            n_samples=len(df),
             n_train=len(X_train),
             n_test=len(X_test),
         )
@@ -605,4 +680,204 @@ def run_binary_automl_model(
         "metrics": metrics,
         "metrics_df": summary_df,
         "feature_importance": importance_df,
+    }
+
+# ===============================================================
+# Generic multiclass classification pipeline using FLAML
+# Optimized for P1-36, P1-58 and Non-Emergency prediction
+# ===============================================================
+
+def run_multiclass_automl_model(
+    cohort_name: str,
+    target_column: str,
+    demand_code: Optional[Union[int, List[int]]] = [36, 58],
+    triage_value: Optional[int] = None,
+    include_embeddings: bool = True,
+    time_budget: int = 600,
+    test_size: float = 0.2,
+    seed: int = 42,
+    min_age: Optional[int] = None,
+    optimize_metric: str = 'macro_f1',
+    n_splits_cv: int = 5,
+    plot_feature_importance: bool = True,
+    use_permutation_importance: bool = False
+) -> dict:
+    """
+    Runs a complete multiclass classification pipeline using FLAML AutoML.
+
+    Parameters
+    ----------
+    cohort_name : str
+        Name of the cohort.
+    target_column : str
+        Multiclass target column (e.g., 0: None, 1: P1-36, 2: P1-58).
+    demand_code : Optional[Union[int, List[int]]]
+        Filtering codes, default is [36, 58].
+    triage_value : Optional[int]
+        Filter by triage availability.
+    include_embeddings : bool
+        Whether to include text embeddings.
+    time_budget : int
+        FLAML training budget in seconds.
+    test_size : float
+        Proportion of test split.
+    seed : int
+        Random seed.
+    min_age : Optional[int]
+        Optional age filter.
+    optimize_metric : str
+        Metric to optimize (macro_f1 is recommended for multiclass).
+    n_splits_cv : int
+        Number of CV folds.
+    plot_feature_importance : bool
+        Whether to compute and plot feature importance.
+    use_permutation_importance : bool
+        If True, use permutation importance.
+
+    Returns
+    -------
+    dict
+        Dictionary with model, metrics, and summary results.
+    """
+
+    # -----------------------------
+    # Print type of triage-specific cohort
+    # -----------------------------
+    triage_print(triage_value, cohort_name, demand_code)
+
+    # -----------------------------
+    # Data loading & column selection
+    # -----------------------------
+    df = data_load_col_selection(triage_value, include_embeddings)
+
+    # -----------------------------
+    # Create multiclass variable
+    # -----------------------------
+    df.loc[(df["demand_type_1"] == 36) & (df[target_column] == 1), target_column] = 1
+    df.loc[(df["demand_type_1"] == 58) & (df[target_column] == 1), target_column] = 2
+    
+    # -----------------------------
+    # Basic validation
+    # -----------------------------
+    col_validation(df, target_column)
+    
+    # -----------------------------
+    # Cohort & triage filtering
+    # -----------------------------
+    df = data_filtering(df, target_column, demand_code, 
+                        triage_value, min_age, protocol_features=protocol_questions)
+
+    # -----------------------------
+    # Train / test split
+    # -----------------------------
+    X_train, X_test, y_train, y_test, sample_weight = train_test_split_weights(
+        df, target_column, test_size, seed)
+
+    # -----------------------------
+    # AutoML training (task set to multiclass)
+    # -----------------------------
+    automl = run_automl_training(
+        X_train, y_train, sample_weight, time_budget, 
+        optimize_metric, n_splits_cv, seed, task="multiclass"
+    )
+
+    # -----------------------------
+    # Test set evaluation
+    # -----------------------------
+    print("\n--- Test set results (Multiclass) ---")
+    
+    # Multiclass prediction uses the highest probability class (argmax)
+    y_test_pred = automl.predict(X_test)
+    y_test_prob = automl.predict_proba(X_test)
+
+    # -----------------------------
+    # Confusion Matrix Plot
+    # -----------------------------
+    conf_matrix = confusion_matrix(y_test, y_test_pred)
+    
+    label_mapping = {
+    0: "P0",
+    1: "P1-Unconscious",
+    2: "P1-Cardiac Arrest"
+    }
+    class_labels = sorted(df[target_column].unique())
+    labels_str = [label_mapping.get(l, str(l)) for l in class_labels]
+
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(conf_matrix, annot=True, cmap='Purples', fmt='d',
+                xticklabels=labels_str, yticklabels=labels_str)
+    plt.title(f'Multiclass Confusion Matrix - {cohort_name}')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.tight_layout()
+    plt.show()
+
+    # -----------------------------
+    # Metrics computation
+    # -----------------------------
+    accuracy = (y_test_pred == y_test).mean()
+    macro_f1 = f1_score(y_test, y_test_pred, average='macro')
+    weighted_f1 = f1_score(y_test, y_test_pred, average='weighted')
+    logloss_val = log_loss(y_test, y_test_prob)
+    
+    # ROC-AUC OvR (One-vs-Rest) is the standard for multiclass
+    roc_auc_ovr = roc_auc_score(y_test, y_test_prob, multi_class='ovr', average='weighted')
+
+    metrics = {
+        "accuracy": accuracy,
+        "macro_f1": macro_f1,
+        "weighted_f1": weighted_f1,
+        "log_loss": logloss_val,
+        "roc_auc_ovr": roc_auc_ovr
+    }
+
+    # -----------------------------
+    # Print metrics 
+    # -----------------------------
+    print("\n" + "="*60)
+    print(f"{'MULTICLASS CLASSIFICATION REPORT':^60}")
+    print("="*60)
+    print(classification_report(y_test, y_test_pred, target_names=labels_str))
+
+    print("\n" + "="*60)
+    print(f"{'PERFORMANCE METRICS (%)':^60}")
+    print("="*60)
+    
+    print(f"\n{'Overall Performance:':<30}")
+    print(f"  Accuracy:                    {metrics['accuracy']*100:.2f}%")
+    print(f"  ROC-AUC (OvR):               {metrics['roc_auc_ovr']*100:.2f}%")
+    print(f"  Macro F1 Score:              {metrics['macro_f1']*100:.2f}%")
+    print(f"  Weighted F1 Score:           {metrics['weighted_f1']*100:.2f}%")
+    
+    print(f"\n{'Model Error:':<30}")
+    print(f"  Log Loss:                    {metrics['log_loss']:.4f}")
+    
+    print("="*60 + "\n")
+
+    # -----------------------------
+    # Feature importance
+    # -----------------------------
+    importance_df = None
+    if plot_feature_importance:
+        importance_df = plot_feature_importances(automl, X_train, use_permutation_importance, 
+                                                 X_test, y_test, seed, task="multiclass")
+
+    # -----------------------------
+    # Build summary DataFrame
+    # -----------------------------
+    summary_df = (
+        pd.DataFrame(metrics, index=[0])
+        .assign(
+            cohort=cohort_name,
+            n_samples=len(df),
+            best_model=automl.best_estimator
+        )
+    )
+
+    return {
+        "automl": automl,
+        "metrics": metrics,
+        "metrics_df": summary_df,
+        "feature_importance": importance_df,
+        "confusion_matrix": conf_matrix
     }
