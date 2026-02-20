@@ -202,7 +202,8 @@ dtype_cols = {
     "is_frequent_user": "category",
     "is_vulnerable": "category",
     "p1_predicted": "category",
-    "p1_real": "category",
+    "p1_real_emerg": "Int8",
+    "p1_real_bps": "Int8",
     "hcdm_id": "object",
     "location_patient": "category",
     "day_week": "category",
@@ -241,7 +242,50 @@ dtype_cols = {
     "q4": "category",
     "q5": "category",
     "q6": "category",
-    "q7": "category"
+    "q7": "category", 
+    "q1_a": "int8",
+    "q1_b": "int8",
+    "q1_c": "int8",
+    "q1_d": "int8",
+    "q2_a": "int8",
+    "q2_b": "int8",
+    "q2_c": "int8",
+    "q2_d": "int8",
+    "q2_e": "int8",
+    "q2_f": "int8",
+    "q2_g": "int8",
+    "q2_h": "int8",
+    "q3_a": "int8",
+    "q3_b": "int8",
+    "q3_c": "int8",
+    "q3_d": "int8",
+    "q3_e": "int8",
+    "q3_f": "int8",
+    "q4_a": "int8",
+    "q4_b": "int8",
+    "q4_c": "int8",
+    "q4_d": "int8",
+    "q4_e": "int8",
+    "q4_f": "int8",
+    "q4_g": "int8",
+    "q4_h": "int8",
+    "q4_i": "int8",
+    "q4_j": "int8",
+    "q4_k": "int8",
+    "q4_l": "int8",
+    "q4_m": "int8",
+    "q5_a": "int8",
+    "q5_b": "int8",
+    "q5_c": "int8",
+    "q5_d": "int8",
+    "q5_e": "int8",
+    "q5_f": "int8",
+    "q6_a": "int8",
+    "q6_b": "int8",
+    "q6_c": "int8",
+    "q6_d": "int8",
+    "q7_a": "int8",
+    "q7_b": "int8"
 }
 
 # Functions
@@ -354,15 +398,15 @@ def rename_columns(df: pd.DataFrame,
     return df.rename(columns=existing)
 
 ## Reduce the size of a dataframe depending on a flag.
-def df_pipeline_test(df: pd.DataFrame, flag: str) -> pd.DataFrame:
-    if flag == "all":
+def df_pipeline_test(df: pd.DataFrame) -> pd.DataFrame:
+    if settings.test_pipeline == "all":
         return df
     
-    elif flag == "test":
-        return df.iloc[:100000].copy()
+    elif settings.test_pipeline == "test":
+        return df.iloc[:10000].copy()
     
     else:
-        raise ValueError('Flag must be either "all" or "test".')
+        raise ValueError('settings.test_pipeline must be either "all" or "test".')
 
 # Function for converting data types and reordering columns
 def transform_column_dtypes(df: pd.DataFrame, dtype_dict=dtype_cols):

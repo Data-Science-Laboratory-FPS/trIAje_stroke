@@ -102,7 +102,7 @@ def triage_print(triage_value, cohort_name, demand_code):
     else:
         raise ValueError("triage_value must be None, 0, or 1")
 
-def data_load_col_selection(triage_value, include_embeddings)-> pd.DataFrame:
+def data_load_col_selection(target_column, triage_value, include_embeddings)-> pd.DataFrame:
     """Loads data and performs initial feature selection based on settings"""
     # Load preprocessed cleaned table
     df = pq.read_table(
@@ -114,7 +114,7 @@ def data_load_col_selection(triage_value, include_embeddings)-> pd.DataFrame:
         "age",
         "sex",
         "demand_type_1",
-        "p1_real",
+        target_column,
         "day_week",
         "time_of_day",
         "month",
@@ -151,8 +151,15 @@ def col_validation(df, target_column):
         raise ValueError("Required column 'triage' not found in dataframe")
 
 def data_filtering(df, target_column, demand_code, 
-                   triage_value, min_age, protocol_features) -> pd.DataFrame:
+                   triage_value, min_age, export_table, protocol_features) -> pd.DataFrame:
     """Applies cohort, triage, age, and protocol-specific filters"""
+
+    # Filter by valid values in target_column
+    if target_column is not None:
+        df = df.dropna(subset=[target_column])
+        if target_column not in df.columns:
+            raise ValueError(f"{target_column} column not found but demand_code was provided")
+        
     # Filter by demand_code
     if demand_code is not None:
         if "demand_type_1" not in df.columns:
@@ -204,12 +211,30 @@ def data_filtering(df, target_column, demand_code,
         # Integrated warning if no protocol matches the demand_code
         else:
             print(f"⚠️ Warning: No specific protocol found for demand_code {demand_code}")
-                    
+                   
     # Drop columns after cohort filtering
     cols_to_drop = ["demand_type_1", "triage"]
     cols_to_drop = [c for c in cols_to_drop if c in df.columns]
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
+
+    # Export of preprocessed, ready for modeling, table
+    if export_table:    
+        rule_to_path = {
+            'cardiac_arrest': settings.cardiacarrest_table_modeling,
+            16: settings.dyspnea_table_modeling,
+            23: settings.chestpain_table_modeling,
+            54: settings.stroke_table_modeling,
+        }
+        export_path = rule_to_path.get(rule_key)
+        
+        if export_path is None:
+            raise ValueError(f"Unknown export path: {rule_key}")
+        
+        df.to_parquet(
+            os.path.join(settings.source_tables_path, export_path),
+            index=False
+        )
 
     print(f"\nFinal cohort size for {target_column}: {len(df)}")
     print("Outcome distribution: ", df[target_column].value_counts(dropna=False), "\n")
@@ -451,6 +476,7 @@ def run_binary_automl_model(
     demand_code: Optional[Union[int, List[int]]] = None,
     triage_value: Optional[int] = None,
     include_embeddings: bool = True,
+    export_table: bool = False, 
     time_budget: int = 600,
     test_size: float = 0.2,
     seed: int = 42,
@@ -512,7 +538,7 @@ def run_binary_automl_model(
     # -----------------------------
     # Data loading & column selection
     # -----------------------------
-    df = data_load_col_selection(triage_value, include_embeddings)
+    df = data_load_col_selection(target_column, triage_value, include_embeddings)
 
     # -----------------------------
     # Basic validation
@@ -522,8 +548,8 @@ def run_binary_automl_model(
     # -----------------------------
     # Cohort & triage filtering
     # -----------------------------
-    df = data_filtering(df, target_column, demand_code, 
-                        triage_value, min_age, protocol_features=protocol_questions)
+    df = data_filtering(df, target_column, demand_code, triage_value, min_age,
+                        export_table, protocol_features=protocol_questions)
 
     # -----------------------------
     # Train / test split
@@ -693,6 +719,7 @@ def run_multiclass_automl_model(
     demand_code: Optional[Union[int, List[int]]] = [36, 58],
     triage_value: Optional[int] = None,
     include_embeddings: bool = True,
+    export_table: bool = False, 
     time_budget: int = 600,
     test_size: float = 0.2,
     seed: int = 42,
@@ -764,8 +791,8 @@ def run_multiclass_automl_model(
     # -----------------------------
     # Cohort & triage filtering
     # -----------------------------
-    df = data_filtering(df, target_column, demand_code, 
-                        triage_value, min_age, protocol_features=protocol_questions)
+    df = data_filtering(df, target_column, demand_code, triage_value, min_age,
+                        export_table, protocol_features=protocol_questions)
 
     # -----------------------------
     # Train / test split
