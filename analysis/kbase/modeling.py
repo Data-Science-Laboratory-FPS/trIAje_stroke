@@ -20,9 +20,17 @@ import matplotlib.pyplot as plt
 import os
 import pyarrow.parquet as pq
 from typing import Optional, List, Union
+import shap
+import warnings
 
 import kbase.preprocessing as dp 
+import kbase.eda as eda 
 from kbase.config import settings
+
+# This ensures .info() shows up to 50 columns by default
+pd.set_option('display.max_info_columns', 50)
+# This ensures that when you print a DataFrame, you see 50 rows
+pd.set_option('display.max_rows', 50)
 
 protocol_questions = {
     # 16: Dyspnea / Respiratory distress (Asfixia)
@@ -119,7 +127,7 @@ def data_load_col_selection(target_column, triage_value, include_embeddings)-> p
         "time_of_day",
         "month",
         "season",
-        "year",
+        "location_patient",
         "triage"
     ]
 
@@ -188,7 +196,6 @@ def data_filtering(df, target_column, demand_code,
     if demand_code is not None and protocol_features is not None:
         # Determine the correct key for protocol_features
         rule_key = None
-        
         # Normalize demand_code to a list for consistent comparison
         codes_list = demand_code if isinstance(demand_code, (list, tuple)) else [demand_code]
 
@@ -211,9 +218,13 @@ def data_filtering(df, target_column, demand_code,
         # Integrated warning if no protocol matches the demand_code
         else:
             print(f"⚠️ Warning: No specific protocol found for demand_code {demand_code}")
+
+    # Clean column names: remove 'q' prefix and underscores for readability
+    df.columns = [col.replace('q', '', 1).replace('_', '') 
+                  if col.startswith('q') else col for col in df.columns]
                    
     # Drop columns after cohort filtering
-    cols_to_drop = ["demand_type_1", "triage"]
+    cols_to_drop = ["demand_type_1"]
     cols_to_drop = [c for c in cols_to_drop if c in df.columns]
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
@@ -236,9 +247,19 @@ def data_filtering(df, target_column, demand_code,
             index=False
         )
 
+        # Check if the export file was created correctly
+        if os.path.exists(export_path):
+            file_size_mb = os.path.getsize(export_path) / (1024 * 1024)
+            print(f"✅ Export successful!")
+            print(f"--- Path: {export_path}")
+            print(f"--- Size: {file_size_mb:.2f} MB")
+        else:
+            print(f"❌ Export failed: File not found at {export_path}")
+
     print(f"\nFinal cohort size for {target_column}: {len(df)}")
     print("Outcome distribution: ", df[target_column].value_counts(dropna=False), "\n")
-    print(df.info(verbose=True, show_counts=True))
+    # Show info for only the first 50 columns
+    df.iloc[:, :50].info()
 
     return df
 
@@ -319,156 +340,327 @@ def optimize_threshold(y_train, y_train_prob, optimize_beta):
     
     return best_threshold
 
-def plot_feature_importances(automl, X_train, use_permutation_importance, 
+def plot_feature_importances(automl, X_train, feature_importance,
                              X_test, y_test, seed, task="classification"):
-    """Computes and plots feature importance using built-in or permutation methods"""
-    importance_df = None
+    """
+    Computes and plots feature importance using permutation or built-in methods.
 
-    # Scoring adapted to type of prediction (binary or multiclass)
-    if task == "multiclass":
-        perm_scoring = "roc_auc_ovr_weighted"
-    else:
-        perm_scoring = "roc_auc"
-    
-    if use_permutation_importance:
-        # Option 1: Permutation Importance (slower, model-agnostic, more reliable)
-        print("--- Computing permutation importance (this may take a while) ---")
-        
+    feature_importance values:
+        0 → no importance computed
+        1 → permutation only (fallback to built-in if it fails)
+        2 → both permutation and built-in
+
+    Permutation importance: shuffles each feature independently and measures
+    how much the chosen scoring metric drops. A large drop = high importance.
+    Importances are metric decrements (can be negative if the feature adds noise).
+
+    Built-in importance: model-internal scores (e.g. impurity reduction in trees).
+    These are relative scores with no direct metric interpretation.
+    """
+    # Return early if no importance requested
+    if feature_importance == 0:
+        return None, None
+
+    importance_df_permutation = None
+    importance_df_builtin = None
+
+    # Exclude text embedding columns — only clinical features are evaluated
+    # for computational efficiency and clinical interpretability
+    non_emb_cols = [col for col in X_train.columns if not col.startswith('emb')]
+
+    # Average Precision (PR-AUC) mirrors the 'ap' training metric used in FLAML,
+    # ensuring consistency between training objective and importance evaluation
+    perm_scoring = "average_precision"
+
+    # -------------------------------------------------------------------------
+    # PERMUTATION IMPORTANCE (feature_importance == 1 or 2)
+    # -------------------------------------------------------------------------
+    use_permutation_importance = False
+
+    if feature_importance >= 1:
+        print(f"--- Computing permutation importance ({perm_scoring}) for {len(non_emb_cols)} clinical features ---")
+
         try:
-            # Create a proper wrapper with fit method
             class ClassifierWrapper:
-                def __init__(self, model):
+                """
+                Wraps FLAML AutoML for sklearn's permutation_importance API.
+                Reconstructs the full feature matrix on each prediction call
+                by merging permuted clinical columns with the original embeddings.
+                """
+                def __init__(self, model, X_full):
                     self.model = model
+                    self.X_full = X_full
                     self._estimator_type = "classifier"
-                    # Use automl.classes_ directly instead of model.X_val
                     self.classes_ = np.array(model.classes_)
-                
+
                 def fit(self, X, y):
-                    # Dummy fit method (model is already trained)
                     return self
-                
+
+                def _reconstruct(self, X_clinical):
+                    # Re-attach original embedding columns using index alignment,
+                    # then restore original column order expected by the model
+                    emb_cols = [c for c in self.X_full.columns if c.startswith('emb')]
+                    X_emb = self.X_full.loc[X_clinical.index, emb_cols]
+                    return pd.concat([X_clinical, X_emb], axis=1)[self.X_full.columns]
+
                 def predict(self, X):
-                    return self.model.predict(X)
-                
+                    return self.model.predict(self._reconstruct(X))
+
                 def predict_proba(self, X):
-                    proba = self.model.predict_proba(X)
-                    # Guarantee 2D array for both binary and multiclass
+                    proba = self.model.predict_proba(self._reconstruct(X))
+                    # Ensure 2D output for both binary and multiclass
                     if proba.ndim == 1:
                         proba = np.column_stack([1 - proba, proba])
                     return proba
-            
-            wrapped_model = ClassifierWrapper(automl)
-            
+
+            # Full X_test passed so the wrapper can recover embeddings internally
+            wrapped_model = ClassifierWrapper(automl, X_test)
+
+            # Only clinical columns are permuted; embeddings are reconstructed internally
             perm_imp = permutation_importance(
                 wrapped_model,
-                X_test,
+                X_test[non_emb_cols],
                 y_test,
                 scoring=perm_scoring,
                 n_repeats=5,
                 random_state=seed,
                 n_jobs=-1,
             )
-            
-            importance_df = (
+
+            importance_df_permutation = (
                 pd.DataFrame({
-                    "feature": X_train.columns,
+                    "feature": non_emb_cols,
                     "importance": perm_imp.importances_mean,
                     "importance_std": perm_imp.importances_std,
                 })
                 .sort_values("importance", ascending=False)
             )
-            
+
+            use_permutation_importance = True
             print("Permutation importance computed successfully.")
-            
+
         except Exception as e:
             print(f"Warning: Permutation importance failed with error: {e}")
-            print("Falling back to built-in feature importance...")
-            use_permutation_importance = False
-        
-        if not use_permutation_importance:
-            # Option 2: Built-in Feature Importance (fast, model-specific)
-            print("--- Computing built-in feature importance ---")
-            
-            try:
-                # Get the underlying model from FLAML
-                best_model = automl.model
-                
-                # Get feature names (accounting for dropped features)
-                feature_names = automl.feature_names_in_.tolist()
-                
-                # Try to get feature importance from the model
-                if hasattr(best_model, 'feature_importances_'):
-                    # Tree-based models (LightGBM, XGBoost, RandomForest)
-                    importances = best_model.feature_importances_
-                    
-                    if len(importances) == len(feature_names):
-                        importance_df = (
-                            pd.DataFrame({
-                                "feature": feature_names,
-                                "importance": importances,
-                            })
-                            .sort_values("importance", ascending=False)
-                        )
-                        print("Built-in feature importance computed successfully.")
-                    else:
-                        print(f"Warning: Importance length ({len(importances)}) doesn't match features ({len(feature_names)})")
-                        importance_df = None
-                    
-                elif hasattr(best_model, 'coef_'):
-                    # Linear models (LogisticRegression, etc.)
-                    # coef_ is 2D for multiclass → use mean of absolute values across classes
-                    coef = best_model.coef_
-                    importances = np.abs(coef).mean(axis=0) if coef.ndim > 1 else np.abs(coef[0])
-                    
-                    if len(importances) == len(feature_names):
-                        importance_df = (
-                            pd.DataFrame({
-                                "feature": feature_names,
-                                "importance": importances,
-                            })
-                            .sort_values("importance", ascending=False)
-                        )
-                        print("Built-in feature importance computed successfully.")
-                    else:
-                        print(f"Warning: Coefficient length ({len(importances)}) doesn't match features ({len(feature_names)})")
-                        importance_df = None
-                    
-                else:
-                    print(f"Warning: Model type '{type(best_model).__name__}' does not have built-in feature importance.")
-                    importance_df = None
-                
-            except Exception as e:
-                print(f"Warning: Could not extract feature importance: {e}")
-                importance_df = None
-        
-        # Plotting
-        if importance_df is not None and len(importance_df) > 0:
-            top_k = min(15, len(importance_df))
-            plot_df = importance_df.head(top_k)
-            
-            plt.figure(figsize=(10, 6))
-            plt.barh(plot_df["feature"][::-1], plot_df["importance"][::-1])
-            
-            if use_permutation_importance:
-                if task == "multiclass":
-                    plt.title("Top Features (Permutation Importance, ROC-AUC OvR Weighted)")
-                    plt.xlabel("Mean decrease in ROC-AUC (OvR)")
-                else:
-                    plt.title("Top Features (Permutation Importance, ROC-AUC)")
-                    plt.xlabel("Mean decrease in ROC-AUC")
-            else:
-                plt.title(f"Top Features (Built-in Importance - {automl.best_estimator})")
-                plt.xlabel("Feature Importance")
-            
-            plt.tight_layout()
-            plt.show()
-            
-            # Print top features
-            print(f"\nTop {top_k} most important features:")
-            for idx, row in plot_df.iterrows():
-                print(f"  {row['feature']:<20} {row['importance']:.6f}")
+            # If mode is 1 (permutation only), fallback to built-in
+            if feature_importance == 1:
+                print("Falling back to built-in feature importance...")
+                feature_importance = 2  # Trigger built-in block below
 
-    return importance_df
+    # -------------------------------------------------------------------------
+    # BUILT-IN IMPORTANCE (feature_importance == 2, or fallback from mode 1)
+    # -------------------------------------------------------------------------
+    if feature_importance == 2:
+        print("--- Computing built-in feature importance ---")
+
+        try:
+            best_model = automl.model
+            feature_names = automl.feature_names_in_.tolist()
+
+            if hasattr(best_model, 'feature_importances_'):
+                # Tree-based models: cumulative impurity reduction across all splits
+                importances = best_model.feature_importances_
+
+                if len(importances) == len(feature_names):
+                    importance_df_builtin = (
+                        pd.DataFrame({
+                            "feature": feature_names,
+                            "importance": importances,
+                        })
+                        .sort_values("importance", ascending=False)
+                    )
+                    print("Built-in feature importance computed successfully.")
+                else:
+                    print(f"Warning: Importance length ({len(importances)}) doesn't match features ({len(feature_names)})")
+
+            elif hasattr(best_model, 'coef_'):
+                # Linear models: absolute coefficients as proxy for importance.
+                # For multiclass, coef_ is 2D (n_classes x n_features) →
+                # average across classes to get a single importance per feature
+                coef = best_model.coef_
+                importances = np.abs(coef).mean(axis=0) if coef.ndim > 1 else np.abs(coef[0])
+
+                if len(importances) == len(feature_names):
+                    importance_df_builtin = (
+                        pd.DataFrame({
+                            "feature": feature_names,
+                            "importance": importances,
+                        })
+                        .sort_values("importance", ascending=False)
+                    )
+                    print("Built-in feature importance computed successfully.")
+                else:
+                    print(f"Warning: Coefficient length ({len(importances)}) doesn't match features ({len(feature_names)})")
+
+            else:
+                print(f"Warning: Model type '{type(best_model).__name__}' does not support built-in feature importance.")
+
+            # Filter out embedding features — not individually interpretable
+            if importance_df_builtin is not None:
+                importance_df_builtin = (
+                    importance_df_builtin[~importance_df_builtin["feature"].str.startswith('emb')]
+                    .sort_values("importance", ascending=False)
+                )
+                print("Built-in importance filtered to show clinical features only.")
+
+        except Exception as e:
+            print(f"Warning: Could not extract built-in feature importance: {e}")
+
+    # -------------------------------------------------------------------------
+    # PLOTTING — one plot per computed importance type
+    # -------------------------------------------------------------------------
+    def _plot_and_print(importance_df, is_permutation):
+        top_k = min(15, len(importance_df))
+        plot_df = importance_df.head(top_k)
+
+        plt.figure(figsize=(10, 6))
+        plt.barh(plot_df["feature"][::-1], plot_df["importance"][::-1])
+
+        if is_permutation:
+            plt.title(f"Top Features (Permutation Importance — {perm_scoring})")
+            plt.xlabel(f"Mean decrease in {perm_scoring} (percentage points)")
+        else:
+            plt.title(f"Top Features (Built-in Importance — {automl.best_estimator})")
+            plt.xlabel("Feature Importance (relative)")
+
+        plt.tight_layout()
+        plt.show()
+
+        print(f"\nTop {top_k} most important features:")
+        if is_permutation:
+            print(f"Metric: Mean decrease in {perm_scoring} (percentage points)\n")
+        for _, row in plot_df.iterrows():
+            if is_permutation:
+                print(f"  {row['feature']:<20} = {row['importance']*100:.4f} pp")
+            else:
+                print(f"  {row['feature']:<20} {row['importance']:.4f}")
+
+    if importance_df_permutation is not None:
+        _plot_and_print(importance_df_permutation, is_permutation=True)
+
+    if importance_df_builtin is not None:
+        _plot_and_print(importance_df_builtin, is_permutation=False)
+
+    return importance_df_permutation, importance_df_builtin
+
+import warnings
+
+def plot_shap_interpretation(automl, X_test, task="classification", max_display=15, seed=42):
+    """
+    Computes SHAP values and plots a summary excluding embedding features.
+    SHAP provides directional impact per feature (positive = pushes toward positive class).
+
+    For binary classification: single summary plot.
+    For multiclass: one summary plot per class.
+    """
+    print("\n--- Initializing SHAP Explainer ---")
+
+    def _prepare_for_shap(X):
+        """Convert categorical columns to numeric codes for SHAP compatibility.
+        Required for XGBoost, LightGBM and any model that stored categorical
+        metadata during training — avoids 'categorical_feature do not match' errors."""
+        X_shap = X.copy()
+        cat_cols = X_shap.select_dtypes(include='category').columns
+        for col in cat_cols:
+            X_shap[col] = X_shap[col].cat.codes
+        return X_shap
+
+    try:
+        # Clinical features only — embeddings excluded for interpretability
+        non_emb_cols = [col for col in X_test.columns if not col.startswith('emb')]
+
+        # Extract the underlying fitted estimator from FLAML
+        model = automl.model.estimator
+
+        # Subsample X_test for compute efficiency
+        sample_size = min(500, len(X_test))
+        X_sample = X_test.sample(sample_size, random_state=seed)
+
+        # Convert categoricals to numeric codes — applied to all model types
+        # to avoid categorical mismatch errors between training and SHAP input
+        X_sample_shap = _prepare_for_shap(X_sample)
+
+        # Precompute non-embedding column indices once for slicing shap_values arrays
+        all_cols = X_test.columns.tolist()
+        non_emb_idx = [all_cols.index(c) for c in non_emb_cols]
+
+        # X used for plotting — converted + clinical columns only
+        X_plot = X_sample_shap[non_emb_cols]
+
+        # Use TreeExplainer for tree-based models (exact, fast)
+        # Fallback to generic Explainer for linear or other model types
+        tree_model_types = (
+            "LGBMClassifier", "XGBClassifier", "RandomForestClassifier",
+            "ExtraTreesClassifier", "GradientBoostingClassifier"
+        )
+
+        if type(model).__name__ in tree_model_types:
+            print(f"Using TreeExplainer for {type(model).__name__}...")
+            explainer = shap.TreeExplainer(model)
+            shap_values = explainer.shap_values(X_sample_shap)
+        else:
+            print(f"Using generic Explainer for {type(model).__name__}...")
+            background = X_sample_shap.sample(min(100, len(X_sample_shap)), random_state=seed)
+            explainer = shap.Explainer(model, background)
+            shap_out = explainer(X_sample_shap)
+            shap_values = shap_out.values
+
+        print(f"SHAP values computed on {sample_size} samples.")
+
+        # --- Plotting ---
+        if task == "multiclass":
+            # TreeExplainer returns a list of 2D arrays (one per class)
+            # Generic Explainer returns a 3D array (n_samples, n_features, n_classes)
+            # Normalize to list of 2D arrays for consistent handling
+            if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+                shap_values = [shap_values[:, :, i] for i in range(shap_values.shape[2])]
+
+            class_names = [str(c) for c in automl.classes_]
+
+            for i, class_name in enumerate(class_names):
+                print(f"\nGenerating SHAP Summary Plot — Class: {class_name}")
+                shap_class_filtered = shap_values[i][:, non_emb_idx]
+
+                with warnings.catch_warnings():
+                    warnings.filterwarnings("ignore", category=UserWarning, module="shap")
+                    shap.summary_plot(
+                        shap_class_filtered,
+                        X_plot,
+                        max_display=max_display,
+                        show=True,
+                    )
+
+        else:
+            # Binary classification:
+            # - TreeExplainer returns list [neg_class, pos_class] or single 2D array
+            # - Generic Explainer returns 2D array directly
+            # Always use positive class (index 1) for interpretability
+            if isinstance(shap_values, list):
+                # RandomForest / tree models return list of arrays — take positive class
+                shap_values_binary = shap_values[1]
+            elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+                shap_values_binary = shap_values[:, :, 1]
+            else:
+                # Already a 2D array (XGBoost, generic explainer)
+                shap_values_binary = shap_values
+
+            shap_filtered = shap_values_binary[:, non_emb_idx]
+
+            print("\nGenerating SHAP Summary Plot — Positive class")
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category=UserWarning, module="shap")
+                shap.summary_plot(
+                    shap_filtered,
+                    X_plot,
+                    max_display=max_display,
+                    show=True,
+                )
+
+        print("SHAP interpretation completed successfully.")
+        return shap_values
+
+    except Exception as e:
+        print(f"Warning: SHAP interpretation failed: {e}")
+        return None
     
 def run_binary_automl_model(
     cohort_name: str,
@@ -484,8 +676,8 @@ def run_binary_automl_model(
     optimize_metric: Optional[str] = None,
     n_splits_cv: int = 5,
     optimize_beta: int = 2,
-    plot_feature_importance: bool = True,
-    use_permutation_importance: bool = False,
+    feature_importance: int = 0,
+    plot_shap: bool = True
 ) -> dict:
 
     
@@ -548,14 +740,14 @@ def run_binary_automl_model(
     # -----------------------------
     # Cohort & triage filtering
     # -----------------------------
-    df = data_filtering(df, target_column, demand_code, triage_value, min_age,
+    df_filtered = data_filtering(df, target_column, demand_code, triage_value, min_age,
                         export_table, protocol_features=protocol_questions)
 
     # -----------------------------
     # Train / test split
     # -----------------------------
     X_train, X_test, y_train, y_test, sample_weight = train_test_split_weights(
-        df, target_column, test_size, seed)
+        df_filtered, target_column, test_size, seed)
 
     # -----------------------------
     # AutoML training
@@ -674,13 +866,27 @@ def run_binary_automl_model(
     
     print("\n" + "="*60 + "\n")
 
+    # Plot metrics
+    # Create an evaluation dataframe by mapping back to the filtered data
+    plot_df = df.loc[y_test.index].copy() 
+    plot_df['target_real'] = y_test
+    plot_df['target_pred'] = y_test_pred
+    eda.evaluate_diagnostic_performance(plot_df, 'target_real', 'target_pred')
+
     # -----------------------------
     # Feature importance
     # -----------------------------
-    importance_df = None
-    if plot_feature_importance:
-        importance_df = plot_feature_importances(automl, X_train, use_permutation_importance, 
-                                                 X_test, y_test, seed, task="classification")
+    importance_df_permutation, importance_df_builtin = plot_feature_importances(
+        automl, X_train, feature_importance, X_test, y_test, seed, task="classification")
+
+    # -----------------------------
+    # SHAP plot
+    # -----------------------------
+    shap_values = None
+    if plot_shap:
+        shap_values = plot_shap_interpretation(
+            automl, X_test, task="classification", seed=seed
+        )
     
     # -----------------------------
     # Build summary DataFrame (one-row, ready to concatenate)
@@ -694,19 +900,13 @@ def run_binary_automl_model(
             optimize_metric=optimize_metric,
             optimize_beta=optimize_beta,
             threshold=best_threshold,
-            n_samples=len(df),
+            n_samples=len(df_filtered),
             n_train=len(X_train),
             n_test=len(X_test),
         )
     )
 
-    return {
-        "automl": automl,
-        "threshold": best_threshold,
-        "metrics": metrics,
-        "metrics_df": summary_df,
-        "feature_importance": importance_df,
-    }
+    display(summary_df)
 
 # ===============================================================
 # Generic multiclass classification pipeline using FLAML
@@ -901,10 +1101,4 @@ def run_multiclass_automl_model(
         )
     )
 
-    return {
-        "automl": automl,
-        "metrics": metrics,
-        "metrics_df": summary_df,
-        "feature_importance": importance_df,
-        "confusion_matrix": conf_matrix
-    }
+    display(summary_df)
