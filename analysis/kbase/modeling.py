@@ -10,9 +10,9 @@ from flaml import AutoML
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score, f1_score, fbeta_score,
-    precision_score, recall_score, confusion_matrix,
+    precision_score, recall_score, accuracy_score, confusion_matrix,
     classification_report, average_precision_score, 
-    log_loss
+    log_loss, precision_recall_curve, roc_curve
 )
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.inspection import permutation_importance
@@ -128,6 +128,7 @@ def data_load_col_selection(target_column, triage_value, include_embeddings)-> p
         "month",
         "season",
         "location_patient",
+        "alert_receiver",
         "triage"
     ]
 
@@ -327,7 +328,7 @@ def run_automl_training(X_train, y_train, sample_weight, time_budget,
     
     return automl
 
-def optimize_threshold(y_train, y_train_prob, optimize_beta):
+def set_fb_threshold(y_train, y_train_prob, optimize_beta):
     """Finds the optimal decision threshold based on F-beta score"""
     print(f"\n--- Optimizing decision threshold (Beta={optimize_beta}) ---")
     thresholds = np.arange(0.05, 0.95, 0.01)
@@ -339,6 +340,383 @@ def optimize_threshold(y_train, y_train_prob, optimize_beta):
     print(f"Optimal threshold found: {best_threshold:.3f}")
     
     return best_threshold
+
+def optimize_clinical_threshold(
+    y_train,
+    y_train_prob,
+    y_test,
+    y_test_prob,
+    max_undertriage: float = 0.10,
+    max_overtriage: float = 0.50,
+) -> float:
+    """
+    Finds the optimal decision threshold using a clinically-grounded strategy.
+
+    Strategy:
+        Maximize F1 subject to two simultaneous constraints:
+            · Undertriage < max_undertriage  → FN / (FN + TP)
+            · Overtriage  < max_overtriage   → FP / (FP + TN)
+        Search is performed on TRAIN to avoid optimistic threshold selection.
+        Fallback to undertriage-only constraint if no threshold meets both.
+
+    Parameters
+    ----------
+    y_train : array-like
+        True labels for the training set.
+    y_train_prob : array-like
+        Predicted probabilities for the positive class (train set).
+    y_test : array-like
+        True labels for the test set (used only for visualization).
+    y_test_prob : array-like
+        Predicted probabilities for the positive class (test set).
+    max_undertriage : float
+        Maximum allowed undertriage rate (default 10%).
+    max_overtriage : float
+        Maximum allowed overtriage rate (default 50%).
+
+    Returns
+    -------
+    float
+        Optimal clinical threshold.
+    """
+    from sklearn.metrics import (
+        precision_recall_curve, roc_curve, roc_auc_score,
+        average_precision_score, accuracy_score
+    )
+
+    print("\n--- Optimizing clinical threshold ---")
+    print(f"    Constraints: undertriage < {max_undertriage:.0%} | overtriage < {max_overtriage:.0%}")
+
+    # Fine-grained threshold grid on TRAIN — 1000 points for uniform resolution
+    thresholds_grid = np.linspace(0.01, 0.99, 1000)
+
+    n_pos = int(y_train.sum())
+    n_neg = int(len(y_train) - n_pos)
+
+    undertriage_arr = np.array([
+        ((y_train_prob < thr) & (y_train == 1)).sum() / n_pos if n_pos > 0 else 0
+        for thr in thresholds_grid
+    ])
+    overtriage_arr = np.array([
+        ((y_train_prob >= thr) & (y_train == 0)).sum() / n_neg if n_neg > 0 else 0
+        for thr in thresholds_grid
+    ])
+
+    f1_arr = np.array([
+        f1_score(y_train, (y_train_prob >= thr).astype(int), zero_division=0)
+        for thr in thresholds_grid
+    ])
+    accuracy_arr = np.array([
+        accuracy_score(y_train, (y_train_prob >= thr).astype(int))
+        for thr in thresholds_grid
+    ])
+    recall_arr = np.array([
+        recall_score(y_train, (y_train_prob >= thr).astype(int), zero_division=0)
+        for thr in thresholds_grid
+    ])
+
+    # Maximize F1 within the safe zone (both constraints met simultaneously)
+    valid_mask    = (undertriage_arr < max_undertriage) & (overtriage_arr < max_overtriage)
+    valid_indices = np.where(valid_mask)[0]
+
+    if len(valid_indices) > 0:
+        best_idx           = valid_indices[np.argmax(f1_arr[valid_indices])]
+        clinical_threshold = float(thresholds_grid[best_idx])
+        print(f"\n  ✅ Optimal threshold : {clinical_threshold:.4f}")
+        print(f"     F1               : {f1_arr[best_idx]:.4f}")
+        print(f"     Accuracy         : {accuracy_arr[best_idx]:.4f}")
+        print(f"     Recall           : {recall_arr[best_idx]:.4f}")
+        print(f"     Undertriage      : {undertriage_arr[best_idx]:.2%}  (limit: {max_undertriage:.0%})")
+        print(f"     Overtriage       : {overtriage_arr[best_idx]:.2%}  (limit: {max_overtriage:.0%})")
+    else:
+        # Fallback: undertriage constraint only (clinically more critical)
+        print("\n  ⚠️  No threshold meets both constraints simultaneously.")
+        print("      → Fallback: undertriage constraint only")
+        under_only = np.where(undertriage_arr < max_undertriage)[0]
+
+        if len(under_only) > 0:
+            best_idx           = under_only[np.argmax(f1_arr[under_only])]
+            clinical_threshold = float(thresholds_grid[best_idx])
+            print(f"      → Fallback threshold : {clinical_threshold:.4f}")
+            print(f"         Resulting overtriage: {overtriage_arr[best_idx]:.2%} (exceeds {max_overtriage:.0%})")
+        else:
+            best_idx           = int(np.argmin(undertriage_arr))
+            clinical_threshold = float(thresholds_grid[best_idx])
+            print(f"      → Minimum undertriage threshold: {clinical_threshold:.4f}")
+
+    # -------------------------------------------------------------------------
+    # Visualization — 2x2 layout (threshold plot + ROC top, PR bottom center)
+    # -------------------------------------------------------------------------
+    fig = plt.figure(figsize=(18, 12))
+
+    # Top-left: threshold optimization curves
+    ax1 = fig.add_subplot(2, 2, 1)
+    ax1.plot(thresholds_grid, f1_arr,          'g-',  label='F1-Score',             linewidth=2)
+    ax1.plot(thresholds_grid, accuracy_arr,    'c-',  label='Accuracy',             linewidth=1.5, alpha=0.8)
+    ax1.plot(thresholds_grid, recall_arr,      'b--', label='Recall (Sensitivity)', linewidth=1.5, alpha=0.8)
+    ax1.plot(thresholds_grid, undertriage_arr, 'r-',  label='Undertriage (FN/P)',   linewidth=2)
+    ax1.plot(thresholds_grid, overtriage_arr,  'm-',  label='Overtriage (FP/N)',    linewidth=2)
+
+    ax1.axvline(clinical_threshold, color='black', linestyle='--', linewidth=1.5,
+                label=f'Optimal threshold = {clinical_threshold:.4f}')
+    ax1.axhline(max_undertriage, color='red',     linestyle=':', alpha=0.6,
+                label=f'Undertriage limit = {max_undertriage:.0%}')
+    ax1.axhline(max_overtriage,  color='magenta', linestyle=':', alpha=0.6,
+                label=f'Overtriage limit = {max_overtriage:.0%}')
+
+    if len(valid_indices) > 0:
+        thr_lo = thresholds_grid[valid_indices[0]]
+        thr_hi = thresholds_grid[valid_indices[-1]]
+        ax1.axvspan(thr_lo, thr_hi, alpha=0.08, color='green',
+                    label='Safe zone (both constraints met)')
+
+    ax1.set_title('Threshold Optimization\n'
+                  f'(max F1 | undertriage < {max_undertriage:.0%} & overtriage < {max_overtriage:.0%})')
+    ax1.set_xlabel('Decision Threshold')
+    ax1.set_ylabel('Rate / Metric')
+    ax1.legend(fontsize=7.5, loc='center right')
+    ax1.set_xlim([0, 1])
+    ax1.set_ylim([0, 1.05])
+    ax1.grid(alpha=0.3)
+
+    # Top-right: ROC Curve (TEST)
+    fpr_curve, tpr_curve, _ = roc_curve(y_test, y_test_prob)
+    roc_auc_val = roc_auc_score(y_test, y_test_prob)
+
+    ax2 = fig.add_subplot(2, 2, 2)
+    ax2.plot(fpr_curve, tpr_curve, 'navy', linewidth=2,
+             label=f'ROC-AUC = {roc_auc_val:.4f}')
+    ax2.plot([0, 1], [0, 1], 'gray', linestyle='--', label='Random (0.5)')
+
+    test_under = ((y_test_prob < clinical_threshold) & (y_test == 1)).sum() / y_test.sum()
+    test_spec  = ((y_test_prob < clinical_threshold) & (y_test == 0)).sum() / (y_test == 0).sum()
+    ax2.scatter([1 - test_spec], [1 - test_under], color='black', zorder=5, s=80,
+                label=f'Threshold = {clinical_threshold:.4f}')
+
+    ax2.set_title('ROC Curve (Test Set)')
+    ax2.set_xlabel('1 - Specificity (FPR)')
+    ax2.set_ylabel('Sensitivity (TPR)')
+    ax2.legend(fontsize=9)
+    ax2.grid(alpha=0.3)
+
+    # Bottom-center: PR Curve (TEST) — spans both bottom columns
+    ax3 = fig.add_subplot(2, 2, 3)
+    prec_curve, rec_curve, _ = precision_recall_curve(y_test, y_test_prob)
+    pr_auc_val = average_precision_score(y_test, y_test_prob)
+    baseline   = float(y_test.mean())
+
+    ax3.plot(rec_curve, prec_curve, 'darkorange', linewidth=2,
+             label=f'PR-AUC = {pr_auc_val:.4f}')
+    ax3.axhline(baseline, color='gray', linestyle='--',
+                label=f'Baseline (random) = {baseline:.2f}')
+
+    test_pred_opt = (y_test_prob >= clinical_threshold).astype(int)
+    opt_prec = precision_score(y_test, test_pred_opt, zero_division=0)
+    opt_rec  = recall_score(y_test, test_pred_opt, zero_division=0)
+    ax3.scatter([opt_rec], [opt_prec], color='black', zorder=5, s=80,
+                label=f'Threshold = {clinical_threshold:.4f}  |  P={opt_prec:.3f}  R={opt_rec:.3f}')
+
+    ax3.set_title('Precision-Recall Curve (Test Set)')
+    ax3.set_xlabel('Recall (Sensitivity)')
+    ax3.set_ylabel('Precision (PPV)')
+    ax3.legend(fontsize=9)
+    ax3.set_xlim([0, 1])
+    ax3.set_ylim([0, 1.05])
+    ax3.grid(alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+    return clinical_threshold
+
+def print_train_test_comparison(
+    automl,
+    X_train, y_train,
+    X_test,  y_test,
+    threshold: float,
+    pr_auc_diff_threshold: float = 0.05,
+    f1_diff_threshold: float     = 0.05,
+    overfit_gap_threshold: float = 0.05,
+) -> pd.DataFrame:
+    """
+    Computes and prints a train vs test performance comparison table.
+
+    Underfitting  : train metric below a prevalence-adjusted baseline
+    Overfitting   : gap (train - test) exceeds overfit_gap_threshold
+                    (PR-AUC and F1 use their own configurable thresholds)
+
+    Layout:
+        Metric | Baseline | Train | Underfit threshold | Underfitting
+               | Test | Gap | Max Gap | Overfitting
+
+    Parameters
+    ----------
+    automl : FLAML AutoML object
+    X_train, y_train : training features and labels
+    X_test,  y_test  : test features and labels
+    threshold        : decision threshold for binarizing predictions
+    pr_auc_diff_threshold : max allowed gap for PR-AUC overfitting flag
+    f1_diff_threshold     : max allowed gap for F1 overfitting flag
+    overfit_gap_threshold : default max gap for all other metrics (default 0.05)
+
+    Returns
+    -------
+    pd.DataFrame with all computed values and flags
+    """
+    from sklearn.metrics import (
+        f1_score, precision_score, recall_score,
+        roc_auc_score, average_precision_score, accuracy_score
+    )
+
+    # Prevalence computed automatically from y_train
+    prevalence = float(y_train.mean())
+
+    # --- Probabilities and predictions ---
+    y_train_prob = automl.predict_proba(X_train)[:, 1]
+    y_test_prob  = automl.predict_proba(X_test)[:, 1]
+
+    y_train_pred = (y_train_prob >= threshold).astype(int)
+    y_test_pred  = (y_test_prob  >= threshold).astype(int)
+
+    # --- Compute metrics ---
+    def _metrics(y_true, y_pred, y_prob):
+        return {
+            "PR-AUC":    average_precision_score(y_true, y_prob),
+            "ROC-AUC":   roc_auc_score(y_true, y_prob),
+            "F1":        f1_score(y_true, y_pred, zero_division=0),
+            "Accuracy":  accuracy_score(y_true, y_pred),
+            "Precision": precision_score(y_true, y_pred, zero_division=0),
+            "Recall":    recall_score(y_true, y_pred, zero_division=0),
+        }
+
+    train_m = _metrics(y_train, y_train_pred, y_train_prob)
+    test_m  = _metrics(y_test,  y_test_pred,  y_test_prob)
+
+    # -------------------------------------------------------------------------
+    # Baselines: value a random classifier would achieve for each metric
+    # -------------------------------------------------------------------------
+    baselines = {
+        "PR-AUC":    (prevalence,          f"{prevalence*100:.1f}%  (prevalence)"),
+        "ROC-AUC":   (0.50,                "50.0%  (random)"),
+        "F1":        (0.0,                 "~0.0%  (imbalanced)"),
+        "Accuracy":  (1 - prevalence,      f"{(1-prevalence)*100:.1f}%  (majority class)"),
+        "Precision": (prevalence,          f"{prevalence*100:.1f}%  (prevalence)"),
+        "Recall":    (0.50,                "50.0%  (floor)"),
+    }
+
+    # -------------------------------------------------------------------------
+    # Prevalence-adjusted underfitting thresholds
+    # -------------------------------------------------------------------------
+    underfit_thresholds = {
+        "PR-AUC":    (min(prevalence * 2, 0.50),
+                      f"prevalence × 2 = {min(prevalence*2, 0.50)*100:.1f}%"),
+        "ROC-AUC":   (0.60,
+                      "random + 10pp = 60.0%"),
+        "F1":        (max(0.30, prevalence * 1.5),
+                      f"max(0.30, prev×1.5) = {max(0.30, prevalence*1.5)*100:.1f}%"),
+        "Accuracy":  ((1 - prevalence) + 0.05,
+                      f"majority + 5pp = {((1-prevalence)+0.05)*100:.1f}%"),
+        "Precision": (prevalence * 1.5,
+                      f"prevalence × 1.5 = {prevalence*1.5*100:.1f}%"),
+        "Recall":    (0.50,
+                      "clinical floor = 50.0%"),
+    }
+
+    # -------------------------------------------------------------------------
+    # Per-metric gap thresholds for overfitting detection
+    # PR-AUC and F1 use their own configurable thresholds;
+    # all others use the shared overfit_gap_threshold argument
+    # -------------------------------------------------------------------------
+    diff_thresholds = {
+        "PR-AUC":    pr_auc_diff_threshold,
+        "ROC-AUC":   overfit_gap_threshold,
+        "F1":        f1_diff_threshold,
+        "Accuracy":  overfit_gap_threshold,
+        "Precision": overfit_gap_threshold,
+        "Recall":    overfit_gap_threshold,
+    }
+
+    rows = []
+    for metric in train_m:
+        train_val              = train_m[metric]
+        test_val               = test_m[metric]
+        gap                    = train_val - test_val
+        diff_thr               = diff_thresholds[metric]
+        under_thr, under_label = underfit_thresholds[metric]
+        baseline_val, baseline_label = baselines[metric]
+
+        is_underfit = train_val < under_thr
+        is_overfit  = gap > diff_thr
+
+        rows.append({
+            "Metric":         metric,
+            "Baseline":       baseline_val,
+            "Baseline_label": baseline_label,
+            "Train":          train_val,
+            "Underfit_thr":   under_thr,
+            "Underfit_label": under_label,
+            "Underfitting":   "🔴 Yes" if is_underfit else "✅ No",
+            "Test":           test_val,
+            "Gap (Tr-Te)":    gap,
+            "Max Gap":        diff_thr,
+            "Overfitting":    "🔴 Yes" if is_overfit  else "✅ No",
+        })
+
+    comparison_df = pd.DataFrame(rows)
+
+    # -------------------------------------------------------------------------
+    # Pretty print
+    # -------------------------------------------------------------------------
+    sep = "─" * 112
+
+    print("\n" + sep)
+    print(f"{'TRAIN vs TEST PERFORMANCE COMPARISON':^112}")
+    print(f"{'(threshold applied: ' + str(round(threshold, 4)) + ')':^112}")
+    print(sep)
+    print(f"  Dataset context  :  prevalence = {prevalence*100:.1f}%  "
+          f"|  PR-AUC random baseline = {prevalence*100:.1f}%  "
+          f"|  Accuracy random baseline = {(1-prevalence)*100:.1f}%")
+    print(f"  Overfitting gap  :  default threshold = {overfit_gap_threshold*100:.1f}pp  "
+          f"(PR-AUC = {pr_auc_diff_threshold*100:.1f}pp, F1 = {f1_diff_threshold*100:.1f}pp)")
+    print(f"  Underfitting     :  thresholds adjusted per metric based on dataset prevalence.")
+    print(sep)
+
+    # Column headers — two logical groups separated visually
+    print(
+        f"  {'Metric':<12}"
+        f"  {'Baseline':<26}"        # random classifier reference
+        f"  {'Train':>8}"
+        f"  {'Underfit threshold':<26}"
+        f"  {'Underfit':^10}"
+        f"  {'Test':>8}"
+        f"  {'Gap':>8}"
+        f"  {'Max Gap':>8}"
+        f"  {'Overfit':^10}"
+    )
+    print(sep)
+
+    for _, row in comparison_df.iterrows():
+        print(
+            f"  {row['Metric']:<12}"
+            f"  {row['Baseline_label']:<26}"
+            f"  {row['Train']*100:>7.2f}%"
+            f"  {row['Underfit_label']:<26}"
+            f"  {row['Underfitting']:^10}"
+            f"  {row['Test']*100:>7.2f}%"
+            f"  {row['Gap (Tr-Te)']*100:>+7.2f}pp"
+            f"  {row['Max Gap']*100:>7.1f}pp"
+            f"  {row['Overfitting']:^10}"
+        )
+
+    print(sep)
+
+    n_overfit  = comparison_df["Overfitting"].str.contains("Yes").sum()
+    n_underfit = comparison_df["Underfitting"].str.contains("Yes").sum()
+    print(f"\n  Underfitting: {n_underfit} metric(s) flagged  |  "
+          f"Overfitting: {n_overfit} metric(s) flagged")
+    print(sep + "\n")
+
+    return comparison_df
 
 def plot_feature_importances(automl, X_train, feature_importance,
                              X_test, y_test, seed, task="classification"):
@@ -542,8 +920,6 @@ def plot_feature_importances(automl, X_train, feature_importance,
 
     return importance_df_permutation, importance_df_builtin
 
-import warnings
-
 def plot_shap_interpretation(automl, X_test, task="classification", max_display=15, seed=42):
     """
     Computes SHAP values and plots a summary excluding embedding features.
@@ -555,13 +931,16 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
     print("\n--- Initializing SHAP Explainer ---")
 
     def _prepare_for_shap(X):
-        """Convert categorical columns to numeric codes for SHAP compatibility.
-        Required for XGBoost, LightGBM and any model that stored categorical
-        metadata during training — avoids 'categorical_feature do not match' errors."""
+        """
+        Convert categorical columns to plain int32 for SHAP compatibility.
+        LightGBM stores categorical metadata during training and validates
+        that input dtypes match — cat.codes returns int8/int16 which can
+        still trigger the mismatch error. Casting to int32 avoids this.
+        """
         X_shap = X.copy()
         cat_cols = X_shap.select_dtypes(include='category').columns
         for col in cat_cols:
-            X_shap[col] = X_shap[col].cat.codes
+            X_shap[col] = X_shap[col].cat.codes.astype('int32')
         return X_shap
 
     try:
@@ -575,19 +954,16 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
         sample_size = min(500, len(X_test))
         X_sample = X_test.sample(sample_size, random_state=seed)
 
-        # Convert categoricals to numeric codes — applied to all model types
-        # to avoid categorical mismatch errors between training and SHAP input
+        # Convert categoricals to int32 — applied to all model types
         X_sample_shap = _prepare_for_shap(X_sample)
 
         # Precompute non-embedding column indices once for slicing shap_values arrays
-        all_cols = X_test.columns.tolist()
+        all_cols    = X_test.columns.tolist()
         non_emb_idx = [all_cols.index(c) for c in non_emb_cols]
 
         # X used for plotting — converted + clinical columns only
         X_plot = X_sample_shap[non_emb_cols]
 
-        # Use TreeExplainer for tree-based models (exact, fast)
-        # Fallback to generic Explainer for linear or other model types
         tree_model_types = (
             "LGBMClassifier", "XGBClassifier", "RandomForestClassifier",
             "ExtraTreesClassifier", "GradientBoostingClassifier"
@@ -595,22 +971,51 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
 
         if type(model).__name__ in tree_model_types:
             print(f"Using TreeExplainer for {type(model).__name__}...")
-            explainer = shap.TreeExplainer(model)
-            shap_values = explainer.shap_values(X_sample_shap)
+
+            if type(model).__name__ == "LGBMClassifier":
+                # LightGBM stores categorical feature indices in booster_.pandas_categorical
+                # and validates them on every prediction call, including those made by SHAP.
+                # Converting to int32 is not enough — LightGBM checks its own internal
+                # metadata, not the dtype of the input.
+                # Fix: temporarily patch pandas_categorical to empty, compute SHAP values,
+                # then restore the original metadata unconditionally via finally.
+                #
+                # booster_ is the underlying Booster object exposed by LGBMClassifier.
+                # We probe for pandas_categorical defensively in case the attribute
+                # does not exist in older LightGBM versions.
+                booster = model.booster_
+                original_categorical = getattr(booster, 'pandas_categorical', None)
+
+                if original_categorical is not None:
+                    booster.pandas_categorical = []
+
+                try:
+                    explainer   = shap.TreeExplainer(
+                        model,
+                        feature_perturbation="tree_path_dependent"
+                    )
+                    shap_values = explainer.shap_values(X_sample_shap)
+                finally:
+                    # Restore original metadata even if SHAP raises an exception
+                    if original_categorical is not None:
+                        booster.pandas_categorical = original_categorical
+            else:
+                explainer   = shap.TreeExplainer(model)
+                shap_values = explainer.shap_values(X_sample_shap)
+
         else:
             print(f"Using generic Explainer for {type(model).__name__}...")
-            background = X_sample_shap.sample(min(100, len(X_sample_shap)), random_state=seed)
-            explainer = shap.Explainer(model, background)
-            shap_out = explainer(X_sample_shap)
+            background  = X_sample_shap.sample(min(100, len(X_sample_shap)), random_state=seed)
+            explainer   = shap.Explainer(model, background)
+            shap_out    = explainer(X_sample_shap)
             shap_values = shap_out.values
 
         print(f"SHAP values computed on {sample_size} samples.")
 
         # --- Plotting ---
         if task == "multiclass":
-            # TreeExplainer returns a list of 2D arrays (one per class)
-            # Generic Explainer returns a 3D array (n_samples, n_features, n_classes)
-            # Normalize to list of 2D arrays for consistent handling
+            # TreeExplainer returns list of 2D arrays (one per class)
+            # Generic Explainer returns 3D array (n_samples, n_features, n_classes)
             if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
                 shap_values = [shap_values[:, :, i] for i in range(shap_values.shape[2])]
 
@@ -628,19 +1033,15 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
                         max_display=max_display,
                         show=True,
                     )
-
         else:
-            # Binary classification:
-            # - TreeExplainer returns list [neg_class, pos_class] or single 2D array
-            # - Generic Explainer returns 2D array directly
-            # Always use positive class (index 1) for interpretability
+            # Binary: use positive class (index 1)
+            # TreeExplainer → list [neg, pos] or single 2D array
+            # Generic Explainer → 2D array directly
             if isinstance(shap_values, list):
-                # RandomForest / tree models return list of arrays — take positive class
                 shap_values_binary = shap_values[1]
             elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
                 shap_values_binary = shap_values[:, :, 1]
             else:
-                # Already a 2D array (XGBoost, generic explainer)
                 shap_values_binary = shap_values
 
             shap_filtered = shap_values_binary[:, non_emb_idx]
@@ -667,7 +1068,7 @@ def run_binary_automl_model(
     target_column: str,
     demand_code: Optional[Union[int, List[int]]] = None,
     triage_value: Optional[int] = None,
-    include_embeddings: bool = True,
+    include_embeddings: bool = False,
     export_table: bool = False, 
     time_budget: int = 600,
     test_size: float = 0.2,
@@ -675,7 +1076,10 @@ def run_binary_automl_model(
     min_age: Optional[int] = None,
     optimize_metric: Optional[str] = None,
     n_splits_cv: int = 5,
-    optimize_beta: int = 2,
+    optimize_beta: int = 1,
+    use_clinical_threshold: bool = False,   
+    max_undertriage: float = 0.10,          
+    max_overtriage: float = 0.50,  
     feature_importance: int = 0,
     plot_shap: bool = True
 ) -> dict:
@@ -760,7 +1164,16 @@ def run_binary_automl_model(
     # -----------------------------
     y_train_prob = automl.predict_proba(X_train)[:, 1]
     y_test_prob = automl.predict_proba(X_test)[:, 1]
-    best_threshold = optimize_threshold(y_train, y_train_prob, optimize_beta)
+    
+    if use_clinical_threshold:
+        best_threshold = optimize_clinical_threshold(
+            y_train, y_train_prob,
+            y_test,  y_test_prob,
+            max_undertriage=max_undertriage,
+            max_overtriage=max_overtriage,
+        )
+    else:
+        best_threshold = set_fb_threshold(y_train, y_train_prob, optimize_beta)
     
     # -----------------------------
     # Test set evaluation
@@ -866,7 +1279,16 @@ def run_binary_automl_model(
     
     print("\n" + "="*60 + "\n")
 
-    # Plot metrics
+    # Train vs Test comparison — overfitting / underfitting diagnosis
+    comparison_df = print_train_test_comparison(
+        automl, X_train, y_train, X_test, y_test,
+        threshold=best_threshold,
+        pr_auc_diff_threshold=0.05,
+        f1_diff_threshold=0.05,
+        overfit_gap_threshold=0.05,   
+    )
+
+    # Plot test metrics
     # Create an evaluation dataframe by mapping back to the filtered data
     plot_df = df.loc[y_test.index].copy() 
     plot_df['target_real'] = y_test
