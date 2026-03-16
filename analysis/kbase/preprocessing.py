@@ -12,7 +12,9 @@ os.chdir(settings.source_tables_path)
 wd = os.getcwd()
 print(f"El directorio de trabajo actual es: {wd}")
 
+# Remove limitations in console prints
 pd.set_option('display.max_columns', None)
+pd.set_option('display.max_colwidth', None)
 pd.set_option('display.max_rows', None)
 pd.set_option('display.width', 1000)
 
@@ -458,6 +460,61 @@ def filter_rows_by_icd(df, icd_value, icd_columns):
 
     # Return filtered rows
     return df_icd[mask]
+
+import os
+import pyarrow.parquet as pq
+
+# Function to merge main df with embedding table (newly or already created)
+def merge_text_embeddings(run_mode, df_embeddings, embedding_path, df_main):
+    """
+    Handles loading or utilizing text embeddings and merges them with the main DataFrame.
+    
+    Args:
+        run_mode (int): If 0, loads embeddings from disk. Otherwise, uses the provided DataFrame.
+        df_embeddings (pd.DataFrame): The newly created embedding DataFrame (if any).
+        embedding_path (str): Filename/path for the saved embedding table.
+        df_main (pd.DataFrame): The primary DataFrame (e.g., triage data).
+        source_path (str): The directory path where embedding files are stored.
+        
+    Returns:
+        pd.DataFrame: The main DataFrame merged with embedding features.
+    """
+    
+    # --- Handling Embedding Table (New or Saved) ---
+    if run_mode == 0:
+        # Scenario: Embeddings already exist, just load them
+        print("--- Loading previously saved embedding table ---")
+        full_path = os.path.join(settings.source_tables_path, embedding_path)
+        df_embeddings = pq.read_table(full_path).to_pandas()
+    else:
+        # Scenario: df_embeddings was just created by the embedding function
+        print("--- Using newly created embeddings ---")
+
+    # --- Unified Merge Logic ---
+    # We only perform the join if df_embeddings is available (either loaded or created)
+    if df_embeddings is not None:
+        print(f"--- Merging embeddings ({len(df_embeddings)} rows) "
+              f"with main table ({len(df_main)} rows) ---")
+        
+        # We drop 'literal_reason' from the embedding table to avoid duplication
+        # We use 'on' because both tables must share the 'demandpk' column
+        df_main = df_main.merge(
+            df_embeddings.drop(columns=['literal_reason'], errors='ignore'), 
+            on='demandpk', 
+            how='left'
+        )
+        
+        # Optional: ensure memory efficiency by deleting the temporary dataframe
+        del df_embeddings
+        print("--- Merge completed successfully ---")
+    else:
+        print("Error: No embedding data found to merge.")
+
+    print(f"\n" + "="*40)
+    print(f"Number of features for modeling: {len(df_main.columns)}")
+    print("="*40 + "\n")
+        
+    return df_main
 
 ## Function to analyze missing values
 def analyze_missing_values(df):
