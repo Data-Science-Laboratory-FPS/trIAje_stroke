@@ -408,6 +408,82 @@ def set_fb_threshold(y_train, y_train_prob, optimize_beta):
     
     return best_threshold
 
+def compute_youden_threshold(y_train, y_train_prob, y_test, y_test_prob):
+    """
+    Finds the optimal decision threshold by maximising the Youden index J = Se + Sp - 1.
+
+    Geometrically, J is the maximum vertical distance between the ROC curve and
+    the no-discrimination diagonal. The threshold that maximises J provides the
+    best symmetric trade-off between sensitivity and specificity.
+
+    Note: Youden assumes symmetric misclassification costs. In emergency triage it
+    serves as an exploratory starting point before shifting the threshold toward
+    higher sensitivity by clinical imperative.
+
+    Optimisation is performed on TRAIN to avoid threshold over-fitting on TEST.
+    The ROC curve plotted uses TEST for an unbiased visual assessment.
+
+    Parameters
+    ----------
+    y_train, y_train_prob : train labels and predicted probabilities
+    y_test,  y_test_prob  : test labels and predicted probabilities
+
+    Returns
+    -------
+    float
+        Optimal threshold (maximises J on train set).
+    """
+    print("\n--- Optimising decision threshold (Youden Index) ---")
+
+    # Compute ROC on TRAIN — threshold selection must not touch TEST
+    fpr_train, tpr_train, thresholds_train = roc_curve(y_train, y_train_prob)
+
+    # J = Se + Sp - 1  ≡  tpr - fpr
+    youden_j  = tpr_train - fpr_train
+    best_idx  = int(np.argmax(youden_j))
+    best_thr  = float(thresholds_train[best_idx])
+    best_j    = float(youden_j[best_idx])
+    best_se   = float(tpr_train[best_idx])
+    best_sp   = float(1.0 - fpr_train[best_idx])
+
+    print(f"  Optimal threshold : {best_thr:.4f}")
+    print(f"  Youden J          : {best_j:.4f}")
+    print(f"  Sensitivity (Se)  : {best_se:.4f}")
+    print(f"  Specificity (Sp)  : {best_sp:.4f}")
+
+    # --- ROC plot on TEST with Youden point (from train optimisation) ---
+    fpr_test, tpr_test, _ = roc_curve(y_test, y_test_prob)
+    auc_test = roc_auc_score(y_test, y_test_prob)
+
+    fig, ax = plt.subplots(figsize=(7, 6))
+
+    ax.plot(fpr_test, tpr_test, color='steelblue', lw=2,
+            label=f'ROC curve — test  (AUC = {auc_test:.3f})')
+    ax.plot([0, 1], [0, 1], 'k--', lw=1, label='No discrimination')
+
+    # Youden point
+    ax.scatter(1.0 - best_sp, best_se, color='crimson', zorder=5, s=120,
+               label=(f'Youden point  J = {best_j:.3f}\n'
+                      f'Se = {best_se:.3f}   Sp = {best_sp:.3f}\n'
+                      f'Threshold = {best_thr:.4f}'))
+
+    # Vertical segment from diagonal to Youden point (visual magnitude of J)
+    ax.vlines(x=1.0 - best_sp,
+              ymin=1.0 - best_sp, ymax=best_se,
+              colors='crimson', linestyles='dashed', lw=1.5, alpha=0.7,
+              label=f'J = {best_j:.3f}  (vertical distance to diagonal)')
+
+    ax.set_xlabel('1 − Specificity  (FPR)', fontsize=11)
+    ax.set_ylabel('Sensitivity  (TPR)', fontsize=11)
+    ax.set_title('ROC Curve — Youden Index Threshold', fontsize=13)
+    ax.legend(loc='lower right', fontsize=9)
+    ax.set_xlim([0.0, 1.0])
+    ax.set_ylim([0.0, 1.02])
+    plt.tight_layout()
+    plt.show()
+
+    return best_thr
+
 def optimize_clinical_threshold(
     y_train,
     y_train_prob,
@@ -1169,9 +1245,10 @@ def run_binary_automl_model(
     optimize_metric: Optional[str] = None,
     n_splits_cv: int = 5,
     optimize_beta: int = 1,
-    use_clinical_threshold: bool = False,   
-    max_undertriage: float = 0.10,          
-    max_overtriage: float = 0.50,  
+    use_clinical_threshold: bool = False,
+    use_youden: bool = False,
+    max_undertriage: float = 0.10,
+    max_overtriage: float = 0.50,
     feature_importance: int = 0,
     plot_shap: bool = True
 ) -> dict:
@@ -1269,6 +1346,11 @@ def run_binary_automl_model(
             y_test,  y_test_prob,
             max_undertriage=max_undertriage,
             max_overtriage=max_overtriage,
+        )
+    elif use_youden:
+        best_threshold = compute_youden_threshold(
+            y_train, y_train_prob,
+            y_test,  y_test_prob,
         )
     else:
         best_threshold = set_fb_threshold(y_train, y_train_prob, optimize_beta)
