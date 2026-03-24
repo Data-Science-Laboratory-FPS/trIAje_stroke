@@ -18,6 +18,7 @@ from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.inspection import permutation_importance
 import matplotlib.pyplot as plt
 import os
+from datetime import datetime
 import pyarrow.parquet as pq
 from typing import Optional, List, Union
 import shap
@@ -97,6 +98,10 @@ protocol_questions = {
     ]
 }
 
+def time_print():
+    now = datetime.now() 
+    print(f"Current Date and Time: {now.strftime('%d/%m/%Y %H:%M:%S')}\n")
+
 def triage_print(triage_value, cohort_name, demand_code):
     """ Prints the initial configuration of the model run """
     print(f"=== Running the model for {cohort_name} cohort - code {demand_code} ===")
@@ -119,16 +124,22 @@ def data_load_col_selection(target_column, triage_value, include_embeddings)-> p
 
     # Select base columns 
     base_cols = [
+        "demandpk",
         "age",
         "sex",
         "demand_type_1",
+        "literal_reason",
         target_column,
         "day_week",
         "time_of_day",
         "month",
         "season",
+        "year",
         "location_patient",
         "alert_receiver",
+        "province", 
+        "incident_latitude", 
+        "incident_longitude",
         "triage"
     ]
 
@@ -160,7 +171,7 @@ def col_validation(df, target_column):
         raise ValueError("Required column 'triage' not found in dataframe")
 
 def data_filtering(df, target_column, demand_code, 
-                   triage_value, min_age, export_table, protocol_features) -> pd.DataFrame:
+                   triage_value, min_age, years, export_table, protocol_features) -> pd.DataFrame:
     """Applies cohort, triage, age, and protocol-specific filters"""
 
     # Filter by valid values in target_column
@@ -192,6 +203,13 @@ def data_filtering(df, target_column, demand_code,
             raise ValueError("'age' column not found but min_age was provided")
         df = df[df["age"] >= min_age].copy()
         print(f"Filtering by age >= {min_age}")
+
+    # Filter by specific years
+    if years is not None:
+        if "year" not in df.columns:
+            raise ValueError("'year' column not found but years was provided")
+        df = df[df["year"].isin(years)].copy()
+        print(f"Filtering specific year cohort: {years}")
 
     # Drop triage columns not present in the specific demand type
     if demand_code is not None and protocol_features is not None:
@@ -225,7 +243,7 @@ def data_filtering(df, target_column, demand_code,
                   if col.startswith('q') else col for col in df.columns]
                    
     # Drop columns after cohort filtering
-    cols_to_drop = ["demand_type_1"]
+    cols_to_drop = ["demand_type_1", "triage", "year"]
     cols_to_drop = [c for c in cols_to_drop if c in df.columns]
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
@@ -261,6 +279,10 @@ def data_filtering(df, target_column, demand_code,
     print("Outcome distribution: ", df[target_column].value_counts(dropna=False), "\n")
     # Show info for only the first 50 columns
     df.iloc[:, :50].info()
+
+    print(f"\n" + "="*40)
+    print(f"Number of features for modeling: {len(df.columns)}")
+    print("="*40 + "\n")
 
     return df
 
@@ -298,9 +320,12 @@ def train_test_split_weights(df, target_column, test_size, seed):
 
     return X_train, X_test, y_train, y_test, sample_weight
 
+import pandas as pd
+from flaml import AutoML
+
 def run_automl_training(X_train, y_train, sample_weight, time_budget, 
                         optimize_metric, n_splits_cv, seed, task):
-    """Executes the FLAML AutoML optimization process"""
+    """Executes the FLAML AutoML optimization process and prints a benchmarking table"""
     print(f"\n--- Starting AutoML ({task.upper()}) | Budget: {time_budget}s ---")
     if optimize_metric is None:
         print("Training metric: FLAML default")
@@ -325,6 +350,44 @@ def run_automl_training(X_train, y_train, sample_weight, time_budget,
     print("\n--- Training completed ---")
     print(f"Best estimator: {automl.best_estimator}")
     print(f"Best CV score:  {1 - automl.best_loss:.4f}")
+
+    # ---------------------------------------------------------
+    # Benchmarking: Best Per Estimator Analysis
+    # ---------------------------------------------------------
+    try:
+        history_list = []
+        
+        # Method A: Try accessing via best_loss_per_estimator (most stable)
+        if hasattr(automl, 'best_loss_per_estimator') and automl.best_loss_per_estimator:
+            for learner, loss in automl.best_loss_per_estimator.items():
+                if loss < 1.0: # Only include learners that were actually tested
+                    history_list.append({
+                        'Estimator': learner,
+                        'CV_Score': 1 - loss
+                    })
+        
+        # Method B: Fallback to _search_states if Method A provided no results
+        if not history_list and hasattr(automl, '_search_states'):
+            for learner_id, state in automl._search_states.items():
+                if hasattr(state, 'best_loss') and state.best_loss < 1.0:
+                    history_list.append({
+                        'Estimator': learner_id,
+                        'CV_Score': 1 - state.best_loss
+                    })
+
+        if history_list:
+            benchmark_df = pd.DataFrame(history_list)
+            # Sort by best score
+            top_models = benchmark_df.sort_values(by='CV_Score', ascending=False).reset_index(drop=True)
+            top_models.index += 1 # Start ranking at 1
+
+            print("\n--- Model Benchmarking (Best Results per Estimator Type) ---")
+            print(top_models.to_string())
+        else:
+            print("\n⚠️ No detailed benchmarking history available for this run.")
+        
+    except Exception as e:
+        print(f"\n⚠️ Could not generate benchmarking table: {e}")
     
     return automl
 
@@ -928,7 +991,9 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
     For binary classification: single summary plot.
     For multiclass: one summary plot per class.
     """
+    import time
     print("\n--- Initializing SHAP Explainer ---")
+    _start_time = time.time()
 
     def _prepare_for_shap(X):
         """
@@ -994,7 +1059,13 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
                         model,
                         feature_perturbation="tree_path_dependent"
                     )
-                    shap_values = explainer.shap_values(X_sample_shap)
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings(
+                            "ignore",
+                            message="LightGBM binary classifier.*TreeExplainer",
+                            category=UserWarning
+                        )
+                        shap_values = explainer.shap_values(X_sample_shap)
                 finally:
                     # Restore original metadata even if SHAP raises an exception
                     if original_categorical is not None:
@@ -1057,6 +1128,8 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
                 )
 
         print("SHAP interpretation completed successfully.")
+        elapsed = time.time() - _start_time
+        print(f"Total SHAP time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
         return shap_values
 
     except Exception as e:
@@ -1074,6 +1147,8 @@ def run_binary_automl_model(
     test_size: float = 0.2,
     seed: int = 42,
     min_age: Optional[int] = None,
+    years: Optional[List[int]] = None,
+    sex_group: bool = False,
     optimize_metric: Optional[str] = None,
     n_splits_cv: int = 5,
     optimize_beta: int = 1,
@@ -1127,6 +1202,11 @@ def run_binary_automl_model(
     """
 
     # -----------------------------
+    # Print time
+    # -----------------------------
+    time_print()
+
+    # -----------------------------
     # Print type of triage-specific cohort
     # -----------------------------
     triage_print(triage_value, cohort_name, demand_code)
@@ -1145,7 +1225,7 @@ def run_binary_automl_model(
     # Cohort & triage filtering
     # -----------------------------
     df_filtered = data_filtering(df, target_column, demand_code, triage_value, min_age,
-                        export_table, protocol_features=protocol_questions)
+                        years, export_table, protocol_features=protocol_questions)
 
     # -----------------------------
     # Train / test split
@@ -1293,7 +1373,7 @@ def run_binary_automl_model(
     plot_df = df.loc[y_test.index].copy() 
     plot_df['target_real'] = y_test
     plot_df['target_pred'] = y_test_pred
-    eda.evaluate_diagnostic_performance(plot_df, 'target_real', 'target_pred')
+    eda.evaluate_diagnostic_performance(plot_df, 'target_real', 'target_pred', sex_group = False)
 
     # -----------------------------
     # Feature importance
