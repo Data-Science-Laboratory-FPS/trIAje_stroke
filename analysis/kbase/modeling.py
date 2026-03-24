@@ -19,6 +19,7 @@ from sklearn.inspection import permutation_importance
 import matplotlib.pyplot as plt
 import os
 from datetime import datetime
+import time
 import pyarrow.parquet as pq
 from typing import Optional, List, Union
 import shap
@@ -115,7 +116,8 @@ def triage_print(triage_value, cohort_name, demand_code):
     else:
         raise ValueError("triage_value must be None, 0, or 1")
 
-def data_load_col_selection(target_column, triage_value, include_embeddings)-> pd.DataFrame:
+def data_load_col_selection(target_column, triage_value, 
+                            include_medication, include_embeddings)-> pd.DataFrame:
     """Loads data and performs initial feature selection based on settings"""
     # Load preprocessed cleaned table
     df = pq.read_table(
@@ -128,7 +130,6 @@ def data_load_col_selection(target_column, triage_value, include_embeddings)-> p
         "age",
         "sex",
         "demand_type_1",
-        "literal_reason",
         target_column,
         "day_week",
         "time_of_day",
@@ -148,6 +149,9 @@ def data_load_col_selection(target_column, triage_value, include_embeddings)-> p
     # Add triage questions (One-Hot Encoded columns)
     if triage_value != 0:
         modelling_cols += [col for col in df.columns if col.startswith('q')]
+    # Add medication (One-Hot Encoded columns)
+    if include_medication == True:
+        modelling_cols += [col for col in df.columns if col.startswith('atc_')]
     # Include NLP text embeddings if flag is set to True
     if include_embeddings:
         embedding_cols = [col for col in df.columns if col.startswith('emb_')]
@@ -242,12 +246,6 @@ def data_filtering(df, target_column, demand_code,
     df.columns = [col.replace('q', '', 1).replace('_', '') 
                   if col.startswith('q') else col for col in df.columns]
                    
-    # Drop columns after cohort filtering
-    cols_to_drop = ["demand_type_1", "triage", "year"]
-    cols_to_drop = [c for c in cols_to_drop if c in df.columns]
-    if cols_to_drop:
-        df = df.drop(columns=cols_to_drop)
-
     # Export of preprocessed, ready for modeling, table
     if export_table:    
         rule_to_path = {
@@ -274,6 +272,12 @@ def data_filtering(df, target_column, demand_code,
             print(f"--- Size: {file_size_mb:.2f} MB")
         else:
             print(f"❌ Export failed: File not found at {export_path}")
+
+    # Drop columns after cohort filtering and data export
+    cols_to_drop = ["demandpk", "demand_type_1", "triage", "year", "literal_reason"]
+    cols_to_drop = [c for c in cols_to_drop if c in df.columns]
+    if cols_to_drop:
+        df = df.drop(columns=cols_to_drop)
 
     print(f"\nFinal cohort size for {target_column}: {len(df)}")
     print("Outcome distribution: ", df[target_column].value_counts(dropna=False), "\n")
@@ -991,7 +995,7 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
     For binary classification: single summary plot.
     For multiclass: one summary plot per class.
     """
-    import time
+
     print("\n--- Initializing SHAP Explainer ---")
     _start_time = time.time()
 
@@ -1022,9 +1026,21 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
         # Convert categoricals to int32 — applied to all model types
         X_sample_shap = _prepare_for_shap(X_sample)
 
+        # Align features to what the model was actually trained on.
+        # FLAML may internally select a feature subset, so X_test can have
+        # more columns than the underlying estimator expects.
+        if hasattr(model, 'feature_name_'):          # LightGBM
+            train_features = model.feature_name_
+        elif hasattr(model, 'feature_names_in_'):    # XGBoost / sklearn
+            train_features = list(model.feature_names_in_)
+        else:
+            train_features = X_sample_shap.columns.tolist()
+
+        X_sample_shap = X_sample_shap[train_features]
+
         # Precompute non-embedding column indices once for slicing shap_values arrays
-        all_cols    = X_test.columns.tolist()
-        non_emb_idx = [all_cols.index(c) for c in non_emb_cols]
+        non_emb_cols = [c for c in train_features if not c.startswith('emb')]
+        non_emb_idx  = [train_features.index(c) for c in non_emb_cols]
 
         # X used for plotting — converted + clinical columns only
         X_plot = X_sample_shap[non_emb_cols]
@@ -1071,7 +1087,7 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
                     if original_categorical is not None:
                         booster.pandas_categorical = original_categorical
             else:
-                explainer   = shap.TreeExplainer(model)
+                explainer   = shap.TreeExplainer(model, feature_perturbation="tree_path_dependent")
                 shap_values = explainer.shap_values(X_sample_shap)
 
         else:
@@ -1141,6 +1157,7 @@ def run_binary_automl_model(
     target_column: str,
     demand_code: Optional[Union[int, List[int]]] = None,
     triage_value: Optional[int] = None,
+    include_medication: bool = True,
     include_embeddings: bool = False,
     export_table: bool = False, 
     time_budget: int = 600,
@@ -1214,7 +1231,8 @@ def run_binary_automl_model(
     # -----------------------------
     # Data loading & column selection
     # -----------------------------
-    df = data_load_col_selection(target_column, triage_value, include_embeddings)
+    df = data_load_col_selection(target_column, triage_value, 
+                                 include_medication, include_embeddings)
 
     # -----------------------------
     # Basic validation
