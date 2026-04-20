@@ -117,6 +117,7 @@ def triage_print(triage_value, cohort_name, demand_code):
         raise ValueError("triage_value must be None, 0, or 1")
 
 def data_load_col_selection(target_column, triage_value, 
+                            include_lr, include_history,
                             include_medication, include_embeddings)-> pd.DataFrame:
     """Loads data and performs initial feature selection based on settings"""
     # Load preprocessed cleaned table
@@ -149,7 +150,13 @@ def data_load_col_selection(target_column, triage_value,
     # Add triage questions (One-Hot Encoded columns)
     if triage_value != 0:
         modelling_cols += [col for col in df.columns if col.startswith('q')]
-    # Add medication (One-Hot Encoded columns)
+    # Add literal reason columns (One-Hot Encoded columns)
+    if include_lr == True:
+        modelling_cols += [col for col in df.columns if col.startswith('lr_')]
+    # Add past history columns (One-Hot Encoded columns)
+    if include_history == True:
+        modelling_cols += [col for col in df.columns if col.startswith('hist_')]
+    # Add medication columns (One-Hot Encoded columns)
     if include_medication == True:
         modelling_cols += [col for col in df.columns if col.startswith('atc_')]
     # Include NLP text embeddings if flag is set to True
@@ -158,7 +165,7 @@ def data_load_col_selection(target_column, triage_value,
         modelling_cols += embedding_cols
         print(f"Feature Set: Including {len(embedding_cols)} text embedding dimensions.")
             
-    # Select columns for final modeling
+    # Select base columns for modeling
     selected_cols = [c for c in modelling_cols if c in df.columns]
     df_model = df[selected_cols].copy()
     # Transform data types
@@ -196,6 +203,13 @@ def data_filtering(df, target_column, demand_code,
         else:
             df = df[df["demand_type_1"] == demand_code].copy()
             print(f"Filtering by demand_type_1 == {demand_code}")
+
+    # Filter out medication columns by threshold-specific available medication columns
+    df = dp.analyze_atc_columns(
+        df,
+        threshold=1.0,
+        drop_columns=True,
+    )
 
     # Filter by triage patients
     if triage_value is not None:
@@ -237,7 +251,6 @@ def data_filtering(df, target_column, demand_code,
             
             if cols_to_drop:
                 df = df.drop(columns=cols_to_drop)
-                print(f"Pruning: Dropped {len(cols_to_drop)} columns for protocol {rule_key}")
         # Integrated warning if no protocol matches the demand_code
         else:
             print(f"⚠️ Warning: No specific protocol found for demand_code {demand_code}")
@@ -252,7 +265,7 @@ def data_filtering(df, target_column, demand_code,
             'cardiac_arrest': settings.cardiacarrest_table_modeling,
             16: settings.dyspnea_table_modeling,
             23: settings.chestpain_table_modeling,
-            54: settings.stroke_table_modeling,
+            54: settings.stroke_table_cleaned_path,
         }
         export_path = rule_to_path.get(rule_key)
         
@@ -274,10 +287,29 @@ def data_filtering(df, target_column, demand_code,
             print(f"❌ Export failed: File not found at {export_path}")
 
     # Drop columns after cohort filtering and data export
-    cols_to_drop = ["demandpk", "demand_type_1", "triage", "year", "literal_reason"]
+    cols_to_drop = ["demandpk", "demand_type_1", "triage", "year", "literal_reason", "hcdm_id"]
     cols_to_drop = [c for c in cols_to_drop if c in df.columns]
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
+
+    # --- Column summary by group ---
+    triage_cols  = [c for c in df.columns if c[0].isdigit()]
+    lr_cols      = [c for c in df.columns if c.startswith("lr_")]
+    hist_cols    = [c for c in df.columns if c.startswith("hist_")]
+    atc_cols     = [c for c in df.columns if c.startswith("atc")]
+    other_cols   = [c for c in df.columns if c not in triage_cols + lr_cols + hist_cols + atc_cols]
+
+    print("\n" + "="*40)
+    print("FEATURE SUMMARY BY GROUP")
+    print("="*40)
+    print(f"  Triage questions  (digit prefix): {len(triage_cols):>4}")
+    print(f"  Literal reason    (lr_):           {len(lr_cols):>4}")
+    print(f"  Past history      (hist_):         {len(hist_cols):>4}")
+    print(f"  Medication        (atc):           {len(atc_cols):>4}")
+    print(f"  Other:                             {len(other_cols):>4}")
+    print(f"  {'─'*30}")
+    print(f"  Total features:                    {len(df.columns):>4}")
+    print("="*40 + "\n")
 
     print(f"\nFinal cohort size for {target_column}: {len(df)}")
     print("Outcome distribution: ", df[target_column].value_counts(dropna=False), "\n")
@@ -408,7 +440,13 @@ def set_fb_threshold(y_train, y_train_prob, optimize_beta):
     
     return best_threshold
 
-def compute_youden_threshold(y_train, y_train_prob, y_test, y_test_prob):
+def compute_youden_threshold(
+    y_train,
+    y_train_prob,
+    y_test,
+    y_test_prob,
+    sensitivity_range: Optional[tuple] = (0.70, 0.90),
+):
     """
     Finds the optimal decision threshold by maximising the Youden index J = Se + Sp - 1.
 
@@ -427,11 +465,17 @@ def compute_youden_threshold(y_train, y_train_prob, y_test, y_test_prob):
     ----------
     y_train, y_train_prob : train labels and predicted probabilities
     y_test,  y_test_prob  : test labels and predicted probabilities
+    sensitivity_range : tuple of float or None
+        If provided, restricts the search to ROC points whose sensitivity falls
+        within [se_min, se_max] (values in [0, 1], e.g. (0.70, 0.90)).
+        Within that band, the point that maximises J is selected.
+        If no ROC point falls in the range, falls back to the global Youden optimum
+        with a warning.
 
     Returns
     -------
     float
-        Optimal threshold (maximises J on train set).
+        Optimal threshold (maximises J on train set, optionally within sensitivity_range).
     """
     print("\n--- Optimising decision threshold (Youden Index) ---")
 
@@ -439,8 +483,22 @@ def compute_youden_threshold(y_train, y_train_prob, y_test, y_test_prob):
     fpr_train, tpr_train, thresholds_train = roc_curve(y_train, y_train_prob)
 
     # J = Se + Sp - 1  ≡  tpr - fpr
-    youden_j  = tpr_train - fpr_train
-    best_idx  = int(np.argmax(youden_j))
+    youden_j = tpr_train - fpr_train
+
+    if sensitivity_range is not None:
+        se_min, se_max = sensitivity_range
+        print(f"  Sensitivity range : [{se_min:.2%}, {se_max:.2%}]")
+        mask = (tpr_train >= se_min) & (tpr_train <= se_max)
+        if mask.any():
+            candidates = np.where(mask)[0]
+            best_idx = int(candidates[np.argmax(youden_j[candidates])])
+        else:
+            print(f"  WARNING: no ROC point found in sensitivity range "
+                  f"[{se_min:.2%}, {se_max:.2%}]. Falling back to global Youden optimum.")
+            best_idx = int(np.argmax(youden_j))
+    else:
+        best_idx = int(np.argmax(youden_j))
+
     best_thr  = float(thresholds_train[best_idx])
     best_j    = float(youden_j[best_idx])
     best_se   = float(tpr_train[best_idx])
@@ -461,13 +519,19 @@ def compute_youden_threshold(y_train, y_train_prob, y_test, y_test_prob):
             label=f'ROC curve — test  (AUC = {auc_test:.3f})')
     ax.plot([0, 1], [0, 1], 'k--', lw=1, label='No discrimination')
 
+    # Sensitivity range band
+    if sensitivity_range is not None:
+        se_min, se_max = sensitivity_range
+        ax.axhspan(se_min, se_max, color='gold', alpha=0.15,
+                   label=f'Sensitivity range [{se_min:.0%}, {se_max:.0%}]')
+
     # Youden point
     ax.scatter(1.0 - best_sp, best_se, color='crimson', zorder=5, s=120,
-               label=(f'Youden point  J = {best_j:.3f}\n'
+               label=(f'Selected point  J = {best_j:.3f}\n'
                       f'Se = {best_se:.3f}   Sp = {best_sp:.3f}\n'
                       f'Threshold = {best_thr:.4f}'))
 
-    # Vertical segment from diagonal to Youden point (visual magnitude of J)
+    # Vertical segment from diagonal to selected point (visual magnitude of J)
     ax.vlines(x=1.0 - best_sp,
               ymin=1.0 - best_sp, ymax=best_se,
               colors='crimson', linestyles='dashed', lw=1.5, alpha=0.7,
@@ -475,7 +539,10 @@ def compute_youden_threshold(y_train, y_train_prob, y_test, y_test_prob):
 
     ax.set_xlabel('1 − Specificity  (FPR)', fontsize=11)
     ax.set_ylabel('Sensitivity  (TPR)', fontsize=11)
-    ax.set_title('ROC Curve — Youden Index Threshold', fontsize=13)
+    title = 'ROC Curve — Youden Index Threshold'
+    if sensitivity_range is not None:
+        title += f'  (Se range [{se_min:.0%}, {se_max:.0%}])'
+    ax.set_title(title, fontsize=13)
     ax.legend(loc='lower right', fontsize=9)
     ax.set_xlim([0.0, 1.0])
     ax.set_ylim([0.0, 1.02])
@@ -681,34 +748,9 @@ def print_train_test_comparison(
     f1_diff_threshold: float     = 0.05,
     overfit_gap_threshold: float = 0.05,
 ) -> pd.DataFrame:
-    """
-    Computes and prints a train vs test performance comparison table.
-
-    Underfitting  : train metric below a prevalence-adjusted baseline
-    Overfitting   : gap (train - test) exceeds overfit_gap_threshold
-                    (PR-AUC and F1 use their own configurable thresholds)
-
-    Layout:
-        Metric | Baseline | Train | Underfit threshold | Underfitting
-               | Test | Gap | Max Gap | Overfitting
-
-    Parameters
-    ----------
-    automl : FLAML AutoML object
-    X_train, y_train : training features and labels
-    X_test,  y_test  : test features and labels
-    threshold        : decision threshold for binarizing predictions
-    pr_auc_diff_threshold : max allowed gap for PR-AUC overfitting flag
-    f1_diff_threshold     : max allowed gap for F1 overfitting flag
-    overfit_gap_threshold : default max gap for all other metrics (default 0.05)
-
-    Returns
-    -------
-    pd.DataFrame with all computed values and flags
-    """
     from sklearn.metrics import (
         f1_score, precision_score, recall_score,
-        roc_auc_score, average_precision_score, accuracy_score
+        roc_auc_score, average_precision_score, accuracy_score,
     )
 
     # Prevalence computed automatically from y_train
@@ -721,66 +763,71 @@ def print_train_test_comparison(
     y_train_pred = (y_train_prob >= threshold).astype(int)
     y_test_pred  = (y_test_prob  >= threshold).astype(int)
 
-    # --- Compute metrics ---
+    # --- Compute metrics helper ---
     def _metrics(y_true, y_pred, y_prob):
         return {
-            "PR-AUC":    average_precision_score(y_true, y_prob),
-            "ROC-AUC":   roc_auc_score(y_true, y_prob),
-            "F1":        f1_score(y_true, y_pred, zero_division=0),
-            "Accuracy":  accuracy_score(y_true, y_pred),
-            "Precision": precision_score(y_true, y_pred, zero_division=0),
-            "Recall":    recall_score(y_true, y_pred, zero_division=0),
+            "PR-AUC":      average_precision_score(y_true, y_prob),
+            "ROC-AUC":     roc_auc_score(y_true, y_prob),
+            "F1":          f1_score(y_true, y_pred, zero_division=0),
+            "Accuracy":    accuracy_score(y_true, y_pred),
+            "Precision":   precision_score(y_true, y_pred, zero_division=0),
+            "Recall":      recall_score(y_true, y_pred, zero_division=0),
+            "Specificity": recall_score(y_true, y_pred, pos_label=0, zero_division=0),
         }
 
     train_m = _metrics(y_train, y_train_pred, y_train_prob)
     test_m  = _metrics(y_test,  y_test_pred,  y_test_prob)
 
     # -------------------------------------------------------------------------
-    # Baselines: value a random classifier would achieve for each metric
+    # Baselines: value a random classifier would achieve
     # -------------------------------------------------------------------------
     baselines = {
-        "PR-AUC":    (prevalence,          f"{prevalence*100:.1f}%  (prevalence)"),
-        "ROC-AUC":   (0.50,                "50.0%  (random)"),
-        "F1":        (0.0,                 "~0.0%  (imbalanced)"),
-        "Accuracy":  (1 - prevalence,      f"{(1-prevalence)*100:.1f}%  (majority class)"),
-        "Precision": (prevalence,          f"{prevalence*100:.1f}%  (prevalence)"),
-        "Recall":    (0.50,                "50.0%  (floor)"),
+        "PR-AUC":      (prevalence,          f"{prevalence*100:.1f}%  (prevalence)"),
+        "ROC-AUC":     (0.50,                "50.0%  (random)"),
+        "F1":          (0.0,                 "~0.0%  (imbalanced)"),
+        "Accuracy":    (1 - prevalence,      f"{(1-prevalence)*100:.1f}%  (majority class)"),
+        "Precision":   (prevalence,          f"{prevalence*100:.1f}%  (prevalence)"),
+        "Recall":      (0.50,                "50.0%  (floor)"),
+        "Specificity": (0.50,                "50.0%  (floor)"),
     }
 
     # -------------------------------------------------------------------------
     # Prevalence-adjusted underfitting thresholds
     # -------------------------------------------------------------------------
     underfit_thresholds = {
-        "PR-AUC":    (min(prevalence * 2, 0.50),
-                      f"prevalence × 2 = {min(prevalence*2, 0.50)*100:.1f}%"),
-        "ROC-AUC":   (0.60,
-                      "random + 10pp = 60.0%"),
-        "F1":        (max(0.30, prevalence * 1.5),
-                      f"max(0.30, prev×1.5) = {max(0.30, prevalence*1.5)*100:.1f}%"),
-        "Accuracy":  ((1 - prevalence) + 0.05,
-                      f"majority + 5pp = {((1-prevalence)+0.05)*100:.1f}%"),
-        "Precision": (prevalence * 1.5,
-                      f"prevalence × 1.5 = {prevalence*1.5*100:.1f}%"),
-        "Recall":    (0.50,
-                      "clinical floor = 50.0%"),
+        "PR-AUC":      (min(prevalence * 2, 0.50),
+                        f"prevalence × 2 = {min(prevalence*2, 0.50)*100:.1f}%"),
+        "ROC-AUC":     (0.60,
+                        "random + 10pp = 60.0%"),
+        "F1":          (max(0.30, prevalence * 1.5),
+                        f"max(0.30, prev×1.5) = {max(0.30, prevalence*1.5)*100:.1f}%"),
+        "Accuracy":    ((1 - prevalence) + 0.05,
+                        f"majority + 5pp = {((1-prevalence)+0.05)*100:.1f}%"),
+        "Precision":   (prevalence * 1.5,
+                        f"prevalence × 1.5 = {prevalence*1.5*100:.1f}%"),
+        "Recall":      (0.50,
+                        "clinical floor = 50.0%"),
+        "Specificity": (0.50,
+                        "technical floor = 50.0%"),
     }
 
     # -------------------------------------------------------------------------
     # Per-metric gap thresholds for overfitting detection
-    # PR-AUC and F1 use their own configurable thresholds;
-    # all others use the shared overfit_gap_threshold argument
     # -------------------------------------------------------------------------
     diff_thresholds = {
-        "PR-AUC":    pr_auc_diff_threshold,
-        "ROC-AUC":   overfit_gap_threshold,
-        "F1":        f1_diff_threshold,
-        "Accuracy":  overfit_gap_threshold,
-        "Precision": overfit_gap_threshold,
-        "Recall":    overfit_gap_threshold,
+        "PR-AUC":      pr_auc_diff_threshold,
+        "ROC-AUC":     overfit_gap_threshold,
+        "F1":          f1_diff_threshold,
+        "Accuracy":    overfit_gap_threshold,
+        "Precision":   overfit_gap_threshold,
+        "Recall":      overfit_gap_threshold,
+        "Specificity": overfit_gap_threshold,
     }
 
     rows = []
-    for metric in train_m:
+    metric_order = ["PR-AUC", "ROC-AUC", "F1", "Accuracy", "Precision", "Recall", "Specificity"]
+
+    for metric in metric_order:
         train_val              = train_m[metric]
         test_val               = test_m[metric]
         gap                    = train_val - test_val
@@ -810,11 +857,11 @@ def print_train_test_comparison(
     # -------------------------------------------------------------------------
     # Pretty print
     # -------------------------------------------------------------------------
-    sep = "─" * 112
+    sep = "─" * 125
 
     print("\n" + sep)
-    print(f"{'TRAIN vs TEST PERFORMANCE COMPARISON':^112}")
-    print(f"{'(threshold applied: ' + str(round(threshold, 4)) + ')':^112}")
+    print(f"{'TRAIN vs TEST PERFORMANCE COMPARISON':^125}")
+    print(f"{'(threshold applied: ' + str(round(threshold, 4)) + ')':^125}")
     print(sep)
     print(f"  Dataset context  :  prevalence = {prevalence*100:.1f}%  "
           f"|  PR-AUC random baseline = {prevalence*100:.1f}%  "
@@ -824,10 +871,9 @@ def print_train_test_comparison(
     print(f"  Underfitting     :  thresholds adjusted per metric based on dataset prevalence.")
     print(sep)
 
-    # Column headers — two logical groups separated visually
     print(
-        f"  {'Metric':<12}"
-        f"  {'Baseline':<26}"        # random classifier reference
+        f"  {'Metric':<14}"
+        f"  {'Baseline':<26}"
         f"  {'Train':>8}"
         f"  {'Underfit threshold':<26}"
         f"  {'Underfit':^10}"
@@ -840,7 +886,7 @@ def print_train_test_comparison(
 
     for _, row in comparison_df.iterrows():
         print(
-            f"  {row['Metric']:<12}"
+            f"  {row['Metric']:<14}"
             f"  {row['Baseline_label']:<26}"
             f"  {row['Train']*100:>7.2f}%"
             f"  {row['Underfit_label']:<26}"
@@ -852,7 +898,6 @@ def print_train_test_comparison(
         )
 
     print(sep)
-
     n_overfit  = comparison_df["Overfitting"].str.contains("Yes").sum()
     n_underfit = comparison_df["Underfitting"].str.contains("Yes").sum()
     print(f"\n  Underfitting: {n_underfit} metric(s) flagged  |  "
@@ -1233,6 +1278,8 @@ def run_binary_automl_model(
     target_column: str,
     demand_code: Optional[Union[int, List[int]]] = None,
     triage_value: Optional[int] = None,
+    include_lr: bool = True,
+    include_history: bool = True,
     include_medication: bool = True,
     include_embeddings: bool = False,
     export_table: bool = False, 
@@ -1309,7 +1356,7 @@ def run_binary_automl_model(
     # Data loading & column selection
     # -----------------------------
     df = data_load_col_selection(target_column, triage_value, 
-                                 include_medication, include_embeddings)
+                                 include_lr, include_history, include_medication, include_embeddings)
 
     # -----------------------------
     # Basic validation

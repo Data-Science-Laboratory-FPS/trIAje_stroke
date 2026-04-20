@@ -413,22 +413,29 @@ def df_pipeline_test(df: pd.DataFrame) -> pd.DataFrame:
 # Function for converting data types and reordering columns
 def transform_column_dtypes(df: pd.DataFrame, dtype_dict=dtype_cols):
     """
-    Cast dataframe columns to the specified data types,
-    selecting only columns that exist in the dataframe.
-    After conversion, reorder dataframe columns according to dtype_dict.
+    Cast dataframe columns to specified types, dynamically including 
+    prefix-based rules (lr_, hist_) and reordering.
     """
+    # 1. Create a local copy of the dictionary to avoid modifying the original global one
+    working_dtype_dict = dtype_dict.copy()
 
-    # 1. Keep only dtype rules that apply to existing columns
-    applicable = {col: dtype for col, dtype in dtype_dict.items() if col in df.columns}
+    # 2. Dynamically add columns starting with 'lr_' or 'hist_' as 'int8'
+    for col in df.columns:
+        if col.startswith(('lr_', 'hist_')):
+            working_dtype_dict[col] = "int8"
 
-    # 2. Apply dtype conversions (ignore errors to avoid crashes)
+    # 3. Keep only dtype rules that apply to existing columns
+    applicable = {col: dtype for col, dtype in working_dtype_dict.items() if col in df.columns}
+
+    # 4. Apply dtype conversions
+    # Note: Using astype on the dictionary is efficient
     df = df.astype(applicable, errors="ignore")
 
-    # 3. Reorder columns based on dtype_dict order
-    ordered_cols = [col for col in dtype_dict.keys() if col in df.columns]
+    # 5. Reorder columns
+    # We follow the dictionary order first, then any extra columns
+    ordered_cols = [col for col in working_dtype_dict.keys() if col in df.columns]
     remaining_cols = [col for col in df.columns if col not in ordered_cols]
 
-    # 4. Return dataframe with ordered columns first, then the rest
     return df[ordered_cols + remaining_cols]
 
 # Function to filter dataset rows where a target ICD code matches any ICD column
@@ -515,6 +522,102 @@ def merge_text_embeddings(run_mode, df_embeddings, embedding_path, df_main):
     print("="*40 + "\n")
         
     return df_main
+
+def analyze_atc_columns(
+    df: pd.DataFrame,
+    threshold: float = 1.0,
+    show_counts: bool = False,
+    show_histogram: bool = False,
+    export: bool = False,
+    export_path: str = None,
+    drop_columns: bool = False,
+) -> pd.DataFrame:
+    """
+    Analyzes ATC medication columns (those starting with 'atc_').
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+    threshold : float
+        Minimum percentage of non-zero rows to keep a column (e.g. 1.0 = 1%).
+    show_counts : bool
+        Print the column count summary and above-threshold table.
+    show_histogram : bool
+        Plot the completeness histogram.
+    export : bool
+        Save the cleaned dataframe to parquet. Requires export_path.
+    export_path : str, optional
+        Full path for the output parquet file. Used only when export=True.
+    drop_columns : bool
+        If True, returns a tuple (completeness, df_clean) where df_clean has
+        below-threshold ATC columns removed. If False, returns only completeness.
+
+    Returns
+    -------
+    pd.DataFrame or None
+        Cleaned dataframe with below-threshold ATC columns removed, if drop_columns=True.
+        Otherwise None.
+    """
+    threshold_dec = threshold / 100
+
+    atc_cols = [c for c in df.columns if c.startswith("atc_")]
+    n_total = len(df)
+
+    completeness = (
+        df[atc_cols]
+        .astype(bool)
+        .sum()
+        .rename("n_nonzero")
+        .to_frame()
+    )
+    completeness["pct"] = completeness["n_nonzero"] / n_total
+    completeness = completeness.sort_values("pct", ascending=False)
+
+    above = completeness[completeness["pct"] >= threshold_dec]
+    below = completeness[completeness["pct"] < threshold_dec]
+    all_zero = completeness[completeness["n_nonzero"] == 0]
+
+    if show_counts:
+        print(f"Total ATC columns:              {len(atc_cols)}")
+        print(f"All-zero columns (drop):        {len(all_zero)}")
+        print(f"Below threshold ({threshold:.2f}%, drop):  {len(below)}")
+        print(f"Above threshold ({threshold:.2f}%, keep):  {len(above)}")
+        print()
+        print(f"Columns above {threshold:.2f}% threshold:")
+        print(
+            above
+            .rename(columns={"n_nonzero": "n", "pct": "completeness"})
+            .assign(completeness=lambda x: x["completeness"].map("{:.2%}".format))
+            .to_string()
+        )
+
+    if show_histogram:
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.hist(completeness["pct"] * 100, bins=50, edgecolor="white", color="steelblue")
+        ax.axvline(threshold, color="crimson", linestyle="--",
+                   label=f"Threshold {threshold:.2f}%")
+        ax.set_xlabel("Completeness (% rows with non-zero value)")
+        ax.set_ylabel("Number of ATC columns")
+        ax.set_title("Distribution of completeness across ATC medication columns")
+        ax.legend()
+        plt.tight_layout()
+        plt.show()
+
+    cols_to_drop = below.index.tolist()
+    df_clean = df.drop(columns=cols_to_drop)
+
+    if show_counts:
+        print(f"\nATC columns eliminated (below threshold {threshold:.2f}%): {len(cols_to_drop)}")
+        print(f"Remaining columns after dropping: {df_clean.shape[1]}")
+        display(completeness)
+
+    if export:
+        if export_path is None:
+            raise ValueError("export=True requires export_path to be provided.")
+        df_clean.to_parquet(export_path, index=False)
+
+    if drop_columns:
+        return df_clean
 
 ## Function to analyze missing values
 def analyze_missing_values(df):
