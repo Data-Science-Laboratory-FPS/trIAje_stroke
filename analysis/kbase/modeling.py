@@ -125,24 +125,29 @@ def data_load_col_selection(target_column, triage_value,
         os.path.join(settings.source_tables_path, settings.triaje_table_cleaned_path)
     ).to_pandas()
 
-    # Select base columns 
+    # Select base columns
     base_cols = [
         "demandpk",
         "age",
         "sex",
         "demand_type_1",
         target_column,
-        "day_week",
-        "time_of_day",
-        "month",
-        "season",
+        "day_week_monday", "day_week_tuesday", "day_week_wednesday", "day_week_thursday",
+        "day_week_friday", "day_week_saturday", "day_week_sunday",
+        "time_of_day_early_morning", "time_of_day_morning", "time_of_day_afternoon", "time_of_day_night",
+        "month_january", "month_february", "month_march", "month_april",
+        "month_may", "month_june", "month_july", "month_august",
+        "month_september", "month_october", "month_november", "month_december",
+        "season_spring", "season_summer", "season_autumn", "season_winter",
         "year",
-        "location_patient",
-        "alert_receiver",
-        "province", 
-        "incident_latitude", 
+        "location_patient_home", "location_patient_public_road", "location_patient_other",
+        "alert_receiver_112", "alert_receiver_user", "alert_receiver_pol_fg",
+        "alert_receiver_hs", "alert_receiver_tele", "alert_receiver_others",
+        "province_almeria", "province_cadiz", "province_cordoba", "province_granada",
+        "province_huelva", "province_jaen", "province_malaga", "province_sevilla",
+        "incident_latitude",
         "incident_longitude",
-        "triage"
+        "triage",
     ]
 
     # Initialize modelling columns with base columns
