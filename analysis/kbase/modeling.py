@@ -445,7 +445,7 @@ def compute_youden_threshold(
     y_train_prob,
     y_test,
     y_test_prob,
-    sensitivity_range: Optional[tuple] = (0.70, 0.90),
+    sensitivity_range: Optional[tuple] = (0.80, 0.90),
 ):
     """
     Finds the optimal decision threshold by maximising the Youden index J = Se + Sp - 1.
@@ -738,6 +738,268 @@ def optimize_clinical_threshold(
     plt.show()
 
     return clinical_threshold
+
+def plot_calibration(
+    y_train, y_train_prob,
+    y_test,  y_test_prob,
+    threshold: float,
+    n_bins: int = 15,
+    save_path: str = None,
+) -> None:
+    """
+    Two-panel calibration figure:
+      Left  — predicted probability distributions by class (train vs test).
+      Right — reliability diagram (calibration curve) for train and test.
+
+    Parameters
+    ----------
+    n_bins    : number of bins for the calibration curve (quantile strategy).
+    save_path : if provided, saves the figure to that path (e.g. 'calibration.png').
+    """
+    from sklearn.calibration import calibration_curve
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # --- Left: probability distributions by class ---
+    ax = axes[0]
+    ax.hist(y_train_prob[y_train == 0], bins=80, alpha=0.5, color='steelblue',
+            density=True, label='Negative (train)')
+    ax.hist(y_train_prob[y_train == 1], bins=80, alpha=0.5, color='red',
+            density=True, label='Positive (train)')
+    ax.hist(y_test_prob[y_test == 0],   bins=80, alpha=0.3, color='navy',
+            density=True, label='Negative (test)', linestyle='--')
+    ax.hist(y_test_prob[y_test == 1],   bins=80, alpha=0.3, color='darkred',
+            density=True, label='Positive (test)', linestyle='--')
+    ax.axvline(threshold, color='black', linestyle='--', linewidth=1.5,
+               label=f'Threshold = {threshold:.4f}')
+    ax.set_title('Predicted probability distribution\n(train vs test)')
+    ax.set_xlabel('Predicted probability P(=1)')
+    ax.set_ylabel('Density')
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    # --- Right: reliability diagram ---
+    ax2 = axes[1]
+    for probs, labels, name, color in [
+        (y_train_prob, y_train, 'Train', 'steelblue'),
+        (y_test_prob,  y_test,  'Test',  'red'),
+    ]:
+        fraction_pos, mean_pred = calibration_curve(labels, probs,
+                                                    n_bins=n_bins,
+                                                    strategy='quantile')
+        ax2.plot(mean_pred, fraction_pos, 's-', label=name,
+                 color=color, linewidth=2)
+    ax2.plot([0, 1], [0, 1], color='gray', linestyle='--',
+             label='Perfect calibration')
+    ax2.axvline(threshold, color='black', linestyle='--', linewidth=1.5,
+                label=f'Threshold = {threshold:.4f}')
+    ax2.set_title('Calibration curve\n(are predicted probabilities reliable?)')
+    ax2.set_xlabel('Mean predicted probability')
+    ax2.set_ylabel('Fraction of positives')
+    ax2.legend(fontsize=8)
+    ax2.grid(alpha=0.3)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    plt.show()
+
+def print_test_metrics_with_ci(
+    y_test,
+    y_test_prob,
+    threshold: float,
+    n_bootstrap: int = 1000,
+    ci_seed:     int = 42,
+) -> dict:
+    """
+    Plots the confusion matrix, computes all test-set metrics, prints them
+    with 95% confidence intervals, and returns the metrics dict.
+
+    Clopper–Pearson (exact binomial) for binary proportions:
+        Accuracy, Precision, Recall, Specificity, NPV
+
+    Stratified bootstrap for composite metrics:
+        F1, MCC, Youden Index, Balanced Accuracy
+    """
+    from scipy.stats import beta as _beta
+    from sklearn.metrics import matthews_corrcoef
+
+    y_test_pred = (y_test_prob >= threshold).astype(int)
+
+    # --- Confusion matrix plot -----------------------------------------------
+    conf_matrix = confusion_matrix(y_test, y_test_pred)
+    labels = ['Negative', 'Positive']
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(conf_matrix, annot=True, cmap='Blues', fmt='d',
+                xticklabels=labels, yticklabels=labels)
+    plt.title('Classification Pipeline Confusion Matrix')
+    plt.xlabel('Predicted')
+    plt.ylabel('Actual')
+    plt.tight_layout()
+    plt.show()
+
+    # --- Metrics computation --------------------------------------------------
+    tn, fp, fn, tp = conf_matrix.ravel()
+    n_test = len(y_test)
+
+    prec  = precision_score(y_test, y_test_pred, zero_division=0)
+    rec   = recall_score(y_test, y_test_pred, zero_division=0)
+    spec  = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+    npv   = tn / (tn + fn) if (tn + fn) > 0 else np.nan
+    acc   = (tp + tn) / n_test
+
+    f1      = f1_score(y_test, y_test_pred, zero_division=0)
+    mcc     = matthews_corrcoef(y_test, y_test_pred)
+    youden  = rec + spec - 1   if not np.isnan(spec) else np.nan
+    bal_acc = (rec + spec) / 2 if not np.isnan(spec) else np.nan
+
+    overtriage  = 1 - prec if not np.isnan(prec) else np.nan
+    undertriage = 1 - npv  if not np.isnan(npv)  else np.nan
+
+    fpr = fp / (fp + tn) if (fp + tn) > 0 else np.nan
+    fnr = fn / (fn + tp) if (fn + tp) > 0 else np.nan
+
+    lr_pos = rec / (1 - spec) if (not np.isnan(spec) and spec < 1) else np.nan
+    lr_neg = (1 - rec) / spec  if (not np.isnan(spec) and spec > 0) else np.nan
+
+    roc_auc = roc_auc_score(y_test, y_test_prob)
+    pr_auc  = average_precision_score(y_test, y_test_prob)
+
+    # --- Clopper–Pearson CIs -------------------------------------------------
+    def _cp(x, n, alpha=0.05):
+        if n == 0:
+            return (np.nan, np.nan)
+        lo = _beta.ppf(alpha / 2,     x,     n - x + 1) if x > 0 else 0.0
+        hi = _beta.ppf(1 - alpha / 2, x + 1, n - x)     if x < n else 1.0
+        return lo, hi
+
+    ci_cp = {
+        "acc":  _cp(int(tp + tn), int(n_test)),
+        "prec": _cp(int(tp), int(tp + fp)),
+        "rec":  _cp(int(tp), int(tp + fn)),
+        "spec": _cp(int(tn), int(tn + fp)),
+        "npv":  _cp(int(tn), int(tn + fn)),
+    }
+
+    # --- Stratified bootstrap CIs --------------------------------------------
+    def _safe_div(a, b):
+        return a / b if b != 0 else np.nan
+
+    rng     = np.random.default_rng(ci_seed)
+    y_te_s  = pd.Series(y_test.values if hasattr(y_test, "values") else y_test).reset_index(drop=True)
+    y_pr_s  = pd.Series(y_test_pred).reset_index(drop=True)
+    pos_idx = np.where(y_te_s == 1)[0]
+    neg_idx = np.where(y_te_s == 0)[0]
+
+    boot = {"f1": [], "mcc": [], "youden": [], "bal_acc": []}
+
+    for _ in range(n_bootstrap):
+        pos_s = rng.choice(pos_idx, size=len(pos_idx), replace=True) if len(pos_idx) else np.array([], dtype=int)
+        neg_s = rng.choice(neg_idx, size=len(neg_idx), replace=True) if len(neg_idx) else np.array([], dtype=int)
+        idx   = np.concatenate([pos_s, neg_s])
+        yt    = y_te_s.iloc[idx]
+        yp    = y_pr_s.iloc[idx]
+
+        tn_b, fp_b, fn_b, tp_b = confusion_matrix(yt, yp, labels=[0, 1]).ravel()
+        prec_b = _safe_div(tp_b, tp_b + fp_b)
+        rec_b  = _safe_div(tp_b, tp_b + fn_b)
+        spec_b = _safe_div(tn_b, tn_b + fp_b)
+
+        f1_b = (
+            _safe_div(2 * prec_b * rec_b, prec_b + rec_b)
+            if not (np.isnan(prec_b) or np.isnan(rec_b)) else np.nan
+        )
+        denom_mcc = np.sqrt((tp_b+fp_b) * (tp_b+fn_b) * (tn_b+fp_b) * (tn_b+fn_b))
+        mcc_b     = _safe_div(tp_b * tn_b - fp_b * fn_b, denom_mcc)
+        youden_b  = (rec_b + spec_b - 1) if not (np.isnan(rec_b) or np.isnan(spec_b)) else np.nan
+        bal_b     = _safe_div(rec_b + spec_b, 2)
+
+        for key, val in [("f1", f1_b), ("mcc", mcc_b), ("youden", youden_b), ("bal_acc", bal_b)]:
+            if not np.isnan(val):
+                boot[key].append(val)
+
+    ci_boot = {
+        k: (np.percentile(v, 2.5), np.percentile(v, 97.5)) if v else (np.nan, np.nan)
+        for k, v in boot.items()
+    }
+
+    # --- Print ---------------------------------------------------------------
+    print("\n--- Test set results ---")
+
+    def _pct(val, ci):
+        lo, hi = ci
+        s = f"{val*100:.2f}%"
+        if not (np.isnan(lo) or np.isnan(hi)):
+            s += f"   [95% CI: {lo*100:.2f}% – {hi*100:.2f}%]"
+        return s
+
+    def _raw(val, ci):
+        lo, hi = ci
+        s = f"{val:+.4f}"
+        if not (np.isnan(lo) or np.isnan(hi)):
+            s += f"   [95% CI: {lo:+.4f} – {hi:+.4f}]"
+        return s
+
+    no_ci = (np.nan, np.nan)
+
+    print("\n" + "="*60)
+    print(f"{'CLASSIFICATION REPORT':^60}")
+    print("="*60)
+    print(classification_report(y_test, y_test_pred, target_names=labels))
+
+    print("\n" + "="*70)
+    print(f"{'PERFORMANCE METRICS WITH 95% CI':^70}")
+    print("="*70)
+
+    print(f"\n  Binary metrics  (Clopper–Pearson CI):")
+    print(f"  Accuracy:              {_pct(acc,  ci_cp['acc'])}")
+    print(f"  ROC-AUC:               {roc_auc*100:.2f}%")
+    print(f"  PR-AUC:                {pr_auc*100:.2f}%")
+    print(f"  Precision (PPV):       {_pct(prec, ci_cp['prec'])}")
+    print(f"  Recall (Sensitivity):  {_pct(rec,  ci_cp['rec'])}")
+    print(f"  Specificity:           {_pct(spec, ci_cp['spec'])}")
+    print(f"  NPV:                   {_pct(npv,  ci_cp['npv'])}")
+
+    print(f"\n  Composite metrics  (Stratified Bootstrap CI):")
+    print(f"  F1 Score:              {_pct(f1,      ci_boot['f1'])}")
+    print(f"  MCC:                   {_raw(mcc,     ci_boot['mcc'])}")
+    print(f"  Youden Index:          {_raw(youden,  ci_boot['youden'])}")
+    print(f"  Balanced Accuracy:     {_pct(bal_acc, ci_boot['bal_acc'])}")
+
+    print(f"\n  Triage-specific metrics:")
+    print(f"  Overtriage Rate:       {overtriage*100:.2f}%")
+    print(f"  Undertriage Rate:      {undertriage*100:.2f}%")
+
+    print(f"\n  Error rates:")
+    print(f"  False Positive Rate:   {fpr*100:.2f}%")
+    print(f"  False Negative Rate:   {fnr*100:.2f}%")
+
+    print(f"\n  Likelihood ratios:")
+    print(f"  LR+:                   {lr_pos:.4f}")
+    print(f"  LR-:                   {lr_neg:.4f}")
+
+    print("\n" + "="*70 + "\n")
+
+    return {
+        "accuracy":            acc,
+        "roc_auc":             roc_auc,
+        "pr_auc":              pr_auc,
+        "precision":           prec,
+        "recall":              rec,
+        "specificity":         spec,
+        "npv":                 npv,
+        "f1":                  f1,
+        "mcc":                 mcc,
+        "youden_index":        youden,
+        "balanced_accuracy":   bal_acc,
+        "overtriage":          overtriage,
+        "undertriage":         undertriage,
+        "false_positive_rate": fpr,
+        "false_negative_rate": fnr,
+        "lr_positive":         lr_pos,
+        "lr_negative":         lr_neg,
+    }
 
 def print_train_test_comparison(
     automl,
@@ -1297,7 +1559,8 @@ def run_binary_automl_model(
     max_undertriage: float = 0.10,
     max_overtriage: float = 0.50,
     feature_importance: int = 0,
-    plot_shap: bool = True
+    plot_shap: bool = True,
+    plot_calibration_curve: bool = True,
 ) -> dict:
 
     
@@ -1405,106 +1668,12 @@ def run_binary_automl_model(
     # -----------------------------
     # Test set evaluation
     # -----------------------------
-    print("\n--- Test set results ---")
+    metrics = print_test_metrics_with_ci(y_test, y_test_prob, threshold=best_threshold)
     y_test_pred = (y_test_prob >= best_threshold).astype(int)
 
-    # -----------------------------
-    # Confusion Matrix Plot
-    # -----------------------------
-    conf_matrix = confusion_matrix(y_test, y_test_pred)
-    labels = ['Negative', 'Positive']
-
-    plt.figure(figsize=(8, 6))
-    sns.heatmap(conf_matrix, annot=True, cmap='Blues', fmt='d',
-                xticklabels=labels, yticklabels=labels)
-    plt.title('Classification Pipeline Confusion Matrix')
-    plt.xlabel('Predicted')
-    plt.ylabel('Actual')
-    plt.tight_layout()
-    plt.show()
-
-    # -----------------------------
-    # Metrics computation (clinical interpretation)
-    # -----------------------------
-    # Confusion matrix components
-    tn, fp, fn, tp = conf_matrix.ravel()
-
-    # Core rates
-    accuracy = (tp + tn) / (tp + tn + fp + fn) if (tp + tn + fp + fn) > 0 else np.nan
-    specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
-    npv = tn / (tn + fn) if (tn + fn) > 0 else np.nan
-
-    precision = precision_score(y_test, y_test_pred) if (tp + fp) > 0 else np.nan
-    recall = recall_score(y_test, y_test_pred) if (tp + fn) > 0 else np.nan
-
-    # Triage-oriented metrics
-    overtriage = 1 - precision if not np.isnan(precision) else np.nan
-    undertriage = 1 - npv if not np.isnan(npv) else np.nan
-
-    # Error rates
-    fpr = fp / (fp + tn) if (fp + tn) > 0 else np.nan
-    fnr = fn / (fn + tp) if (fn + tp) > 0 else np.nan
-
-    # Likelihood ratios
-    lr_pos = recall / (1 - specificity) if specificity < 1 else np.nan
-    lr_neg = (1 - recall) / specificity if specificity > 0 else np.nan
-
-    metrics = {
-        "accuracy": accuracy,
-        "roc_auc": roc_auc_score(y_test, y_test_prob),
-        "pr_auc": average_precision_score(y_test, y_test_prob),
-        "precision": precision,
-        "recall": recall,
-        "specificity": specificity,
-        "npv": npv,
-        "f1": f1_score(y_test, y_test_pred),
-        "overtriage": overtriage,
-        "undertriage": undertriage,
-        "false_positive_rate": fpr,
-        "false_negative_rate": fnr,
-        "lr_positive": lr_pos,
-        "lr_negative": lr_neg,
-    }
-
-    # -----------------------------
-    # Print metrics in a nice format
-    # -----------------------------
-    print("\n" + "="*60)
-    print(f"{'CLASSIFICATION REPORT':^60}")
-    print("="*60)
-    print(classification_report(y_test, y_test_pred, target_names=labels))
-
-    print("\n" + "="*60)
-    print(f"{'PERFORMANCE METRICS (%)':^60}")
-    print("="*60)
-    
-    print(f"\n{'Classification Metrics:':<30}")
-    print(f"  Accuracy:                    {metrics['accuracy']*100:.2f}%")
-    print(f"  ROC-AUC:                     {metrics['roc_auc']*100:.2f}%")
-    print(f"  PR-AUC:                      {metrics['pr_auc']*100:.2f}%")
-    print(f"  F1 Score:                    {metrics['f1']*100:.2f}%")
-    
-    print(f"\n{'Positive Class Performance:':<30}")
-    print(f"  Precision (PPV):             {metrics['precision']*100:.2f}%")
-    print(f"  Recall (Sensitivity):        {metrics['recall']*100:.2f}%")
-    
-    print(f"\n{'Negative Class Performance:':<30}")
-    print(f"  Specificity:                 {metrics['specificity']*100:.2f}%")
-    print(f"  NPV:                         {metrics['npv']*100:.2f}%")
-    
-    print(f"\n{'Triage-Specific Metrics:':<30}")
-    print(f"  Overtriage Rate:             {metrics['overtriage']*100:.2f}%")
-    print(f"  Undertriage Rate:            {metrics['undertriage']*100:.2f}%")
-    
-    print(f"\n{'Error Rates:':<30}")
-    print(f"  False Positive Rate:         {metrics['false_positive_rate']*100:.2f}%")
-    print(f"  False Negative Rate:         {metrics['false_negative_rate']*100:.2f}%")
-    
-    print(f"\n{'Likelihood Ratios (Abs):':<30}")
-    print(f"  LR+:                         {metrics['lr_positive']:.4f}")
-    print(f"  LR-:                         {metrics['lr_negative']:.4f}")
-    
-    print("\n" + "="*60 + "\n")
+    # Calibration plot
+    if plot_calibration_curve:
+        plot_calibration(y_train, y_train_prob, y_test, y_test_prob, threshold=best_threshold)
 
     # Train vs Test comparison — overfitting / underfitting diagnosis
     comparison_df = print_train_test_comparison(
