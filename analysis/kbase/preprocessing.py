@@ -465,7 +465,7 @@ def transform_column_dtypes(df: pd.DataFrame, dtype_dict=dtype_cols):
 
     # 2. Dynamically add columns starting with 'lr_' or 'hist_' as 'int8'
     for col in df.columns:
-        if col.startswith(('lr_', 'hist_')):
+        if col.startswith(('lr_', 'hist_', 'atc_')):
             working_dtype_dict[col] = "int8"
 
     # 3. Keep only dtype rules that apply to existing columns
@@ -567,6 +567,174 @@ def merge_text_embeddings(run_mode, df_embeddings, embedding_path, df_main):
         
     return df_main
 
+# Merges related ATC sub-groups into a single column via OR logic (max of dummies).
+# Source columns are dropped after merging.
+ATC_GROUPING_CONFIG = {
+    'atc_group_IECA_ARAII': [
+        'atc_group_ANTAGONISTAS_ANGIOTENSINA_II',
+        'atc_group_INHIBIDORES_ENZIMA_CONVERTASA_ANGIOTENSINA_IECA',
+        'atc_group_ANTAGONISTAS_ANGIOTENSINA_II_EN_ASOCIACION',
+    ],
+    'atc_group_DIURETICOS': [
+        'atc_group_DIURETICOS_DE_ALTO_TECHO',
+        'atc_group_DIURETICOS_DE_BAJO_TECHO_TIAZIDAS',
+        'atc_group_DIURETICOS_DE_BAJO_TECHO_EXCLUIDAS_TIAZIDAS',
+    ],
+    'atc_group_ANTIBACTERIANOS': [
+        'atc_group_ANTIBACTERIANOS_DERIVADOS_DE_LA_QUINOLONA_SISTEM',
+        'atc_group_OTROS_ANTIBACTERIANOS_ANTIINFECCIOSOS_SISTEMICOS',
+        'atc_group_ANTIBACTERIANOS_BETALACTAMICOS_PENICILINAS',
+    ],
+    'atc_group_OBSTRUCCION_VIAS_RESPIRATORIAS_INHALADOS': [
+        'atc_group_OTROS_PARA_OBSTRUCCION_DE_VIAS_RESPIRATORIAS_INHALADOS',
+        'atc_group_ANTICOLINERGICOS_ANTIASMATICOS',
+    ],
+    'atc_group_MODIFICADORES_DE_LOS_LIPIDOS_SOLOS': [
+        'atc_group_MODIFICADORES_DE_LOS_LIPIDOS_SOLOS',
+        'atc_group_MODIFICADORES_DE_LOS_LIPIDOS_EN_ASOCIACION',
+    ],
+    'atc_group_ANSIOLITICOS': [
+        'atc_group_ANSIOLITICOS',
+        'atc_group_HIPNOTICOS_Y_SEDANTES',
+        'atc_group_N05C_Hipn_ticos_y_sedantes_N05CM_Otros_hipn_ticos_y_sedantes',
+    ],
+    'atc_group_BETABLOQUEANTES_SELECTIVOS_SOLOS': [
+        'atc_group_BETABLOQUEANTES_SELECTIVOS_SOLOS',
+        'atc_group_BETABLOQUEANTES_SOLOS',
+    ],
+    'atc_group_MEDICAMENTOS_PARA_HIPERTROFIA_PROSTATICA_BENIGNA': [
+        'atc_group_MEDICAMENTOS_PARA_HIPERTROFIA_PROSTATICA_BENIGNA',
+        'atc_group_G04C_F_rmacos_usados_en_hipertrofia_prost_tica_benigna_otros_f_rmacos_urol_gicos',
+    ],
+    'atc_group_MEDICAMENTOS_QUE_AFECTAN_A_ESTRUCTURA_OSEA_Y_MINERALIZACION': [
+        'atc_group_MEDICAMENTOS_QUE_AFECTAN_A_ESTRUCTURA_OSEA_Y_MINERALIZACION',
+        'atc_group_CALCIO',
+    ],
+    'atc_group_HIERRO': [
+        'atc_group_B03A_Preparados_con_hierro_B03AA_Hierro_bivalente_preparados_orales',
+        'atc_group_B03A_Preparados_con_hierro_B03AB_Hierro_trivalente_preparados_orales',
+    ],
+    'atc_group_PROPULSIVOS': [
+        'atc_group_PROPULSIVOS',
+        'atc_group_A03F_Propulsivos_A03FA_Propulsivos_benzamidas_con_acci_n_procin_tica_antiem_tica',
+    ],
+    'atc_group_BLOQ_CANALES_CALCIO_SELECTIVOS_EFECTO_VASCULAR': [
+        'atc_group_BLOQ_CANALES_CALCIO_SELECTIVOS_EFECTO_VASCULAR',
+        'atc_group_BLOQ_CANALES_CALCIO_SELECTIVOS_EFECTO_CARDIACO',
+    ],
+    'atc_group_NITRATOS_ORGANICOS_CARDIOTERAPIA': [
+        'atc_group_NITRATOS_ORGANICOS_CARDIOTERAPIA',
+        'atc_group_VASODILATADORES_USADOS_EN_CARDIOTERAPIA',
+        'atc_group_OTROS_PREPARADOS_CARDIACOS',
+    ],
+    'atc_group_DOPA_Y_DERIVADOS_ANTIPARKINSONIANOS': [
+        'atc_group_DOPA_Y_DERIVADOS_ANTIPARKINSONIANOS',
+        'atc_group_DOPAMINERGICOS_ANTIPARKINSONIANOS',
+    ],
+}
+
+# Maps post-grouping column names (lowercase) to their final English names.
+# Keys are the real dataset column names lowercased. Columns not listed here
+# are dropped by the final filter in analyze_atc_columns.
+ATC_TRANSLATION_DICT = {
+    # Grouped columns
+    'atc_group_ieca_araii':
+        'atc_group_ace_inhibitors_and_arbs',
+    'atc_group_diureticos':
+        'atc_group_diuretics',
+    'atc_group_antibacterianos':
+        'atc_group_antibacterials',
+    'atc_group_obstruccion_vias_respiratorias_inhalados':
+        'atc_group_inhalants_for_obstructive_airway_diseases',
+    'atc_group_modificadores_de_los_lipidos_solos':
+        'atc_group_lipid_modifying_agents',
+    'atc_group_ansioliticos':
+        'atc_group_psycholeptics',
+    'atc_group_betabloqueantes_selectivos_solos':
+        'atc_group_beta_blocking_agents',
+    'atc_group_medicamentos_para_hipertrofia_prostatica_benigna':
+        'atc_group_benign_prostatic_hypertrophy_drugs',
+    'atc_group_medicamentos_que_afectan_a_estructura_osea_y_mineralizacion':
+        'atc_group_calcium_and_bone_structure_agents',
+    'atc_group_hierro':
+        'atc_group_iron_preparations',
+    'atc_group_propulsivos':
+        'atc_group_propulsives',
+    'atc_group_bloq_canales_calcio_selectivos_efecto_vascular':
+        'atc_group_calcium_channel_blockers',
+    'atc_group_nitratos_organicos_cardioterapia':
+        'atc_group_other_cardiac_therapy',
+    'atc_group_dopa_y_derivados_antiparkinsonianos':
+        'atc_group_anti_parkinson_drugs',
+
+    # Individual columns
+    'atc_group_medicamentos_para_ulcera_peptica_y_reflujo':
+        'atc_group_drugs_for_peptic_ulcer_and_gerd',
+    'atc_group_otros_analgesicos_y_antipireticos':
+        'atc_group_other_analgesics_and_antipyretics',
+    'atc_group_producto_sanitario_absorbentes':
+        'atc_group_absorbent_sanitary_products',
+    'atc_group_inhibidores_de_la_agregacion_plaquetaria':
+        'atc_group_platelet_aggregation_inhibitors',
+    'atc_group_antidiabeticos_orales_excl_insulinas':
+        'atc_group_oral_antidiabetic_drugs_excl_insulins',
+    'atc_group_antitromboticos':
+        'atc_group_antithrombotic_agents',
+    'atc_group_antidepresivos':
+        'atc_group_antidepressants',
+    'atc_group_analgesicos_opiaceos':
+        'atc_group_opioid_analgesics',
+    'atc_group_antipsicoticos':
+        'atc_group_antipsychotics',
+    'atc_group_vitaminas_a_y_d':
+        'atc_group_vitamins_a_and_d',
+    'atc_group_insulinas_y_analogos':
+        'atc_group_insulins_and_analogues',
+    'atc_group_adrenergicos_inhalados_antiasmaticos':
+        'atc_group_inhaled_adrenergics',
+    'atc_group_preparados_tirodeos':
+        'atc_group_thyroid_preparations',
+    'atc_group_antiepilepticos':
+        'atc_group_antiepileptics',
+    'atc_group_preparados_contra_la_gota':
+        'atc_group_antigout_preparations',
+    'atc_group_corticosteroides_de_uso_sistemico_solos':
+        'atc_group_systemic_corticosteroids_plain',
+    'atc_group_antihistaminicos_de_uso_sistemico':
+        'atc_group_antihistamines_for_systemic_use',
+    'atc_group_preparados_antiglaucoma_y_mioticos':
+        'atc_group_antiglaucoma_preparations_and_miotics',
+    'atc_group_medicamentos_contra_la_demencia':
+        'atc_group_anti_dementia_drugs',
+    'atc_group_antiinflamatorios_y_antireumaticos_no_esteroideos':
+        'atc_group_nsaids',
+    'atc_group_medicamentos_contra_el_vertigo':
+        'atc_group_antivertigo_preparations',
+    'atc_group_diureticos_ahorradores_de_potasio':
+        'atc_group_potassium_sparing_diuretics',
+    'atc_group_vasodilatadores_perifericos':
+        'atc_group_peripheral_vasodilators',
+    'atc_group_vitamina_b12_y_derivados':
+        'atc_group_vitamin_b12_and_folic_acid',
+    'atc_group_antiadrenergicos_de_accion_periferica_antihipert':
+        'atc_group_peripheral_antiadrenergics',
+    'atc_group_otros_preparados_urologicos_incl_antiespasmodicos':
+        'atc_group_other_urologicals_incl_antispasmodics',
+    'atc_group_laxantes':
+        'atc_group_laxatives',
+    'atc_group_nutrici_n_cl_nica_diet_ticos_sueros':
+        'atc_group_clinical_nutrition_and_electrolytes',
+    'atc_group_glicosidos_cardiacos':
+        'atc_group_cardiac_glycosides',
+    'atc_group_expectorantes_excluid_asociac_con_antitusigenos':
+        'atc_group_expectorants',
+    'atc_group_psicoestimulantes_medic_para_adhd_y_nootropicos':
+        'atc_group_psychostimulants_adhd_and_nootropics',
+    'atc_group_antiarritmicos':
+        'atc_group_antiarrhythmics',
+}
+
+
 def analyze_atc_columns(
     df: pd.DataFrame,
     threshold: float = 1.0,
@@ -575,6 +743,7 @@ def analyze_atc_columns(
     export: bool = False,
     export_path: str = None,
     drop_columns: bool = False,
+    group_and_translate: bool = True,
 ) -> pd.DataFrame:
     """
     Analyzes ATC medication columns (those starting with 'atc_').
@@ -585,28 +754,32 @@ def analyze_atc_columns(
     threshold : float
         Minimum percentage of non-zero rows to keep a column (e.g. 1.0 = 1%).
     show_counts : bool
-        Print the column count summary and above-threshold table.
+        Print the column count summary after threshold filtering and, if
+        group_and_translate=True, the final column list with n and completeness %
+        after grouping and translation.
     show_histogram : bool
-        Plot the completeness histogram.
+        Plot the completeness histogram before threshold filtering.
     export : bool
         Save the cleaned dataframe to parquet. Requires export_path.
     export_path : str, optional
         Full path for the output parquet file. Used only when export=True.
     drop_columns : bool
-        If True, returns a tuple (completeness, df_clean) where df_clean has
-        below-threshold ATC columns removed. If False, returns only completeness.
+        If True, returns the cleaned dataframe. If False, returns None.
+    group_and_translate : bool
+        If True (default), merges related ATC sub-groups via OR logic (max of
+        dummies), lowercases all column headers, applies ATC_TRANSLATION_DICT,
+        and drops any remaining untranslated ATC columns.
 
     Returns
     -------
     pd.DataFrame or None
-        Cleaned dataframe with below-threshold ATC columns removed, if drop_columns=True.
-        Otherwise None.
+        Cleaned dataframe if drop_columns=True, otherwise None.
     """
     threshold_dec = threshold / 100
-
     atc_cols = [c for c in df.columns if c.startswith("atc_")]
     n_total = len(df)
 
+    # 1. Calculate completeness on the original ATC columns
     completeness = (
         df[atc_cols]
         .astype(bool)
@@ -617,13 +790,13 @@ def analyze_atc_columns(
     completeness["pct"] = completeness["n_nonzero"] / n_total
     completeness = completeness.sort_values("pct", ascending=False)
 
-    above = completeness[completeness["pct"] >= threshold_dec]
-    below = completeness[completeness["pct"] < threshold_dec]
-    all_zero = completeness[completeness["n_nonzero"] == 0]
+    above     = completeness[completeness["pct"] >= threshold_dec]
+    below     = completeness[completeness["pct"] < threshold_dec]
+    all_zero  = completeness[completeness["n_nonzero"] == 0]
 
     if show_counts:
-        print(f"Total ATC columns:              {len(atc_cols)}")
-        print(f"All-zero columns (drop):        {len(all_zero)}")
+        print(f"Total ATC columns:                        {len(atc_cols)}")
+        print(f"All-zero columns (drop):                  {len(all_zero)}")
         print(f"Below threshold ({threshold:.2f}%, drop):  {len(below)}")
         print(f"Above threshold ({threshold:.2f}%, keep):  {len(above)}")
         print()
@@ -647,21 +820,63 @@ def analyze_atc_columns(
         plt.tight_layout()
         plt.show()
 
+    # 2. Drop columns below threshold
     cols_to_drop = below.index.tolist()
     df_clean = df.drop(columns=cols_to_drop)
 
     if show_counts:
         print(f"\nATC columns eliminated (below threshold {threshold:.2f}%): {len(cols_to_drop)}")
-        print(f"Remaining columns after dropping: {df_clean.shape[1]}")
-        display(completeness)
+        print(f"Remaining columns after dropping:                          {df_clean.shape[1]}")
+
+    # 3. Grouping and translation
+    if group_and_translate:
+        # A. Merge sub-groups via OR logic (max of dummies).
+        #    When target name matches a source name, compute first then drop others
+        #    to avoid dropping the column before it is assigned.
+        for target_group, source_columns in ATC_GROUPING_CONFIG.items():
+            available_cols = [c for c in source_columns if c in df_clean.columns]
+            if available_cols:
+                df_clean[target_group] = df_clean[available_cols].max(axis=1)
+                cols_to_remove = [c for c in available_cols if c != target_group]
+                df_clean.drop(columns=cols_to_remove, inplace=True)
+
+        # B. Standardize all column names to lowercase
+        df_clean.columns = [col.lower() for col in df_clean.columns]
+
+        # C. Rename to final English names
+        df_clean.rename(columns=ATC_TRANSLATION_DICT, inplace=True)
+
+        # D. Drop any remaining ATC columns not covered by the translation dictionary
+        english_atc_targets = set(ATC_TRANSLATION_DICT.values())
+        final_cols_to_keep = [
+            c for c in df_clean.columns
+            if not c.startswith('atc_') or c in english_atc_targets
+        ]
+        df_clean = df_clean[final_cols_to_keep]
+
+        if show_counts:
+            final_atc_cols = sorted(c for c in df_clean.columns if c.startswith('atc_'))
+            final_completeness = (
+                df_clean[final_atc_cols]
+                .astype(bool)
+                .sum()
+                .rename("n")
+                .to_frame()
+            )
+            final_completeness["completeness"] = (
+                final_completeness["n"] / n_total
+            ).map("{:.2%}".format)
+            final_completeness = final_completeness.sort_values("n", ascending=False)
+
+            print(f"\nATC columns after grouping and translation: {len(final_atc_cols)}")
+            print(final_completeness.to_string())
 
     if export:
         if export_path is None:
             raise ValueError("export=True requires export_path to be provided.")
         df_clean.to_parquet(export_path, index=False)
 
-    if drop_columns:
-        return df_clean
+    return df_clean if drop_columns else None
 
 ## Function to analyze missing values
 def analyze_missing_values(df):
