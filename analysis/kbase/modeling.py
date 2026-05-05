@@ -126,11 +126,16 @@ def data_load_col_selection(target_column, triage_value,
     ).to_pandas()
 
     # Select base columns
+    ## Some columns are later excluded for modeling, but are included in the exported
+    ## table for statistics analysis
     base_cols = [
         "demandpk",
+        "demand_date",
         "age",
         "sex",
         "demand_type_1",
+        "has_icd_emerg",
+        "p1_assigned",
         target_column,
         "day_week_monday", "day_week_tuesday", "day_week_wednesday", "day_week_thursday",
         "day_week_friday", "day_week_saturday", "day_week_sunday",
@@ -209,7 +214,8 @@ def data_filtering(df, target_column, demand_code,
             df = df[df["demand_type_1"] == demand_code].copy()
             print(f"Filtering by demand_type_1 == {demand_code}")
 
-    # Filter out medication columns by threshold-specific available medication columns
+    # Filter out medication columns by threshold-specific available medication columns and 
+    # group and remove similar coloumns
     df = dp.analyze_atc_columns(
         df,
         threshold=1.0,
@@ -292,7 +298,9 @@ def data_filtering(df, target_column, demand_code,
             print(f"❌ Export failed: File not found at {export_path}")
 
     # Drop columns after cohort filtering and data export
-    cols_to_drop = ["demandpk", "demand_type_1", "triage", "year", "literal_reason", "hcdm_id"]
+    # for preparation to modeling
+    cols_to_drop = ["demandpk", "demand_date", "demand_type_1", "has_icd_emerg", "p1_assigned", 
+                    "triage", "year", "literal_reason", "hcdm_id"]
     cols_to_drop = [c for c in cols_to_drop if c in df.columns]
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
@@ -319,7 +327,8 @@ def data_filtering(df, target_column, demand_code,
     print(f"\nFinal cohort size for {target_column}: {len(df)}")
     print("Outcome distribution: ", df[target_column].value_counts(dropna=False), "\n")
     # Show info for only the first 50 columns
-    df.iloc[:, :50].info()
+    # df.iloc[:, :50].info()
+    df.info(verbose=True)
 
     print(f"\n" + "="*40)
     print(f"Number of features for modeling: {len(df.columns)}")
