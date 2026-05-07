@@ -103,6 +103,70 @@ def time_print():
     now = datetime.now() 
     print(f"Current Date and Time: {now.strftime('%d/%m/%Y %H:%M:%S')}\n")
 
+def _make_outcome_year_strata(y, year):
+    """Builds combined outcome-year strata for balanced splitting."""
+    # Keep outcome and year aligned even when callers pass Series with custom indexes.
+    y_s = pd.Series(y)
+    if hasattr(year, "index") and y_s.index.equals(year.index):
+        year_s = pd.Series(year)
+    else:
+        year_s = pd.Series(np.asarray(year), index=y_s.index)
+    return y_s.astype(str) + "__year_" + year_s.astype(str)
+
+
+def _validate_strata_counts(strata, min_count, context):
+    """Validates that every stratum has enough samples for the requested split."""
+    # scikit-learn stratification requires enough samples in every stratum.
+    counts = pd.Series(strata).value_counts()
+    rare = counts[counts < min_count]
+    if not rare.empty:
+        raise ValueError(
+            f"{context} requires at least {min_count} samples per outcome-year stratum. "
+            f"Rare strata: {rare.to_dict()}"
+        )
+
+class OutcomeYearStratifiedKFold:
+    """K-fold splitter that stratifies by the stored outcome-year strata."""
+
+    def __init__(self, strata, n_splits=5, random_state=42):
+        # Store the precomputed outcome-year strata used later by FLAML CV.
+        self.strata = pd.Series(strata)
+        self.n_splits = n_splits
+        self.random_state = random_state
+        _validate_strata_counts(
+            self.strata,
+            min_count=n_splits,
+            context=f"{n_splits}-fold cross-validation",
+        )
+
+    def get_n_splits(self, X=None, y=None, groups=None):
+        """Returns the number of CV folds."""
+        return self.n_splits
+
+    def split(self, X, y=None, groups=None):
+        """Yields train/test indices while preserving outcome-year strata per fold."""
+        if hasattr(X, "index"):
+            strata = self.strata.loc[X.index].reset_index(drop=True)
+        else:
+            strata = self.strata.iloc[:len(X)].reset_index(drop=True)
+
+        rng = np.random.default_rng(self.random_state)
+        fold_test_indices = [[] for _ in range(self.n_splits)]
+
+        # Split each outcome-year cell across folds, rotating fold assignment to balance sizes.
+        for stratum_number, (_, stratum) in enumerate(strata.groupby(strata, sort=False)):
+            indices = stratum.index.to_numpy()
+            rng.shuffle(indices)
+            for fold_idx, chunk in enumerate(np.array_split(indices, self.n_splits)):
+                rotated_fold_idx = (fold_idx + stratum_number) % self.n_splits
+                fold_test_indices[rotated_fold_idx].extend(chunk.tolist())
+
+        all_indices = np.arange(len(strata))
+        for test_indices in fold_test_indices:
+            test_indices = np.array(sorted(test_indices), dtype=int)
+            train_indices = np.setdiff1d(all_indices, test_indices, assume_unique=False)
+            yield train_indices, test_indices
+
 def triage_print(triage_value, cohort_name, demand_code):
     """ Prints the initial configuration of the model run """
     print(f"=== Running the model for {cohort_name} cohort - code {demand_code} ===")
@@ -129,30 +193,48 @@ def data_load_col_selection(target_column, triage_value,
     ## Some columns are later excluded for modeling, but are included in the exported
     ## table for statistics analysis
     base_cols = [
-        "demandpk",
-        "demand_date",
+        # --- Patient demographics ---
         "age",
         "sex",
-        "demand_type_1",
-        "has_icd_emerg",
-        "p1_assigned",
+
+        # --- Target ---
         target_column,
+
+        # --- Temporal: day of week ---
         "day_week_monday", "day_week_tuesday", "day_week_wednesday", "day_week_thursday",
         "day_week_friday", "day_week_saturday", "day_week_sunday",
+
+        # --- Temporal: time of day ---
         "time_of_day_early_morning", "time_of_day_morning", "time_of_day_afternoon", "time_of_day_night",
+
+        # --- Temporal: month (seasons excluded — redundant with months, lower resolution) ---
         "month_january", "month_february", "month_march", "month_april",
         "month_may", "month_june", "month_july", "month_august",
         "month_september", "month_october", "month_november", "month_december",
-        "season_spring", "season_summer", "season_autumn", "season_winter",
-        "year",
+
+        # --- Call context: patient location ---
         "location_patient_home", "location_patient_public_road", "location_patient_other",
+
+        # --- Call context: entity receiving the alert ---
         "alert_receiver_112", "alert_receiver_user", "alert_receiver_pol_fg",
         "alert_receiver_hs", "alert_receiver_tele", "alert_receiver_others",
+
+        # --- Geographic: province and coordinates ---
         "province_almeria", "province_cadiz", "province_cordoba", "province_granada",
         "province_huelva", "province_jaen", "province_malaga", "province_sevilla",
         "incident_latitude",
         "incident_longitude",
+
+        # --- Excluded before modeling (kept for export / statistics only) ---
+        "demandpk",
+        "demand_date",
+        "demand_type_1",
+        "has_icd_emerg",
+        "p1_assigned",
         "triage",
+        "year",
+        "has_history",
+        "has_med",
     ]
 
     # Initialize modelling columns with base columns
@@ -299,18 +381,34 @@ def data_filtering(df, target_column, demand_code,
 
     # Drop columns after cohort filtering and data export
     # for preparation to modeling
-    cols_to_drop = ["demandpk", "demand_date", "demand_type_1", "has_icd_emerg", "p1_assigned", 
-                    "triage", "year", "literal_reason", "hcdm_id"]
+    cols_to_drop = ["demandpk", "demand_date", "demand_type_1", 
+                    "has_history", "has_med", "has_icd_emerg", 
+                    "p1_assigned", 
+                    "triage", "literal_reason", "hcdm_id"]
     cols_to_drop = [c for c in cols_to_drop if c in df.columns]
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
 
-    # --- Column summary by group ---
-    triage_cols  = [c for c in df.columns if c[0].isdigit()]
-    lr_cols      = [c for c in df.columns if c.startswith("lr_")]
-    hist_cols    = [c for c in df.columns if c.startswith("hist_")]
-    atc_cols     = [c for c in df.columns if c.startswith("atc")]
-    other_cols   = [c for c in df.columns if c not in triage_cols + lr_cols + hist_cols + atc_cols]
+    print(f"\nFinal cohort size for {target_column}: {len(df)}")
+    print("Outcome distribution: ", df[target_column].value_counts(dropna=False), "\n")
+
+    print(f"\n" + "="*40)
+    print(f"Columns retained before train/test split: {len(df.columns)}")
+    print(f"Not used as model features: {target_column} is the outcome; year is used with {target_column} for stratification")
+    print("="*40 + "\n")
+
+    df = df.reset_index(drop=True)
+
+    return df
+
+
+def print_feature_summary(X_train):
+    """Prints the feature groups that are actually passed to the model."""
+    triage_cols  = [c for c in X_train.columns if c[0].isdigit()]
+    lr_cols      = [c for c in X_train.columns if c.startswith("lr_")]
+    hist_cols    = [c for c in X_train.columns if c.startswith("hist_")]
+    atc_cols     = [c for c in X_train.columns if c.startswith("atc")]
+    other_cols   = [c for c in X_train.columns if c not in triage_cols + lr_cols + hist_cols + atc_cols]
 
     print("\n" + "="*40)
     print("FEATURE SUMMARY BY GROUP")
@@ -320,26 +418,29 @@ def data_filtering(df, target_column, demand_code,
     print(f"  Past history      (hist_):         {len(hist_cols):>4}")
     print(f"  Medication        (atc):           {len(atc_cols):>4}")
     print(f"  Other:                             {len(other_cols):>4}")
-    print(f"  {'─'*30}")
-    print(f"  Total features:                    {len(df.columns):>4}")
+    print(f"  {'-'*30}")
+    print(f"  Total model features:              {X_train.shape[1]:>4}")
     print("="*40 + "\n")
 
-    print(f"\nFinal cohort size for {target_column}: {len(df)}")
-    print("Outcome distribution: ", df[target_column].value_counts(dropna=False), "\n")
-    # Show info for only the first 50 columns
-    # df.iloc[:, :50].info()
-    df.info(verbose=True)
-
-    print(f"\n" + "="*40)
-    print(f"Number of features for modeling: {len(df.columns)}")
-    print("="*40 + "\n")
-
-    return df
+    X_train.info(verbose=True)
 
 def train_test_split_weights(df, target_column, test_size, seed):
     """Splits data into train/test sets and computes sample weights for imbalance"""
-    X = df.drop(columns=[target_column])
+    if "year" not in df.columns:
+        raise ValueError("'year' column is required for outcome-year stratified splitting")
+
+    # Keep year only as splitting metadata: it is not used as a model feature.
+    year = df["year"]
+    X = df.drop(columns=[target_column, "year"])
     y = df[target_column]
+
+    # Stratify by the joint outcome-year cell to preserve both prevalence and year mix.
+    strata = _make_outcome_year_strata(y, year)
+    _validate_strata_counts(
+        strata,
+        min_count=2,
+        context="Train/test outcome-year stratified split",
+    )
 
     # Ensure categorical consistency
     # This prevents the 'categorical_feature do not match' error in LightGBM/FLAML
@@ -351,16 +452,19 @@ def train_test_split_weights(df, target_column, test_size, seed):
         #    even if one split is missing a specific category value.
         X[col] = X[col].astype(str).astype('category')
         
-    X_train, X_test, y_train, y_test = train_test_split(
+    X_train, X_test, y_train, y_test, year_train, year_test = train_test_split(
         X,
         y,
+        year,
         test_size=test_size,
         random_state=seed,
-        stratify=y,
+        stratify=strata,
     )
 
     print(f"Train samples: {len(X_train)}")
     print(f"Test samples:  {len(X_test)}")
+    print(f"Model features used for training: {X_train.shape[1]}")
+    print_feature_summary(X_train)
 
     # Sample weights (class imbalance)
     sample_weight = compute_sample_weight(
@@ -368,12 +472,12 @@ def train_test_split_weights(df, target_column, test_size, seed):
         y=y_train,
     )
 
-    return X_train, X_test, y_train, y_test, sample_weight
+    return X_train, X_test, y_train, y_test, year_train, year_test, sample_weight
 
 import pandas as pd
 from flaml import AutoML
 
-def run_automl_training(X_train, y_train, sample_weight, time_budget, 
+def run_automl_training(X_train, y_train, year_train, sample_weight, time_budget, 
                         optimize_metric, n_splits_cv, seed, task):
     """Executes the FLAML AutoML optimization process and prints a benchmarking table"""
     print(f"\n--- Starting AutoML ({task.upper()}) | Budget: {time_budget}s ---")
@@ -382,6 +486,13 @@ def run_automl_training(X_train, y_train, sample_weight, time_budget,
     else:
         print(f"Training metric: {optimize_metric}")
         
+    cv_strata = _make_outcome_year_strata(y_train, year_train)
+    cv_splitter = OutcomeYearStratifiedKFold(
+        cv_strata,
+        n_splits=n_splits_cv,
+        random_state=seed,
+    )
+
     automl = AutoML()
     automl.fit(
         X_train=X_train, 
@@ -392,6 +503,7 @@ def run_automl_training(X_train, y_train, sample_weight, time_budget,
         task=task,
         eval_method="cv", 
         n_splits=n_splits_cv, 
+        split_type=cv_splitter,
         seed=seed, 
         verbose=1,
         log_training_metric=True,
@@ -459,7 +571,7 @@ def compute_youden_threshold(
     y_train_prob,
     y_test,
     y_test_prob,
-    sensitivity_range: Optional[tuple] = (0.80, 0.90),
+    sensitivity_range: Optional[tuple] = (0.85, 0.90),
 ):
     """
     Finds the optimal decision threshold by maximising the Youden index J = Se + Sp - 1.
@@ -821,6 +933,7 @@ def plot_calibration(
 def print_test_metrics_with_ci(
     y_test,
     y_test_prob,
+    y_test_year,
     threshold: float,
     n_bootstrap: int = 1000,
     ci_seed:     int = 42,
@@ -832,7 +945,7 @@ def print_test_metrics_with_ci(
     Clopper–Pearson (exact binomial) for binary proportions:
         Accuracy, Precision, Recall, Specificity, NPV
 
-    Stratified bootstrap for composite metrics:
+    Outcome-year stratified bootstrap for composite metrics:
         F1, MCC, Youden Index, Balanced Accuracy
     """
     from scipy.stats import beta as _beta
@@ -903,15 +1016,20 @@ def print_test_metrics_with_ci(
     rng     = np.random.default_rng(ci_seed)
     y_te_s  = pd.Series(y_test.values if hasattr(y_test, "values") else y_test).reset_index(drop=True)
     y_pr_s  = pd.Series(y_test_pred).reset_index(drop=True)
-    pos_idx = np.where(y_te_s == 1)[0]
-    neg_idx = np.where(y_te_s == 0)[0]
+    year_s  = pd.Series(y_test_year.values if hasattr(y_test_year, "values") else y_test_year).reset_index(drop=True)
+    boot_strata = _make_outcome_year_strata(y_te_s, year_s)
+    strata_indices = [
+        group.index.to_numpy()
+        for _, group in boot_strata.groupby(boot_strata, sort=False)
+    ]
 
     boot = {"f1": [], "mcc": [], "youden": [], "bal_acc": []}
 
     for _ in range(n_bootstrap):
-        pos_s = rng.choice(pos_idx, size=len(pos_idx), replace=True) if len(pos_idx) else np.array([], dtype=int)
-        neg_s = rng.choice(neg_idx, size=len(neg_idx), replace=True) if len(neg_idx) else np.array([], dtype=int)
-        idx   = np.concatenate([pos_s, neg_s])
+        idx   = np.concatenate([
+            rng.choice(stratum_idx, size=len(stratum_idx), replace=True)
+            for stratum_idx in strata_indices
+        ])
         yt    = y_te_s.iloc[idx]
         yp    = y_pr_s.iloc[idx]
 
@@ -975,7 +1093,7 @@ def print_test_metrics_with_ci(
     print(f"  Specificity:           {_pct(spec, ci_cp['spec'])}")
     print(f"  NPV:                   {_pct(npv,  ci_cp['npv'])}")
 
-    print(f"\n  Composite metrics  (Stratified Bootstrap CI):")
+    print(f"\n  Composite metrics  (Outcome-year Stratified Bootstrap CI):")
     print(f"  F1 Score:              {_pct(f1,      ci_boot['f1'])}")
     print(f"  MCC:                   {_raw(mcc,     ci_boot['mcc'])}")
     print(f"  Youden Index:          {_raw(youden,  ci_boot['youden'])}")
@@ -1649,13 +1767,13 @@ def run_binary_automl_model(
     # -----------------------------
     # Train / test split
     # -----------------------------
-    X_train, X_test, y_train, y_test, sample_weight = train_test_split_weights(
+    X_train, X_test, y_train, y_test, year_train, year_test, sample_weight = train_test_split_weights(
         df_filtered, target_column, test_size, seed)
 
     # -----------------------------
     # AutoML training
     # -----------------------------
-    automl = run_automl_training(X_train, y_train, sample_weight, time_budget, 
+    automl = run_automl_training(X_train, y_train, year_train, sample_weight, time_budget, 
                                  optimize_metric, n_splits_cv, seed, task = "classification")
 
     # -----------------------------
@@ -1682,7 +1800,7 @@ def run_binary_automl_model(
     # -----------------------------
     # Test set evaluation
     # -----------------------------
-    metrics = print_test_metrics_with_ci(y_test, y_test_prob, threshold=best_threshold)
+    metrics = print_test_metrics_with_ci(y_test, y_test_prob, year_test, threshold=best_threshold)
     y_test_pred = (y_test_prob >= best_threshold).astype(int)
 
     # Calibration plot
@@ -1829,14 +1947,14 @@ def run_multiclass_automl_model(
     # -----------------------------
     # Train / test split
     # -----------------------------
-    X_train, X_test, y_train, y_test, sample_weight = train_test_split_weights(
+    X_train, X_test, y_train, y_test, year_train, year_test, sample_weight = train_test_split_weights(
         df, target_column, test_size, seed)
 
     # -----------------------------
     # AutoML training (task set to multiclass)
     # -----------------------------
     automl = run_automl_training(
-        X_train, y_train, sample_weight, time_budget, 
+        X_train, y_train, year_train, sample_weight, time_budget, 
         optimize_metric, n_splits_cv, seed, task="multiclass"
     )
 
