@@ -5,6 +5,8 @@
 data/
 .git/
 .env
+*.docx
+*.jpg
 
 # R specific
 .Rproj.user
