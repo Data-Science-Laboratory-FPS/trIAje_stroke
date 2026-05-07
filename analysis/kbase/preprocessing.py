@@ -467,7 +467,7 @@ def transform_column_dtypes(df: pd.DataFrame, dtype_dict=dtype_cols):
 
     # 2. Dynamically add columns starting with 'lr_' or 'hist_' as 'int8'
     for col in df.columns:
-        if col.startswith(('lr_', 'hist_', 'atc_')):
+        if col.startswith(('lr_', 'has_hist', 'hist_', 'has_med', 'atc_')):
             working_dtype_dict[col] = "int8"
 
     # 3. Keep only dtype rules that apply to existing columns
@@ -568,6 +568,37 @@ def merge_text_embeddings(run_mode, df_embeddings, embedding_path, df_main):
     print("="*40 + "\n")
         
     return df_main
+
+# Maps Spanish-abbreviated lr_* column names (as produced by the NLP one-hot pipeline)
+# to their English equivalents used throughout the modeling pipeline.
+lr_translation_dict = {
+    "lr_sospecha_acv":    "lr_suspected_stroke",
+    "lr_foc_habla":       "lr_focal_speech_deficit",
+    "lr_foc_facial":      "lr_focal_facial_weakness",
+    "lr_foc_motor_ms":    "lr_focal_arm_weakness",
+    "lr_foc_lateral":     "lr_focal_laterality_mentioned",
+    "lr_foc_motor_mi":    "lr_focal_leg_weakness",
+    "lr_foc_sensiti":     "lr_focal_sensory_deficit",
+    "lr_foc_visual":      "lr_focal_visual_deficit",
+    "lr_confu_aguda":     "lr_acute_confusion",
+    "lr_alt_consci":      "lr_altered_consciousness",
+    "lr_tmp_hiperag":     "lr_onset_hyperacute",
+    "lr_tmp_despert":     "lr_onset_on_waking",
+    "lr_tmp_evolucionado":"lr_onset_subacute",
+    "lr_cefalea":         "lr_headache",
+    "lr_convul":          "lr_seizure_or_convulsion",
+    "lr_sint_mareo":      "lr_symptom_dizziness_syncope",
+    "lr_sint_digest":     "lr_symptom_digestive",
+    "lr_sint_infecc":     "lr_symptom_infectious",
+    "lr_sint_temblor":    "lr_symptom_tremor_rigidity",
+    "lr_sint_disfagia":   "lr_symptom_dysphagia",
+    "lr_frag_social":     "lr_fragility_social_telecare",
+    "lr_frag_basal":      "lr_fragility_baseline_dependency",
+    "lr_ant_acv_prev":    "lr_history_prior_stroke",
+    "lr_riesgo_cv":       "lr_history_cardiovascular_risk",
+    "lr_src_profes":      "lr_caller_is_professional",
+    "lr_missing_dat":     "lr_no_clinical_data",
+}
 
 # Merges related ATC sub-groups into a single column via OR logic (max of dummies).
 # Source columns are dropped after merging.
