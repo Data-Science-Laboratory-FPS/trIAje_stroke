@@ -571,7 +571,7 @@ def compute_youden_threshold(
     y_train_prob,
     y_test,
     y_test_prob,
-    sensitivity_range: Optional[tuple] = (0.85, 0.90),
+    sensitivity_range: Optional[tuple] = (0.80, 0.90),
 ):
     """
     Finds the optimal decision threshold by maximising the Youden index J = Se + Sp - 1.
@@ -1384,7 +1384,9 @@ def plot_feature_importances(automl, X_train, feature_importance,
                 scoring=perm_scoring,
                 n_repeats=5,
                 random_state=seed,
-                n_jobs=-1,
+                # Keep this sequential: joblib has to pickle the local wrapper
+                # and FLAML AutoML object when n_jobs != 1, which can fail.
+                n_jobs=1,
             )
 
             importance_df_permutation = (
