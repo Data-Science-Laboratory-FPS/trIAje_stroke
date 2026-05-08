@@ -25,9 +25,46 @@ from typing import Optional, List, Union
 import shap
 import warnings
 
-import kbase.preprocessing as dp 
-import kbase.eda as eda 
+import kbase.preprocessing as dp
+import kbase.eda as eda
 from kbase.config import settings
+
+_FIGURES_DIR_MAP = {
+    16: 'figures/03_dyspnea',
+    23: 'figures/02_chestpain',
+    54: 'figures/04_stroke',
+    'cardiac_arrest': 'figures/01_cardiac_arrest',
+}
+
+# Set by run_*_automl_model at the start of each pipeline run.
+# All internal plot functions read from here via save_figure().
+_current_demand_code = None
+_current_time_budget = None
+
+_ANALYSIS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+def _get_figures_dir(demand_code):
+    """Returns the absolute figures directory path for a given demand_code."""
+    if isinstance(demand_code, (list, tuple)):
+        key = 'cardiac_arrest' if set(demand_code) == {36, 58} else None
+    else:
+        key = demand_code
+    rel = _FIGURES_DIR_MAP.get(key)
+    return os.path.join(_ANALYSIS_DIR, rel) if rel is not None else None
+
+def save_figure(fig, filename, dpi=300):
+    """Saves a matplotlib figure to the demand-specific figures directory with high quality."""
+    folder = _get_figures_dir(_current_demand_code)
+    if folder is None:
+        print(f"[save_figure] WARNING: no folder for demand_code={_current_demand_code!r}, skipping '{filename}'")
+        return
+    os.makedirs(folder, exist_ok=True)
+    if _current_time_budget is not None:
+        stem, ext = os.path.splitext(filename)
+        filename = f"{stem}_{int(_current_time_budget // 60)}min{ext}"
+    path = os.path.join(folder, filename)
+    fig.savefig(path, dpi=dpi, bbox_inches='tight')
+    print(f"Figure saved: {path}")
 
 # This ensures .info() shows up to 50 columns by default
 pd.set_option('display.max_info_columns', 50)
@@ -222,8 +259,8 @@ def data_load_col_selection(target_column, triage_value,
         # --- Geographic: province and coordinates ---
         "province_almeria", "province_cadiz", "province_cordoba", "province_granada",
         "province_huelva", "province_jaen", "province_malaga", "province_sevilla",
-        "incident_latitude",
-        "incident_longitude",
+        # "incident_latitude",
+        # "incident_longitude",
 
         # --- Excluded before modeling (kept for export / statistics only) ---
         "demandpk",
@@ -673,6 +710,7 @@ def compute_youden_threshold(
     ax.set_xlim([0.0, 1.0])
     ax.set_ylim([0.0, 1.02])
     plt.tight_layout()
+    save_figure(fig, 'roc_curve_youden.png')
     plt.show()
 
     return best_thr
@@ -870,7 +908,6 @@ def plot_calibration(
     y_test,  y_test_prob,
     threshold: float,
     n_bins: int = 15,
-    save_path: str = None,
 ) -> None:
     """
     Two-panel calibration figure:
@@ -879,8 +916,7 @@ def plot_calibration(
 
     Parameters
     ----------
-    n_bins    : number of bins for the calibration curve (quantile strategy).
-    save_path : if provided, saves the figure to that path (e.g. 'calibration.png').
+    n_bins : number of bins for the calibration curve (quantile strategy).
     """
     from sklearn.calibration import calibration_curve
 
@@ -926,8 +962,7 @@ def plot_calibration(
     ax2.grid(alpha=0.3)
 
     plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    save_figure(fig, 'calibration_curve.png')
     plt.show()
 
 def print_test_metrics_with_ci(
@@ -957,13 +992,14 @@ def print_test_metrics_with_ci(
     conf_matrix = confusion_matrix(y_test, y_test_pred)
     labels = ['Negative', 'Positive']
 
-    plt.figure(figsize=(8, 6))
+    fig_cm = plt.figure(figsize=(8, 6))
     sns.heatmap(conf_matrix, annot=True, cmap='Blues', fmt='d',
                 xticklabels=labels, yticklabels=labels)
     plt.title('Classification Pipeline Confusion Matrix')
     plt.xlabel('Predicted')
     plt.ylabel('Actual')
     plt.tight_layout()
+    save_figure(fig_cm, 'confusion_matrix.png')
     plt.show()
 
     # --- Metrics computation --------------------------------------------------
@@ -1474,17 +1510,20 @@ def plot_feature_importances(automl, X_train, feature_importance,
         top_k = min(15, len(importance_df))
         plot_df = importance_df.head(top_k)
 
-        plt.figure(figsize=(10, 6))
-        plt.barh(plot_df["feature"][::-1], plot_df["importance"][::-1])
+        fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
+        ax_imp.barh(plot_df["feature"][::-1], plot_df["importance"][::-1])
 
         if is_permutation:
-            plt.title(f"Top Features (Permutation Importance — {perm_scoring})")
-            plt.xlabel(f"Mean decrease in {perm_scoring} (percentage points)")
+            ax_imp.set_title(f"Top Features (Permutation Importance — {perm_scoring})")
+            ax_imp.set_xlabel(f"Mean decrease in {perm_scoring} (percentage points)")
+            filename = 'permutation_importance.png'
         else:
-            plt.title(f"Top Features (Built-in Importance — {automl.best_estimator})")
-            plt.xlabel("Feature Importance (relative)")
+            ax_imp.set_title(f"Top Features (Built-in Importance — {automl.best_estimator})")
+            ax_imp.set_xlabel("Feature Importance (relative)")
+            filename = 'builtin_importance.png'
 
         plt.tight_layout()
+        save_figure(fig_imp, filename)
         plt.show()
 
         print(f"\nTop {top_k} most important features:")
@@ -1635,8 +1674,10 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
                         shap_class_filtered,
                         X_plot,
                         max_display=max_display,
-                        show=True,
+                        show=False,
                     )
+                save_figure(plt.gcf(), f'shap_class_{class_name}.png')
+                plt.show()
         else:
             # Binary: use positive class (index 1)
             # TreeExplainer → list [neg, pos] or single 2D array
@@ -1657,8 +1698,10 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
                     shap_filtered,
                     X_plot,
                     max_display=max_display,
-                    show=True,
+                    show=False,
                 )
+            save_figure(plt.gcf(), 'shap_importance.png')
+            plt.show()
 
         print("SHAP interpretation completed successfully.")
         elapsed = time.time() - _start_time
@@ -1738,6 +1781,11 @@ def run_binary_automl_model(
     dict
         Dictionary with model, metrics, threshold and feature importance.
     """
+
+    # Register the active demand_code and time_budget so save_figure() knows which folder/suffix to use
+    global _current_demand_code, _current_time_budget
+    _current_demand_code = demand_code
+    _current_time_budget = time_budget
 
     # -----------------------------
     # Print time
@@ -1823,7 +1871,11 @@ def run_binary_automl_model(
     plot_df = df.loc[y_test.index].copy() 
     plot_df['target_real'] = y_test
     plot_df['target_pred'] = y_test_pred
-    eda.evaluate_diagnostic_performance(plot_df, 'target_real', 'target_pred', sex_group = False)
+    eda.evaluate_diagnostic_performance(
+        plot_df, 'target_real', 'target_pred',
+        sex_group=False,
+        figures_dir=_get_figures_dir(demand_code),
+    )
 
     # -----------------------------
     # Feature importance
@@ -1918,6 +1970,10 @@ def run_multiclass_automl_model(
     dict
         Dictionary with model, metrics, and summary results.
     """
+
+    global _current_demand_code, _current_time_budget
+    _current_demand_code = demand_code
+    _current_time_budget = time_budget
 
     # -----------------------------
     # Print type of triage-specific cohort

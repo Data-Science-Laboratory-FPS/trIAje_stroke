@@ -9,7 +9,7 @@ from IPython.display import display
 
 from kbase.config import settings
 
-def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False):
+def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False, figures_dir=None):
     """
     Calculates clinical metrics and generates plots segmented by triage status.
     If sex_group=True, it performs a cross-stratification: 
@@ -176,6 +176,11 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False)
                                 fontweight='bold')
 
     plt.tight_layout()
+    if figures_dir:
+        os.makedirs(figures_dir, exist_ok=True)
+        path = os.path.join(figures_dir, 'metrics_barplots.png')
+        fig.savefig(path, dpi=300, bbox_inches='tight')
+        print(f"Figure saved: {path}")
     plt.show()
 
     return results_df
