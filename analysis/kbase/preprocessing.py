@@ -349,7 +349,6 @@ def summarize_numbers(
     id_cols should be a list of exactly 3 columns:
         [id1_col, id2_col, id3_col]
     """
-
     # --- Unpack ID columns ---
     if len(id_cols) != 3:
         raise ValueError("id_cols must contain exactly 3 column names.")
@@ -366,21 +365,37 @@ def summarize_numbers(
         patient_id_col = "PATIENTID"
     elif "patientid" in df.columns:
         patient_id_col = "patientid"
-
     if patient_id_col:
         n_unique_patient = df[patient_id_col].nunique()
+        patient_counts = df[patient_id_col].value_counts()
+        n_patient_once = (patient_counts == 1).sum()
+        n_patient_multiple = (patient_counts > 1).sum()
+        # Rows corresponding to patients appearing once or more than once
+        n_rows_patient_once = (patient_counts == 1).sum()       # same as n_patient_once (1 row each)
+        n_rows_patient_multiple = df[patient_id_col].isin(
+            patient_counts[patient_counts > 1].index
+        ).sum()
     else:
         n_unique_patient = None
 
     # Counts for ID variables
+    n_id1_notna = df[id1_col].notna().sum()
     n_id1_unique = df[id1_col].nunique()
     n_id1_nan = df[id1_col].isna().sum()
 
+    n_id2_notna = df[id2_col].notna().sum()
     n_id2_unique = df[id2_col].nunique()
     n_id2_nan = df[id2_col].isna().sum()
 
+    n_id3_notna = df[id3_col].notna().sum()
     n_id3_unique = df[id3_col].nunique()
     n_id3_nan = df[id3_col].isna().sum()
+
+    # Rows where BOTH id1 and id2 are missing
+    n_id1_and_id2_nan = (
+        df[id1_col].isna() &
+        df[id2_col].isna()
+    ).sum()
 
     # Rows where ALL THREE IDs are missing
     n_all_three_nan = (
@@ -394,26 +409,48 @@ def summarize_numbers(
     n_unique_pairs_id2 = df[[key_col, id2_col]].dropna(subset=[id2_col]).nunique().min()
     n_unique_pairs_id3 = df[[key_col, id3_col]].dropna(subset=[id3_col]).nunique().min()
 
+    # Rows with id1 but not id2, and vice versa
+    n_id1_not_id2 = (df[id1_col].notna() & df[id2_col].isna()).sum()
+    n_id2_not_id1 = (df[id2_col].notna() & df[id1_col].isna()).sum()
+
+    # --- Helper ---
+    def pct(n): return n / n_rows * 100
+
     # --- PRINT BLOCK ---
     print("\n--- Summary of key and patient identifiers ---")
-    print(f"Total rows: {n_rows:,}")
-    print(f"Unique {key_col}: {n_key_unique:,}")
-
+    print(f"Total rows: {n_rows:,} (100.00%)")
+    print(f"Unique {key_col}: {n_key_unique:,} ({pct(n_key_unique):.2f}%)")
     if n_unique_patient is not None:
-        print(f"Unique patient IDs ({patient_id_col}): {n_unique_patient:,}")
+        print(f"Unique patient IDs ({patient_id_col}): {n_unique_patient:,} ({pct(n_unique_patient):.2f}%)")
+        print(f"  patients appearing exactly once:      {n_patient_once:,} ({pct(n_patient_once):.2f}%) — rows: {n_rows_patient_once:,} ({pct(n_rows_patient_once):.2f}%)")
+        print(f"  patients appearing more than once:    {n_patient_multiple:,} ({pct(n_patient_multiple):.2f}%) — rows: {n_rows_patient_multiple:,} ({pct(n_rows_patient_multiple):.2f}%)")
 
-    # print("\n")
-    print(f"\n{id1_col}: {n_id1_unique:,} unique — NaN: {n_id1_nan:,}")
-    print(f"{id2_col}: {n_id2_unique:,} unique — NaN: {n_id2_nan:,}")
-    print(f"{id3_col}: {n_id3_unique:,} unique — NaN: {n_id3_nan:,}")
+    print(f"\n{id1_col}:")
+    print(f"  notna:  {n_id1_notna:,} ({pct(n_id1_notna):.2f}%)")
+    print(f"  unique: {n_id1_unique:,} ({pct(n_id1_unique):.2f}%)")
+    print(f"  NaN:    {n_id1_nan:,} ({pct(n_id1_nan):.2f}%)")
 
-    # print("\n")
-    print(f"\nRows with ALL THREE IDs missing: {n_all_three_nan:,}")
+    print(f"\n{id2_col}:")
+    print(f"  notna:  {n_id2_notna:,} ({pct(n_id2_notna):.2f}%)")
+    print(f"  unique: {n_id2_unique:,} ({pct(n_id2_unique):.2f}%)")
+    print(f"  NaN:    {n_id2_nan:,} ({pct(n_id2_nan):.2f}%)")
+
+    print(f"\n{id3_col}:")
+    print(f"  notna:  {n_id3_notna:,} ({pct(n_id3_notna):.2f}%)")
+    print(f"  unique: {n_id3_unique:,} ({pct(n_id3_unique):.2f}%)")
+    print(f"  NaN:    {n_id3_nan:,} ({pct(n_id3_nan):.2f}%)")
+
+    print(f"\nRows with {id1_col} AND {id2_col} missing: {n_id1_and_id2_nan:,} ({pct(n_id1_and_id2_nan):.2f}%)")
+    print(f"Rows with ALL THREE IDs missing: {n_all_three_nan:,} ({pct(n_all_three_nan):.2f}%)")
 
     print("\n--- Unique pairs with key_col ---")
-    print(f"({key_col}, {id1_col}) → {n_unique_pairs_id1:,} unique pairs")
-    print(f"({key_col}, {id2_col}) → {n_unique_pairs_id2:,} unique pairs")
-    print(f"({key_col}, {id3_col}) → {n_unique_pairs_id3:,} unique pairs")
+    print(f"({key_col}, {id1_col}) → {n_unique_pairs_id1:,} unique pairs ({pct(n_unique_pairs_id1):.2f}%)")
+    print(f"({key_col}, {id2_col}) → {n_unique_pairs_id2:,} unique pairs ({pct(n_unique_pairs_id2):.2f}%)")
+    print(f"({key_col}, {id3_col}) → {n_unique_pairs_id3:,} unique pairs ({pct(n_unique_pairs_id3):.2f}%)")
+
+    print(f"\n--- {id1_col} / {id2_col} cross-presence ---")
+    print(f"Rows with {id1_col} but NOT {id2_col}: {n_id1_not_id2:,} ({pct(n_id1_not_id2):.2f}%)")
+    print(f"Rows with {id2_col} but NOT {id1_col}: {n_id2_not_id1:,} ({pct(n_id2_not_id1):.2f}%)")
 
 ## Reorders the columns of a DataFrame based on a specified column order.
 def reorder_dataframe(df: pd.DataFrame, column_order: list = var_order) -> pd.DataFrame:
