@@ -217,8 +217,8 @@ def triage_print(triage_value, cohort_name, demand_code):
     else:
         raise ValueError("triage_value must be None, 0, or 1")
 
-def data_load_col_selection(target_column, triage_value, 
-                            include_lr, include_history,
+def data_load_col_selection(target_column, triage_value,
+                            include_lr, include_history, include_com,
                             include_medication, include_embeddings)-> pd.DataFrame:
     """Loads data and performs initial feature selection based on settings"""
     # Load preprocessed cleaned table
@@ -288,6 +288,9 @@ def data_load_col_selection(target_column, triage_value,
     # Add medication columns (One-Hot Encoded columns)
     if include_medication == True:
         modelling_cols += [col for col in df.columns if col.startswith('atc_')]
+    # Add comorbidity / active problem columns (One-Hot Encoded columns)
+    if include_com == True:
+        modelling_cols += [col for col in df.columns if col.startswith('com_')]
     # Include NLP text embeddings if flag is set to True
     if include_embeddings:
         embedding_cols = [col for col in df.columns if col.startswith('emb_')]
@@ -333,13 +336,20 @@ def data_filtering(df, target_column, demand_code,
             df = df[df["demand_type_1"] == demand_code].copy()
             print(f"Filtering by demand_type_1 == {demand_code}")
 
-    # Filter out medication columns by threshold-specific available medication columns and 
+    # Filter out medication columns by threshold-specific available medication columns and
     # group and remove similar coloumns
     df = dp.analyze_atc_columns(
         df,
         threshold=1.0,
         drop_columns=True,
     )
+
+    # Group all atc_ columns together (including the grouped categories created
+    # above, which pandas appends at the end) and all com_ columns together
+    atc_cols = [c for c in df.columns if c.startswith('atc_')]
+    com_cols = [c for c in df.columns if c.startswith('com_')]
+    other_cols = [c for c in df.columns if c not in atc_cols and c not in com_cols]
+    df = df[other_cols + atc_cols + com_cols]
 
     # Filter by triage patients
     if triage_value is not None:
@@ -444,15 +454,16 @@ def print_feature_summary(X_train):
     triage_cols  = [c for c in X_train.columns if c[0].isdigit()]
     lr_cols      = [c for c in X_train.columns if c.startswith("lr_")]
     hist_cols    = [c for c in X_train.columns if c.startswith("hist_")]
+    com_cols     = [c for c in X_train.columns if c.startswith("com_")]
     atc_cols     = [c for c in X_train.columns if c.startswith("atc")]
-    other_cols   = [c for c in X_train.columns if c not in triage_cols + lr_cols + hist_cols + atc_cols]
+    other_cols   = [c for c in X_train.columns if c not in triage_cols + lr_cols + hist_cols + com_cols + atc_cols]
 
     print("\n" + "="*40)
     print("FEATURE SUMMARY BY GROUP")
     print("="*40)
     print(f"  Triage questions  (digit prefix): {len(triage_cols):>4}")
     print(f"  Literal reason    (lr_):           {len(lr_cols):>4}")
-    print(f"  Past history      (hist_):         {len(hist_cols):>4}")
+    print(f"  Comorbidities     (com_):          {len(com_cols):>4}")
     print(f"  Medication        (atc):           {len(atc_cols):>4}")
     print(f"  Other:                             {len(other_cols):>4}")
     print(f"  {'-'*30}")
@@ -1719,6 +1730,7 @@ def run_binary_automl_model(
     triage_value: Optional[int] = None,
     include_lr: bool = True,
     include_history: bool = True,
+    include_com: bool = True,
     include_medication: bool = True,
     include_embeddings: bool = False,
     export_table: bool = False, 
@@ -1800,8 +1812,8 @@ def run_binary_automl_model(
     # -----------------------------
     # Data loading & column selection
     # -----------------------------
-    df = data_load_col_selection(target_column, triage_value, 
-                                 include_lr, include_history, include_medication, include_embeddings)
+    df = data_load_col_selection(target_column, triage_value,
+                                 include_lr, include_history, include_com, include_medication, include_embeddings)
 
     # -----------------------------
     # Basic validation
