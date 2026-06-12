@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import os
 import pyarrow.parquet as pq
-from sklearn.metrics import confusion_matrix, f1_score, accuracy_score
+from sklearn.metrics import confusion_matrix, f1_score, fbeta_score, accuracy_score
 from IPython.display import display
 
 from kbase.config import settings
@@ -19,7 +19,7 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
     import numpy as np
     import matplotlib.pyplot as plt
     import seaborn as sns
-    from sklearn.metrics import confusion_matrix, accuracy_score, f1_score
+    from sklearn.metrics import confusion_matrix, accuracy_score, f1_score, fbeta_score
 
     df = df.copy()
     
@@ -56,7 +56,8 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
         specificity = (tn / (tn + fp) if (tn + fp) > 0 else 0) * 100
         npv = (tn / (tn + fn) if (tn + fn) > 0 else 0) * 100
         f1 = f1_score(y_real, y_pred, zero_division=0) * 100
-        
+        f2 = fbeta_score(y_real, y_pred, beta=2, zero_division=0) * 100
+
         overtriage = 100 - precision
         undertriage = 100 - npv
         
@@ -68,6 +69,7 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
             "Precision (%)": round(precision, 2),
             "Recall (%)": round(recall, 2),
             "F1-Score (%)": round(f1, 2),
+            "F2-Score (%)": round(f2, 2),
             "Overtriage (%)": round(overtriage, 2),
             "Undertriage (%)": round(undertriage, 2),
             "Specificity (%)": round(specificity, 2),
@@ -113,10 +115,10 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
     # --- BLOCK: Visualization (2x4 Grid) ---
     # Reordered metrics as requested:
     # Row 1: Accuracy, Recall, Precision, Specificity
-    # Row 2: F1-Score, Overtriage, Undertriage
+    # Row 2: F1-Score, F2-Score, Overtriage, Undertriage
     metrics_to_plot = [
         "Accuracy (%)", "Recall (%)", "Precision (%)", "Specificity (%)",
-        "F1-Score (%)", "Overtriage (%)", "Undertriage (%)"
+        "F1-Score (%)", "F2-Score (%)", "Overtriage (%)", "Undertriage (%)"
     ]
     
     # 2 rows, 4 columns = 8 slots

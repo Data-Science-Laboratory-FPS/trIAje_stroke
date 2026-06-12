@@ -791,6 +791,10 @@ def optimize_clinical_threshold(
         f1_score(y_train, (y_train_prob >= thr).astype(int), zero_division=0)
         for thr in thresholds_grid
     ])
+    f2_arr = np.array([
+        fbeta_score(y_train, (y_train_prob >= thr).astype(int), beta=2, zero_division=0)
+        for thr in thresholds_grid
+    ])
     accuracy_arr = np.array([
         accuracy_score(y_train, (y_train_prob >= thr).astype(int))
         for thr in thresholds_grid
@@ -809,6 +813,7 @@ def optimize_clinical_threshold(
         clinical_threshold = float(thresholds_grid[best_idx])
         print(f"\n  ✅ Optimal threshold : {clinical_threshold:.4f}")
         print(f"     F1               : {f1_arr[best_idx]:.4f}")
+        print(f"     F2               : {f2_arr[best_idx]:.4f}")
         print(f"     Accuracy         : {accuracy_arr[best_idx]:.4f}")
         print(f"     Recall           : {recall_arr[best_idx]:.4f}")
         print(f"     Undertriage      : {undertriage_arr[best_idx]:.2%}  (limit: {max_undertriage:.0%})")
@@ -837,6 +842,7 @@ def optimize_clinical_threshold(
     # Top-left: threshold optimization curves
     ax1 = fig.add_subplot(2, 2, 1)
     ax1.plot(thresholds_grid, f1_arr,          'g-',  label='F1-Score',             linewidth=2)
+    ax1.plot(thresholds_grid, f2_arr,          color='darkgreen', linestyle='-.', label='F2-Score', linewidth=1.5, alpha=0.8)
     ax1.plot(thresholds_grid, accuracy_arr,    'c-',  label='Accuracy',             linewidth=1.5, alpha=0.8)
     ax1.plot(thresholds_grid, recall_arr,      'b--', label='Recall (Sensitivity)', linewidth=1.5, alpha=0.8)
     ax1.plot(thresholds_grid, undertriage_arr, 'r-',  label='Undertriage (FN/P)',   linewidth=2)
@@ -992,7 +998,7 @@ def print_test_metrics_with_ci(
         Accuracy, Precision, Recall, Specificity, NPV
 
     Outcome-year stratified bootstrap for composite metrics:
-        F1, MCC, Youden Index, Balanced Accuracy
+        F1, F2, MCC, Youden Index, Balanced Accuracy
     """
     from scipy.stats import beta as _beta
     from sklearn.metrics import matthews_corrcoef
@@ -1024,6 +1030,7 @@ def print_test_metrics_with_ci(
     acc   = (tp + tn) / n_test
 
     f1      = f1_score(y_test, y_test_pred, zero_division=0)
+    f2      = fbeta_score(y_test, y_test_pred, beta=2, zero_division=0)
     mcc     = matthews_corrcoef(y_test, y_test_pred)
     youden  = rec + spec - 1   if not np.isnan(spec) else np.nan
     bal_acc = (rec + spec) / 2 if not np.isnan(spec) else np.nan
@@ -1070,7 +1077,7 @@ def print_test_metrics_with_ci(
         for _, group in boot_strata.groupby(boot_strata, sort=False)
     ]
 
-    boot = {"f1": [], "mcc": [], "youden": [], "bal_acc": []}
+    boot = {"f1": [], "f2": [], "mcc": [], "youden": [], "bal_acc": []}
 
     for _ in range(n_bootstrap):
         idx   = np.concatenate([
@@ -1089,12 +1096,16 @@ def print_test_metrics_with_ci(
             _safe_div(2 * prec_b * rec_b, prec_b + rec_b)
             if not (np.isnan(prec_b) or np.isnan(rec_b)) else np.nan
         )
+        f2_b = (
+            _safe_div(5 * prec_b * rec_b, 4 * prec_b + rec_b)
+            if not (np.isnan(prec_b) or np.isnan(rec_b)) else np.nan
+        )
         denom_mcc = np.sqrt((tp_b+fp_b) * (tp_b+fn_b) * (tn_b+fp_b) * (tn_b+fn_b))
         mcc_b     = _safe_div(tp_b * tn_b - fp_b * fn_b, denom_mcc)
         youden_b  = (rec_b + spec_b - 1) if not (np.isnan(rec_b) or np.isnan(spec_b)) else np.nan
         bal_b     = _safe_div(rec_b + spec_b, 2)
 
-        for key, val in [("f1", f1_b), ("mcc", mcc_b), ("youden", youden_b), ("bal_acc", bal_b)]:
+        for key, val in [("f1", f1_b), ("f2", f2_b), ("mcc", mcc_b), ("youden", youden_b), ("bal_acc", bal_b)]:
             if not np.isnan(val):
                 boot[key].append(val)
 
@@ -1142,6 +1153,7 @@ def print_test_metrics_with_ci(
 
     print(f"\n  Composite metrics  (Outcome-year Stratified Bootstrap CI):")
     print(f"  F1 Score:              {_pct(f1,      ci_boot['f1'])}")
+    print(f"  F2 Score:              {_pct(f2,      ci_boot['f2'])}")
     print(f"  MCC:                   {_raw(mcc,     ci_boot['mcc'])}")
     print(f"  Youden Index:          {_raw(youden,  ci_boot['youden'])}")
     print(f"  Balanced Accuracy:     {_pct(bal_acc, ci_boot['bal_acc'])}")
@@ -1169,6 +1181,7 @@ def print_test_metrics_with_ci(
         "specificity":         spec,
         "npv":                 npv,
         "f1":                  f1,
+        "f2":                  f2,
         "mcc":                 mcc,
         "youden_index":        youden,
         "balanced_accuracy":   bal_acc,
@@ -1187,10 +1200,11 @@ def print_train_test_comparison(
     threshold: float,
     pr_auc_diff_threshold: float = 0.05,
     f1_diff_threshold: float     = 0.05,
+    f2_diff_threshold: float     = 0.05,
     overfit_gap_threshold: float = 0.05,
 ) -> pd.DataFrame:
     from sklearn.metrics import (
-        f1_score, precision_score, recall_score,
+        f1_score, fbeta_score, precision_score, recall_score,
         roc_auc_score, average_precision_score, accuracy_score,
     )
 
@@ -1210,6 +1224,7 @@ def print_train_test_comparison(
             "PR-AUC":      average_precision_score(y_true, y_prob),
             "ROC-AUC":     roc_auc_score(y_true, y_prob),
             "F1":          f1_score(y_true, y_pred, zero_division=0),
+            "F2":          fbeta_score(y_true, y_pred, beta=2, zero_division=0),
             "Accuracy":    accuracy_score(y_true, y_pred),
             "Precision":   precision_score(y_true, y_pred, zero_division=0),
             "Recall":      recall_score(y_true, y_pred, zero_division=0),
@@ -1226,6 +1241,7 @@ def print_train_test_comparison(
         "PR-AUC":      (prevalence,          f"{prevalence*100:.1f}%  (prevalence)"),
         "ROC-AUC":     (0.50,                "50.0%  (random)"),
         "F1":          (0.0,                 "~0.0%  (imbalanced)"),
+        "F2":          (0.0,                 "~0.0%  (imbalanced)"),
         "Accuracy":    (1 - prevalence,      f"{(1-prevalence)*100:.1f}%  (majority class)"),
         "Precision":   (prevalence,          f"{prevalence*100:.1f}%  (prevalence)"),
         "Recall":      (0.50,                "50.0%  (floor)"),
@@ -1241,6 +1257,8 @@ def print_train_test_comparison(
         "ROC-AUC":     (0.60,
                         "random + 10pp = 60.0%"),
         "F1":          (max(0.30, prevalence * 1.5),
+                        f"max(0.30, prev×1.5) = {max(0.30, prevalence*1.5)*100:.1f}%"),
+        "F2":          (max(0.30, prevalence * 1.5),
                         f"max(0.30, prev×1.5) = {max(0.30, prevalence*1.5)*100:.1f}%"),
         "Accuracy":    ((1 - prevalence) + 0.05,
                         f"majority + 5pp = {((1-prevalence)+0.05)*100:.1f}%"),
@@ -1259,6 +1277,7 @@ def print_train_test_comparison(
         "PR-AUC":      pr_auc_diff_threshold,
         "ROC-AUC":     overfit_gap_threshold,
         "F1":          f1_diff_threshold,
+        "F2":          f2_diff_threshold,
         "Accuracy":    overfit_gap_threshold,
         "Precision":   overfit_gap_threshold,
         "Recall":      overfit_gap_threshold,
@@ -1266,7 +1285,7 @@ def print_train_test_comparison(
     }
 
     rows = []
-    metric_order = ["PR-AUC", "ROC-AUC", "F1", "Accuracy", "Precision", "Recall", "Specificity"]
+    metric_order = ["PR-AUC", "ROC-AUC", "F1", "F2", "Accuracy", "Precision", "Recall", "Specificity"]
 
     for metric in metric_order:
         train_val              = train_m[metric]
@@ -1308,7 +1327,8 @@ def print_train_test_comparison(
           f"|  PR-AUC random baseline = {prevalence*100:.1f}%  "
           f"|  Accuracy random baseline = {(1-prevalence)*100:.1f}%")
     print(f"  Overfitting gap  :  default threshold = {overfit_gap_threshold*100:.1f}pp  "
-          f"(PR-AUC = {pr_auc_diff_threshold*100:.1f}pp, F1 = {f1_diff_threshold*100:.1f}pp)")
+          f"(PR-AUC = {pr_auc_diff_threshold*100:.1f}pp, F1 = {f1_diff_threshold*100:.1f}pp, "
+          f"F2 = {f2_diff_threshold*100:.1f}pp)")
     print(f"  Underfitting     :  thresholds adjusted per metric based on dataset prevalence.")
     print(sep)
 
@@ -1875,7 +1895,8 @@ def run_binary_automl_model(
         threshold=best_threshold,
         pr_auc_diff_threshold=0.05,
         f1_diff_threshold=0.05,
-        overfit_gap_threshold=0.05,   
+        f2_diff_threshold=0.05,
+        overfit_gap_threshold=0.05,
     )
 
     # Plot test metrics
