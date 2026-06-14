@@ -218,7 +218,7 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
     plt.tight_layout()
     if figures_dir:
         os.makedirs(figures_dir, exist_ok=True)
-        path = os.path.join(figures_dir, 'metrics_barplots.png')
+        path = os.path.join(figures_dir, 'metrics_barplots_2x4.png')
         fig.savefig(path, dpi=300, bbox_inches='tight')
         print(f"Figure saved: {path}")
     plt.show()
@@ -284,7 +284,7 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
         plt.tight_layout()
         if figures_dir:
             os.makedirs(figures_dir, exist_ok=True)
-            path2 = os.path.join(figures_dir, 'metrics_barplot_combined.png')
+            path2 = os.path.join(figures_dir, 'metrics_barplots_combined.png')
             fig2.savefig(path2, dpi=300, bbox_inches='tight')
             print(f"Figure saved: {path2}")
         plt.show()
