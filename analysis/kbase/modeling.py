@@ -272,6 +272,7 @@ def data_load_col_selection(target_column, triage_value,
         "year",
         "has_history",
         "has_med",
+        "has_com"
     ]
 
     # Initialize modelling columns with base columns
@@ -429,7 +430,7 @@ def data_filtering(df, target_column, demand_code,
     # Drop columns after cohort filtering and data export
     # for preparation to modeling
     cols_to_drop = ["demandpk", "demand_date", "demand_type_1", 
-                    "has_history", "has_med", "has_icd_emerg", 
+                    "has_history", "has_med", "has_icd_emerg", "has_com", 
                     "p1_assigned", 
                     "triage", "literal_reason", "hcdm_id"]
     cols_to_drop = [c for c in cols_to_drop if c in df.columns]
@@ -1046,6 +1047,28 @@ def print_test_metrics_with_ci(
 
     roc_auc = roc_auc_score(y_test, y_test_prob)
     pr_auc  = average_precision_score(y_test, y_test_prob)
+
+    # --- Precision-Recall curve plot -----------------------------------------
+    prec_curve, rec_curve, _ = precision_recall_curve(y_test, y_test_prob)
+    baseline = float(y_test.mean())
+
+    fig_pr, ax_pr = plt.subplots(figsize=(7, 6))
+    ax_pr.plot(rec_curve, prec_curve, color='darkorange', lw=2,
+               label=f'PR curve  (PR-AUC = {pr_auc:.4f})')
+    ax_pr.axhline(baseline, color='gray', linestyle='--',
+                   label=f'Baseline (prevalence) = {baseline:.3f}')
+    ax_pr.scatter([rec], [prec], color='black', zorder=5, s=80,
+                  label=f'Threshold = {threshold:.4f}  |  P={prec:.3f}  R={rec:.3f}')
+    ax_pr.set_xlabel('Recall (Sensitivity)', fontsize=11)
+    ax_pr.set_ylabel('Precision (PPV)', fontsize=11)
+    ax_pr.set_title('Precision-Recall Curve (Test Set)', fontsize=13)
+    ax_pr.legend(loc='best', fontsize=9)
+    ax_pr.set_xlim([0.0, 1.0])
+    ax_pr.set_ylim([0.0, 1.02])
+    ax_pr.grid(alpha=0.3)
+    plt.tight_layout()
+    save_figure(fig_pr, 'pr_curve.png')
+    plt.show()
 
     # --- Clopper–Pearson CIs -------------------------------------------------
     def _cp(x, n, alpha=0.05):
