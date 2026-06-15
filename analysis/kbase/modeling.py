@@ -431,12 +431,18 @@ def data_filtering(df, target_column, demand_code,
             print(f"❌ Export failed: File not found at {export_path}")
 
     # Drop columns after cohort filtering and data export
-    # for preparation to modeling
-    cols_to_drop = ["demandpk", "demand_date", "demand_type_1", 
-                    "age",
-                    "has_history", "has_med", "has_icd_emerg", "has_com", 
-                    "p1_assigned", 
-                    "triage", "literal_reason", "hcdm_id"]
+    # for preparation to modeling.
+    # Continuous 'age' remains a model feature; the WHO age-group indicators
+    # (age_0_14 ... age_75_plus) are reserved for subgroup fairness evaluation
+    # and are therefore excluded from the modeling feature set here.
+    age_group_cols = [
+        c for c in df.columns
+        if c.startswith('age_') and c.split('_')[1].isdigit()
+    ]
+    cols_to_drop = ["demandpk", "demand_date", "demand_type_1",
+                    "has_history", "has_med", "has_icd_emerg", "has_com",
+                    "p1_assigned",
+                    "triage", "literal_reason", "hcdm_id"] + age_group_cols
     cols_to_drop = [c for c in cols_to_drop if c in df.columns]
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
@@ -448,8 +454,6 @@ def data_filtering(df, target_column, demand_code,
     print(f"Columns retained before train/test split: {len(df.columns)}")
     print(f"Not used as model features: {target_column} is the outcome; year is used with {target_column} for stratification")
     print("="*40 + "\n")
-
-    df = df.reset_index(drop=True)
 
     return df
 
