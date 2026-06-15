@@ -987,6 +987,220 @@ def plot_calibration(
     save_figure(fig, 'calibration_curve.png')
     plt.show()
 
+
+# ===============================================================
+# SA-ROC (Safety-Aware ROC) framework
+#
+# Reference:
+#   Kim, Y.-T. et al. "Defining operational safety in clinical artificial
+#   intelligence systems." npj Digital Medicine 9, 281 (2026).
+#   https://www.nature.com/articles/s41746-026-02450-7
+#   Official code: https://github.com/MGH-LMIC/SA-ROC
+#
+# Standard accuracy metrics (AUC, etc.) describe how well a model
+# *discriminates*, but not *when it is safe to act on its output
+# autonomously*. SA-ROC partitions the predicted-probability axis into
+# three operational zones, given two clinician-defined reliability targets:
+#
+#   - Rule-in Safe Zone  : scores high enough that PPV >= alpha_pos -> autonomous escalate
+#   - Rule-out Safe Zone : scores low enough that  NPV >= alpha_neg -> autonomous de-prioritize
+#   - Gray Zone          : everything in between -> mandatory human review
+#
+# It also computes the Gray Zone Area (gamma_area), summarizing the model's
+# "cost of indecision": how much of the ROC space cannot be automated at the
+# requested reliability.
+#
+# Caveats:
+#   - PPV/NPV are prevalence-dependent: the thresholds found here are only
+#     valid if the evaluation set's prevalence matches the deployment
+#     prevalence, and if the predicted probabilities are reasonably calibrated.
+#   - SA-ROC partitions by predicted probability only; it does not capture
+#     time-sensitive factors (e.g. a stroke thrombolysis/thrombectomy window),
+#     which must be handled separately in the clinical workflow.
+#   - Confirm what y_true == 1 means (confirmed diagnosis vs. a triage/operational
+#     decision) before interpreting PPV/NPV as diagnostic reliabilities.
+# ===============================================================
+
+class SafetyTargetWarning(UserWarning):
+    """Emitted when the model cannot satisfy a requested SA-ROC safety target."""
+    pass
+
+
+def _sa_roc_fpr_tpr_at(y_true, y_prob, tau):
+    """
+    Computes (FPR, TPR) at an exact score threshold `tau` (a sample is
+    predicted positive iff score >= tau).
+
+    Computed directly from the labels and scores at the exact tau, rather
+    than snapping tau onto sklearn's roc_curve threshold grid, to avoid the
+    rounding error that a nearest-threshold lookup introduces in the score
+    tails - exactly where high-alpha policies operate.
+    """
+    n_pos = (y_true == 1).sum()
+    n_neg = (y_true == 0).sum()
+    pred_pos = (y_prob >= tau)
+    tpr = (pred_pos & (y_true == 1)).sum() / n_pos if n_pos > 0 else 0.0
+    fpr = (pred_pos & (y_true == 0)).sum() / n_neg if n_neg > 0 else 0.0
+    return fpr, tpr
+
+
+def evaluate_sa_roc(y_true, y_prob, alpha_pos=0.85, alpha_neg=0.95):
+    """
+    Applies the SA-ROC framework and partitions predictions into the Rule-in
+    Safe, Gray, and Rule-out Safe zones.
+
+    Parameters
+    ----------
+    y_true : array-like of {0, 1}
+        Ground-truth binary labels (1 = positive class).
+    y_prob : array-like in [0, 1]
+        Predicted probability of the positive class.
+    alpha_pos : float, default 0.85
+        Rule-in safety level (alpha+): minimum acceptable PPV to trust a
+        positive (rule-in) action.
+    alpha_neg : float, default 0.95
+        Rule-out safety level (alpha-): minimum acceptable NPV to trust a
+        negative (rule-out) action.
+
+    Returns
+    -------
+    tau_safe_pos : float
+        Lower bound (infimum) of the Rule-in Safe Zone.
+    tau_safe_neg : float
+        Upper bound (supremum) of the Rule-out Safe Zone.
+    pct_gray : float
+        Fraction of the cohort that falls in the Gray Zone.
+    gamma_area : float
+        Gray Zone Area in ROC space (cost of indecision).
+
+    Warns
+    -----
+    SafetyTargetWarning
+        If a requested safety target cannot be met, or if the resulting safe
+        zones overlap (degenerate model). The corresponding zone is set empty.
+    """
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+
+    # Empirical linear scan over every unique observed score (no binning gaps).
+    thresholds = np.sort(np.unique(y_prob))
+
+    tau_safe_pos = None  # infimum threshold for the Rule-in Safe Zone
+    tau_safe_neg = None  # supremum threshold for the Rule-out Safe Zone
+
+    # Rule-in threshold: smallest t with PPV(score >= t) >= alpha_pos.
+    # Low->high scan + first hit = infimum.
+    for t in thresholds:
+        pred_pos = (y_prob >= t)
+        if pred_pos.sum() > 0:
+            ppv = (y_true[pred_pos] == 1).sum() / pred_pos.sum()
+            if ppv >= alpha_pos:
+                tau_safe_pos = t
+                break
+
+    # Rule-out threshold: largest t with NPV(score < t) >= alpha_neg.
+    # High->low scan + first hit = supremum. Strict "<" matches rule-out
+    # (rule-in uses ">=").
+    for t in reversed(thresholds):
+        pred_neg = (y_prob < t)
+        if pred_neg.sum() > 0:
+            npv = (y_true[pred_neg] == 0).sum() / pred_neg.sum()
+            if npv >= alpha_neg:
+                tau_safe_neg = t
+                break
+
+    # Warn and fall back to an empty zone if a safety target is unreachable.
+    # An empty Safe Zone is a clinical-safety failure, so it must never be
+    # silent, but plotting still proceeds.
+    if tau_safe_pos is None:
+        warnings.warn(
+            f"Rule-in target not achievable: no score threshold reaches "
+            f"PPV >= {alpha_pos:.0%}. Rule-in Safe Zone set EMPTY.",
+            SafetyTargetWarning, stacklevel=2,
+        )
+        tau_safe_pos = 1.0
+    if tau_safe_neg is None:
+        warnings.warn(
+            f"Rule-out target not achievable: no score threshold reaches "
+            f"NPV >= {alpha_neg:.0%}. Rule-out Safe Zone set EMPTY.",
+            SafetyTargetWarning, stacklevel=2,
+        )
+        tau_safe_neg = 0.0
+
+    # Degenerate case: thresholds cross -> zones would overlap. Warn and
+    # collapse the overlap by clamping rule-out down to rule-in, so the Gray
+    # Zone is empty rather than negative.
+    if tau_safe_pos < tau_safe_neg:
+        warnings.warn(
+            f"Safe Zones overlap (tau_rule_in={tau_safe_pos:.4f} < "
+            f"tau_rule_out={tau_safe_neg:.4f}); model too weak to satisfy both "
+            f"targets at these alpha levels. Collapsing overlap (empty Gray Zone).",
+            SafetyTargetWarning, stacklevel=2,
+        )
+        tau_safe_neg = tau_safe_pos
+
+    # Assign each sample to a zone and compute cohort distribution.
+    # Boundary operators: rule-out is "<", rule-in is ">=".
+    idx_rule_out = (y_prob < tau_safe_neg)
+    idx_rule_in = (y_prob >= tau_safe_pos)
+    idx_gray = ~(idx_rule_out | idx_rule_in)
+
+    n_total = len(y_true)
+    pct_rule_out = idx_rule_out.sum() / n_total
+    pct_rule_in = idx_rule_in.sum() / n_total
+    pct_gray = idx_gray.sum() / n_total
+
+    # Gray Zone Area (gamma_area) in ROC space:
+    #     gamma_area = FPR(tau_safe_neg) * (1 - TPR(tau_safe_pos))
+    fpr_tau_neg, _ = _sa_roc_fpr_tpr_at(y_true, y_prob, tau_safe_neg)
+    _, tpr_tau_pos = _sa_roc_fpr_tpr_at(y_true, y_prob, tau_safe_pos)
+    gamma_area = fpr_tau_neg * (1 - tpr_tau_pos)
+
+    print("=== OPERATIONAL SAFETY REPORT (SA-ROC) ===")
+    print(f"Clinical target -> desired PPV (Rule-in): {alpha_pos:.0%} | desired NPV (Rule-out): {alpha_neg:.0%}")
+    print("-" * 60)
+    print(f"[Rule-out Safe] (NPV >= {alpha_neg:.0%}) : P(positive) <  {tau_safe_neg:.4f} | covers {pct_rule_out:.1%} of cases")
+    print(f"[Rule-in Safe]  (PPV >= {alpha_pos:.0%}) : P(positive) >= {tau_safe_pos:.4f} | covers {pct_rule_in:.1%} of cases")
+    print(f"[GRAY ZONE]     (mandatory human review)          | covers {pct_gray:.1%} of cases")
+    print("-" * 60)
+    print(f"Gray Zone Area (Gamma_Area): {gamma_area:.4f} (model's cost of indecision)")
+
+    return tau_safe_pos, tau_safe_neg, pct_gray, gamma_area
+
+
+def plot_sa_roc(y_test, y_test_prob, tau_safe_pos, tau_safe_neg):
+    """
+    Plots the test-set predicted-probability distributions by class, overlaid
+    with the Rule-out Safe / Gray / Rule-in Safe zones from SA-ROC.
+    """
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.hist(y_test_prob[y_test == 0], bins=50, alpha=0.5, color='steelblue',
+            density=True, label='Negative (actual)')
+    ax.hist(y_test_prob[y_test == 1], bins=50, alpha=0.5, color='darkred',
+            density=True, label='Positive (actual)')
+
+    # Shade the three operational zones.
+    ax.axvspan(0, tau_safe_neg, color='blue', alpha=0.1,
+               label=f'Rule-out Safe (< {tau_safe_neg:.3f})')
+    ax.axvspan(tau_safe_neg, tau_safe_pos, color='gray', alpha=0.2,
+               label='Gray Zone (human review)')
+    ax.axvspan(tau_safe_pos, 1, color='red', alpha=0.1,
+               label=f'Rule-in Safe (>= {tau_safe_pos:.3f})')
+
+    # Mark the two safety thresholds.
+    ax.axvline(tau_safe_neg, color='blue', linestyle='--', linewidth=2)
+    ax.axvline(tau_safe_pos, color='red', linestyle='--', linewidth=2)
+
+    ax.set_title('SA-ROC framework: triage zones and clinical flow')
+    ax.set_xlabel('Predicted probability of positive class')
+    ax.set_ylabel('Patient density')
+    ax.legend(loc='upper center')
+    ax.set_xlim(0, 1)
+
+    save_figure(fig, 'sa_roc_zones.png')
+    plt.show()
+
+
 def print_test_metrics_with_ci(
     y_test,
     y_test_prob,
@@ -1804,6 +2018,9 @@ def run_binary_automl_model(
     feature_importance: int = 0,
     plot_shap: bool = True,
     plot_calibration_curve: bool = True,
+    plot_sa_roc_curve: bool = True,
+    sa_roc_alpha_pos: float = 0.85,
+    sa_roc_alpha_neg: float = 0.95,
 ) -> dict:
 
     
@@ -1922,6 +2139,13 @@ def run_binary_automl_model(
     # Calibration plot
     if plot_calibration_curve:
         plot_calibration(y_train, y_train_prob, y_test, y_test_prob, threshold=best_threshold)
+
+    # Operational safety zones (SA-ROC)
+    if plot_sa_roc_curve:
+        tau_safe_pos, tau_safe_neg, pct_gray, gamma_area = evaluate_sa_roc(
+            y_test, y_test_prob, alpha_pos=sa_roc_alpha_pos, alpha_neg=sa_roc_alpha_neg
+        )
+        plot_sa_roc(y_test, y_test_prob, tau_safe_pos, tau_safe_neg)
 
     # Train vs Test comparison — overfitting / underfitting diagnosis
     comparison_df = print_train_test_comparison(
