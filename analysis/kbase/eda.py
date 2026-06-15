@@ -9,12 +9,19 @@ from IPython.display import display
 
 from kbase.config import settings
 
-def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False, triage_group=False, figures_dir=None):
+def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False, age_group=False, triage_group=False, figures_dir=None, reference_df=None):
     """
     Calculates clinical metrics and generates plots.
     If triage_group=True, results are stratified by triage status (General, Triage 1, No Triage 0).
     If sex_group=True, it performs a cross-stratification: each group above is subdivided by Men and Women.
-    If both are False, a single overall result ("General") is computed, with no group breakdown.
+    If age_group=True, it performs a cross-stratification: each group above is subdivided by WHO age
+    groups (derived from the age_0_14 ... age_75_plus indicators), keeping only groups with N > 1000.
+    The N > 1000 threshold is evaluated on `reference_df` if provided (e.g. the full dataset, before
+    any train/test split), otherwise on `df` itself.
+    sex_group and age_group are mutually exclusive subgroup dimensions; if both are True, age_group
+    takes precedence.
+    If sex_group, age_group, and triage_group are all False, a single overall result ("General") is
+    computed, with no group breakdown.
     """
     import pandas as pd
     import numpy as np
@@ -37,9 +44,44 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
             df['triage'] = 1
             print("⚠️ No question columns found. Defaulting to triage=1.")
 
+    # --- BLOCK: Subgroup Setup (sex_group / age_group are mutually exclusive) ---
+    subgroup_col = None
+    subgroup_values = []
+
     if sex_group and 'sex' in df.columns:
         # Direct mapping for category types (0: Men, 1: Women)
         df['sex_label'] = df['sex'].map({0: 'Men', 1: 'Women'})
+        subgroup_col = 'sex_label'
+        subgroup_values = ['Men', 'Women']
+
+    if age_group:
+        # WHO age-group indicators -> single categorical label column
+        age_group_cols = {
+            "age_0_14":    "Children",
+            "age_15_24":   "Youth",
+            "age_25_44":   "Young Adults",
+            "age_45_59":   "Middle-aged Adults",
+            "age_60_74":   "Elderly",
+            "age_75_plus": "Seniors",
+        }
+        present_cols = [c for c in age_group_cols if c in df.columns]
+        if present_cols:
+            df['age_group_label'] = df[present_cols].idxmax(axis=1).map(age_group_cols)
+
+            # Only keep age groups with more than 1000 cases in the reference dataset
+            # (defaults to the full stroke cohort, so the threshold doesn't depend on the
+            # train/test split size)
+            if reference_df is not None:
+                count_source = reference_df
+            else:
+                count_source = pq.read_table(
+                    os.path.join(settings.source_tables_path, settings.stroke_table_cleaned_path)
+                ).to_pandas()
+            count_labels = count_source[present_cols].idxmax(axis=1).map(age_group_cols)
+            counts = count_labels.value_counts()
+            age_group_order = [age_group_cols[c] for c in present_cols]
+            subgroup_col = 'age_group_label'
+            subgroup_values = [g for g in age_group_order if counts.get(g, 0) > 1000]
 
     # --- BLOCK: Internal Metric Calculation Helper ---
     def calculate_metrics(data, group_name, subgroup_name="General"):
@@ -65,7 +107,7 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
         
         return {
             "Triage Group": group_name,
-            "Sex": subgroup_name,
+            "Subgroup": subgroup_name,
             "Display Group": f"{group_name} ({subgroup_name})" if subgroup_name != "General" else group_name,
             "Accuracy (%)": round(accuracy, 2),
             "Precision (%)": round(precision, 2),
@@ -89,12 +131,12 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
             res_total = calculate_metrics(df, "General", "General")
             if res_total: results.append(res_total)
 
-            if sex_group and 'sex_label' in df.columns:
-                for s_val in ['Men', 'Women']:
-                    sex_df = df[df['sex_label'] == s_val]
-                    if len(sex_df) > 0:
-                        res_sex = calculate_metrics(sex_df, "General", s_val)
-                        if res_sex: results.append(res_sex)
+            if subgroup_col:
+                for s_val in subgroup_values:
+                    sub_df = df[df[subgroup_col] == s_val]
+                    if len(sub_df) > 0:
+                        res_sub = calculate_metrics(sub_df, "General", s_val)
+                        if res_sub: results.append(res_sub)
 
         for t_val in [1, 0]:
             t_df = df[df['triage'] == t_val]
@@ -104,24 +146,24 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
             res_triage = calculate_metrics(t_df, label, "General")
             if res_triage: results.append(res_triage)
 
-            if sex_group and 'sex_label' in df.columns:
-                for s_val in ['Men', 'Women']:
-                    sex_df = t_df[t_df['sex_label'] == s_val]
-                    if len(sex_df) > 0:
-                        res_sex = calculate_metrics(sex_df, label, s_val)
-                        if res_sex: results.append(res_sex)
+            if subgroup_col:
+                for s_val in subgroup_values:
+                    sub_df = t_df[t_df[subgroup_col] == s_val]
+                    if len(sub_df) > 0:
+                        res_sub = calculate_metrics(sub_df, label, s_val)
+                        if res_sub: results.append(res_sub)
     else:
         # No triage stratification: a single overall ("General") result,
-        # optionally subdivided by sex.
+        # optionally subdivided by sex or age group.
         res_total = calculate_metrics(df, "General", "General")
         if res_total: results.append(res_total)
 
-        if sex_group and 'sex_label' in df.columns:
-            for s_val in ['Men', 'Women']:
-                sex_df = df[df['sex_label'] == s_val]
-                if len(sex_df) > 0:
-                    res_sex = calculate_metrics(sex_df, "General", s_val)
-                    if res_sex: results.append(res_sex)
+        if subgroup_col:
+            for s_val in subgroup_values:
+                sub_df = df[df[subgroup_col] == s_val]
+                if len(sub_df) > 0:
+                    res_sub = calculate_metrics(sub_df, "General", s_val)
+                    if res_sub: results.append(res_sub)
 
     results_df = pd.DataFrame(results)
     
@@ -148,17 +190,27 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
 
     if sex_group:
         palette_dict = {"General": c_blue, "Men": c_teal, "Women": c_orange}
-        hue_col = "Sex"
+        hue_col = "Subgroup"
+        legend_title = "Sex Subgroup"
+        label_size = 16
+        fmt = ".1f"
+    elif age_group:
+        age_palette = sns.color_palette("Set2", n_colors=len(subgroup_values))
+        palette_dict = {"General": c_blue, **dict(zip(subgroup_values, age_palette))}
+        hue_col = "Subgroup"
+        legend_title = "Age Subgroup"
         label_size = 16
         fmt = ".1f"
     elif triage_group:
         palette_dict = {"General": c_blue, "Triage (1)": c_teal, "No Triage (0)": c_orange}
         hue_col = "Triage Group"
+        legend_title = None
         label_size = 18
         fmt = ".2f"
     else:
         palette_dict = None
         hue_col = None
+        legend_title = None
         label_size = 18
         fmt = ".2f"
 
@@ -177,7 +229,7 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
                 hue=hue_col,
                 ax=axes[i],
                 palette=palette_dict,
-                legend=(sex_group and i == 0)
+                legend=((sex_group or age_group) and i == 0)
             )
         else:
             sns.barplot(
@@ -197,11 +249,11 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
 
         if not triage_group:
             # Single "General" category: the x-tick label is redundant
-            # (sex_group=True already clarifies via the legend).
+            # (sex_group=True / age_group=True already clarifies via the legend).
             axes[i].set_xticks([])
 
-        if sex_group and i == 0:
-            axes[i].legend(title="Sex Subgroup", loc='upper right', frameon=True,
+        if (sex_group or age_group) and i == 0:
+            axes[i].legend(title=legend_title, loc='upper right', frameon=True,
                            fontsize=14, title_fontsize=15)
 
         for p in axes[i].patches:
@@ -218,14 +270,15 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
     plt.tight_layout()
     if figures_dir:
         os.makedirs(figures_dir, exist_ok=True)
-        path = os.path.join(figures_dir, 'metrics_barplots_2x4.png')
+        suffix = '_age' if age_group else '_sex' if sex_group else ''
+        path = os.path.join(figures_dir, f'metrics_barplots_2x4{suffix}.png')
         fig.savefig(path, dpi=300, bbox_inches='tight')
         print(f"Figure saved: {path}")
     plt.show()
 
-    # --- BLOCK: Combined Single-Plot Visualization (sex_group=False only) ---
+    # --- BLOCK: Combined Single-Plot Visualization (sex_group=False and age_group=False only) ---
     # Aggregates all 8 metrics into a single, publication-ready bar chart.
-    if not sex_group:
+    if not sex_group and not age_group:
         metric_labels = [m.replace(" (%)", "") for m in metrics_to_plot]
         error_metrics = {"Overtriage", "Undertriage"}
 
@@ -291,14 +344,14 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
 
     return results_df
 
-def analyze_emergency_performance(demand_type, y_real_col, y_pred_col, sex_group):
+def analyze_emergency_performance(demand_type, y_real_col, y_pred_col, sex_group=False, age_group=False):
     """
     High-level function to load data and call evaluation.
     This function no longer returns specific objects to avoid redundant printing.
     """
     # Load data
     df = pq.read_table(
-        os.path.join(settings.source_tables_path, settings.triaje_table_cleaned_path)
+        os.path.join(settings.source_tables_path, settings.stroke_table_cleaned_path)
     ).to_pandas()
 
     # Mapping and filtering
@@ -329,7 +382,7 @@ def analyze_emergency_performance(demand_type, y_real_col, y_pred_col, sex_group
     df[y_real_col] = df[y_real_col].astype('int8')
     
     # Execute evaluation and plotting
-    evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group)
+    evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group, age_group)
 
 # Example usage in a cell:
 # analyze_emergency_performance("Non-traumatic Chest Pain")

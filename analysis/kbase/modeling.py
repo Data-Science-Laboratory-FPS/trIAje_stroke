@@ -28,6 +28,7 @@ import warnings
 import kbase.preprocessing as dp
 import kbase.eda as eda
 from kbase.config import settings
+from kbase.labels import get_labels_map, get_display_label, resolve_demand_key
 
 _FIGURES_DIR_MAP = {
     16: 'figures/03_dyspnea',
@@ -45,10 +46,7 @@ _ANALYSIS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _get_figures_dir(demand_code):
     """Returns the absolute figures directory path for a given demand_code."""
-    if isinstance(demand_code, (list, tuple)):
-        key = 'cardiac_arrest' if set(demand_code) == {36, 58} else None
-    else:
-        key = demand_code
+    key = resolve_demand_key(demand_code)
     rel = _FIGURES_DIR_MAP.get(key)
     return os.path.join(_ANALYSIS_DIR, rel) if rel is not None else None
 
@@ -277,6 +275,11 @@ def data_load_col_selection(target_column, triage_value,
 
     # Initialize modelling columns with base columns
     modelling_cols = base_cols.copy()
+    # Add age groups (One-Hot Encoded columns, e.g. age_0_14, age_75_plus)
+    modelling_cols += [
+        col for col in df.columns
+        if col.startswith('age_') and col.split('_')[1].isdigit()
+    ]
     # Add triage questions (One-Hot Encoded columns)
     if triage_value != 0:
         modelling_cols += [col for col in df.columns if col.startswith('q')]
@@ -430,6 +433,7 @@ def data_filtering(df, target_column, demand_code,
     # Drop columns after cohort filtering and data export
     # for preparation to modeling
     cols_to_drop = ["demandpk", "demand_date", "demand_type_1", 
+                    "age",
                     "has_history", "has_med", "has_icd_emerg", "has_com", 
                     "p1_assigned", 
                     "triage", "literal_reason", "hcdm_id"]
@@ -1560,12 +1564,15 @@ def plot_feature_importances(automl, X_train, feature_importance,
     # -------------------------------------------------------------------------
     # PLOTTING — one plot per computed importance type
     # -------------------------------------------------------------------------
+    labels_map = get_labels_map(demand_code=_current_demand_code, columns=X_train.columns)
+
     def _plot_and_print(importance_df, is_permutation):
         top_k = min(15, len(importance_df))
         plot_df = importance_df.head(top_k)
+        feature_labels = plot_df["feature"].map(lambda c: get_display_label(c, labels_map))
 
         fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
-        ax_imp.barh(plot_df["feature"][::-1], plot_df["importance"][::-1])
+        ax_imp.barh(feature_labels[::-1], plot_df["importance"][::-1])
 
         if is_permutation:
             ax_imp.set_title(f"Top Features (Permutation Importance — {perm_scoring})")
@@ -1654,6 +1661,10 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
 
         # X used for plotting — converted + clinical columns only
         X_plot = X_sample_shap[non_emb_cols]
+
+        # Rename columns to human-readable display labels for plotting
+        labels_map = get_labels_map(demand_code=_current_demand_code, columns=non_emb_cols)
+        X_plot = X_plot.rename(columns=lambda c: get_display_label(c, labels_map))
 
         tree_model_types = (
             "LGBMClassifier", "XGBClassifier", "RandomForestClassifier",
@@ -1930,6 +1941,18 @@ def run_binary_automl_model(
     eda.evaluate_diagnostic_performance(
         plot_df, 'target_real', 'target_pred',
         sex_group=False,
+        figures_dir=_get_figures_dir(demand_code),
+    )
+    # Fairness analysis by sex
+    eda.evaluate_diagnostic_performance(
+        plot_df, 'target_real', 'target_pred',
+        sex_group=True,
+        figures_dir=_get_figures_dir(demand_code),
+    )
+    # Fairness analysis by age groups
+    eda.evaluate_diagnostic_performance(
+        plot_df, 'target_real', 'target_pred',
+        age_group=True,
         figures_dir=_get_figures_dir(demand_code),
     )
 
