@@ -2078,6 +2078,19 @@ def _rank_shap_features(shap_values, non_emb_cols, non_emb_idx, task="classifica
         .reset_index(drop=True)
     )
 
+
+def _grid_dims(n: int):
+    """Return (n_rows, n_cols) for n panels: max 3 cols, max 3 rows per column."""
+    import math
+    if n <= 3:
+        return 1, n
+    for n_cols in range(2, 4):
+        n_rows = math.ceil(n / n_cols)
+        if n_rows <= 3:
+            return n_rows, n_cols
+    return math.ceil(n / 3), 3
+
+
 def plot_marginal_effects(
     automl,
     X_test,
@@ -2177,6 +2190,29 @@ def plot_marginal_effects(
         for _ in range(n_bootstrap)
     ]
 
+    def _draw_panel(ax, is_cat, gvals, med, lo, hi, label):
+        n_v = len(gvals)
+        if is_cat:
+            x_pos = np.arange(n_v)
+            yerr  = np.vstack([med - lo, hi - med])
+            ax.errorbar(x_pos, med, yerr=yerr, fmt='o', color='steelblue',
+                        capsize=4, markersize=6, label='Median [95% CI]')
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels([str(v) for v in gvals])
+            ax.set_xlim(-0.5, n_v - 0.5)
+        else:
+            ax.plot(gvals, med, color='steelblue', lw=2, label='Median')
+            ax.fill_between(gvals, lo, hi, color='steelblue', alpha=0.25,
+                            label='95% CI (bootstrap)')
+        ax.set_xlabel(label)
+        ax.set_ylabel('Predicted probability of positive class')
+        ax.set_title(f'Marginal effect: {label}')
+        ax.set_ylim(0, 1)
+        ax.legend(loc='best')
+        ax.grid(alpha=0.3)
+
+    _results = []
+
     for feature in top_features:
         display_label = get_display_label(feature, labels_map)
         col = X_sample[feature]
@@ -2225,27 +2261,32 @@ def plot_marginal_effects(
         ci_lo   = np.percentile(boot_means, 2.5, axis=1)
         ci_hi   = np.percentile(boot_means, 97.5, axis=1)
 
-        fig, ax = plt.subplots(figsize=(8, 6))
-        if is_categorical:
-            x_pos = np.arange(n_vals)
-            yerr = np.vstack([medians - ci_lo, ci_hi - medians])
-            ax.errorbar(x_pos, medians, yerr=yerr, fmt='o', color='steelblue',
-                        capsize=4, markersize=6, label='Median [95% CI]')
-            ax.set_xticks(x_pos)
-            ax.set_xticklabels([str(v) for v in grid_values])
-        else:
-            ax.plot(grid_values, medians, color='steelblue', lw=2, label='Median')
-            ax.fill_between(grid_values, ci_lo, ci_hi, color='steelblue', alpha=0.25,
-                            label='95% CI (bootstrap)')
+        _results.append((display_label, is_categorical, grid_values, medians, ci_lo, ci_hi))
 
-        ax.set_xlabel(display_label)
-        ax.set_ylabel('Predicted probability of positive class')
-        ax.set_title(f'Marginal effect: {display_label}')
-        ax.set_ylim(0, 1)
-        ax.legend(loc='best')
-        ax.grid(alpha=0.3)
+        # Individual plot
+        fig_w = max(3.5, n_vals * 1.4 + 1.0) if is_categorical else 8
+        fig, ax = plt.subplots(figsize=(fig_w, 6))
+        _draw_panel(ax, is_categorical, grid_values, medians, ci_lo, ci_hi, display_label)
         plt.tight_layout()
         save_figure(fig, f'marginal_{feature}.png')
+        plt.show()
+
+    # Combined grid figure
+    if _results:
+        n_plots = len(_results)
+        n_rows, n_cols = _grid_dims(n_plots)
+        fig_grid, axes = plt.subplots(
+            n_rows, n_cols,
+            figsize=(n_cols * 5, n_rows * 4.5),
+            squeeze=False,
+        )
+        axes_flat = axes.flatten()
+        for i, (lbl, is_cat, gvals, med, lo, hi) in enumerate(_results):
+            _draw_panel(axes_flat[i], is_cat, gvals, med, lo, hi, lbl)
+        for j in range(n_plots, n_rows * n_cols):
+            axes_flat[j].set_visible(False)
+        plt.tight_layout()
+        save_figure(fig_grid, 'marginal_combined.png')
         plt.show()
 
     print(f"\nTop {len(top_features)} features by mean(|SHAP value|):")
@@ -2283,11 +2324,11 @@ def run_binary_automl_model(
     max_overtriage: float = 0.50,
     feature_importance: int = 0,
     plot_shap: bool = True,
-    n_interpretability_features: int = 10,
+    n_interpretability_features: int = 9,
     plot_calibration_curve: bool = True,
     plot_sa_roc_curve: bool = True,
     sa_roc_alpha_pos: float = 0.60,
-    sa_roc_alpha_neg: float = 0.95,
+    sa_roc_alpha_neg: float = 0.90,
 ) -> dict:
 
     
