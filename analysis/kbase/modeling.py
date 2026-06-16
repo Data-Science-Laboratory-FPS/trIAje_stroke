@@ -7,6 +7,7 @@ import pandas as pd
 import numpy as np
 import seaborn as sns
 from flaml import AutoML
+from sklearn.base import clone
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score, f1_score, fbeta_score,
@@ -63,6 +64,95 @@ def save_figure(fig, filename, dpi=300):
     path = os.path.join(folder, filename)
     fig.savefig(path, dpi=dpi, bbox_inches='tight')
     print(f"Figure saved: {path}")
+
+def save_table(df, filename, title=None, footnote=None):
+    """Saves a dataframe as a Word table in the demand-specific tables directory."""
+    folder = _get_figures_dir(_current_demand_code)
+    if folder is None:
+        print(f"[save_table] WARNING: no folder for demand_code={_current_demand_code!r}, skipping '{filename}'")
+        return None
+    os.makedirs(folder, exist_ok=True)
+    if _current_time_budget is not None:
+        stem, ext = os.path.splitext(filename)
+        filename = f"{stem}_{int(_current_time_budget // 60)}min{ext}"
+
+    from docx import Document
+    from docx.shared import Pt, RGBColor
+    from docx.enum.section import WD_ORIENT
+    from docx.oxml.ns import qn
+    from docx.oxml import OxmlElement
+
+    HDR_BG = "2D2D2D"
+    HDR_FG = RGBColor(0xFF, 0xFF, 0xFF)
+    ALT_BG = "EFEFEF"
+    EVEN_BG = "FFFFFF"
+
+    def _set_cell_bg(cell, hex_color):
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        shd = OxmlElement('w:shd')
+        shd.set(qn('w:val'), 'clear')
+        shd.set(qn('w:color'), 'auto')
+        shd.set(qn('w:fill'), hex_color)
+        tcPr.append(shd)
+
+    display_df = df.copy()
+    for col in display_df.select_dtypes(include=[np.number]).columns:
+        display_df[col] = display_df[col].map(
+            lambda v: "" if pd.isna(v) else f"{v:.4f}" if isinstance(v, float) else str(v)
+        )
+
+    doc = Document()
+    section = doc.sections[0]
+    section.orientation = WD_ORIENT.LANDSCAPE
+    section.page_width, section.page_height = section.page_height, section.page_width
+
+    style = doc.styles['Normal']
+    style.font.name = 'Calibri'
+    style.font.size = Pt(10)
+
+    if title:
+        title_para = doc.add_paragraph()
+        title_run = title_para.add_run(title)
+        title_run.bold = True
+        title_run.font.size = Pt(11)
+        doc.add_paragraph()
+
+    cols = list(display_df.columns)
+    table = doc.add_table(rows=len(display_df) + 1, cols=len(cols))
+    table.style = 'Table Grid'
+
+    for j, col_name in enumerate(cols):
+        cell = table.rows[0].cells[j]
+        cell.text = str(col_name)
+        run = cell.paragraphs[0].runs[0]
+        run.bold = True
+        run.font.color.rgb = HDR_FG
+        run.font.size = Pt(8)
+        _set_cell_bg(cell, HDR_BG)
+
+    for i, row_vals in enumerate(display_df.itertuples(index=False)):
+        bg = ALT_BG if i % 2 == 1 else EVEN_BG
+        for j, val in enumerate(row_vals):
+            cell = table.rows[i + 1].cells[j]
+            cell.text = str(val)
+            run = cell.paragraphs[0].runs[0]
+            run.font.size = Pt(8)
+            _set_cell_bg(cell, bg)
+
+    if footnote:
+        doc.add_paragraph()
+        note_para = doc.add_paragraph()
+        note_run = note_para.add_run(footnote)
+        note_run.italic = True
+        note_run.font.size = Pt(8)
+
+    tables_dir = os.path.join(folder, 'tables')
+    os.makedirs(tables_dir, exist_ok=True)
+    path = os.path.join(tables_dir, filename)
+    doc.save(path)
+    print(f"Table saved: {path}")
+    return path
 
 # This ensures .info() shows up to 50 columns by default
 pd.set_option('display.max_info_columns', 50)
@@ -609,6 +699,195 @@ def run_automl_training(X_train, y_train, year_train, sample_weight, time_budget
         print(f"\n⚠️ Could not generate benchmarking table: {e}")
     
     return automl
+
+def print_selected_model_hyperparameters(automl):
+    """Prints the hyperparameters for the final selected AutoML model."""
+    print("\n--- Final selected model hyperparameters ---")
+    print(f"Best estimator: {automl.best_estimator}")
+
+    best_config = getattr(automl, "best_config", None)
+    if best_config:
+        print("FLAML best_config:")
+        for param, value in sorted(best_config.items()):
+            print(f"  {param}: {value}")
+
+    final_model = getattr(automl, "model", None)
+    estimator = getattr(final_model, "estimator", final_model)
+    get_params = getattr(estimator, "get_params", None)
+
+    if callable(get_params):
+        print("Estimator get_params():")
+        for param, value in sorted(get_params(deep=True).items()):
+            print(f"  {param}: {value}")
+    elif not best_config:
+        print("No hyperparameter details available for the selected model.")
+
+def export_final_model_cv_fold_metrics(
+    automl,
+    X,
+    y,
+    year,
+    n_splits_cv,
+    seed,
+    task="classification",
+    threshold=None,
+    filename="cv_fold_metrics.docx",
+):
+    """Replays CV with the final selected model and exports fold-level metrics."""
+    from sklearn.metrics import matthews_corrcoef
+
+    print("\n--- Exporting final-model cross-validation fold metrics ---")
+
+    final_model = getattr(automl, "model", None)
+    estimator = getattr(final_model, "estimator", final_model)
+    if estimator is None:
+        print("No final estimator available; skipping CV fold metrics export.")
+        return pd.DataFrame()
+
+    cv_strata = _make_outcome_year_strata(y, year)
+    cv_splitter = OutcomeYearStratifiedKFold(
+        cv_strata,
+        n_splits=n_splits_cv,
+        random_state=seed,
+    )
+
+    def _take(data, indices):
+        if hasattr(data, "iloc"):
+            return data.iloc[indices]
+        return np.asarray(data)[indices]
+
+    def _safe_metric(func, *args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except (TypeError, ValueError):
+            return np.nan
+
+    rows = []
+    for fold_number, (train_idx, valid_idx) in enumerate(cv_splitter.split(X, y), start=1):
+        fold_estimator = clone(estimator)
+        X_fold_train = _take(X, train_idx)
+        y_fold_train = _take(y, train_idx)
+        X_fold_valid = _take(X, valid_idx)
+        y_fold_valid = _take(y, valid_idx)
+
+        fold_sample_weight = compute_sample_weight(
+            class_weight="balanced",
+            y=y_fold_train,
+        )
+
+        try:
+            fold_estimator.fit(X_fold_train, y_fold_train, sample_weight=fold_sample_weight)
+        except TypeError:
+            fold_estimator.fit(X_fold_train, y_fold_train)
+
+        y_valid_pred = fold_estimator.predict(X_fold_valid)
+        y_valid_prob = (
+            fold_estimator.predict_proba(X_fold_valid)
+            if hasattr(fold_estimator, "predict_proba") else None
+        )
+
+        row = {
+            "fold": fold_number,
+            "estimator": automl.best_estimator,
+            "n_train": len(train_idx),
+            "n_validation": len(valid_idx),
+            "validation_prevalence": float(np.mean(y_fold_valid)),
+        }
+
+        if task == "multiclass":
+            row.update({
+                "accuracy": accuracy_score(y_fold_valid, y_valid_pred),
+                "macro_f1": f1_score(y_fold_valid, y_valid_pred, average="macro", zero_division=0),
+                "weighted_f1": f1_score(y_fold_valid, y_valid_pred, average="weighted", zero_division=0),
+            })
+            if y_valid_prob is not None:
+                row["log_loss"] = _safe_metric(log_loss, y_fold_valid, y_valid_prob)
+                row["roc_auc_ovr_weighted"] = _safe_metric(
+                    roc_auc_score,
+                    y_fold_valid,
+                    y_valid_prob,
+                    multi_class="ovr",
+                    average="weighted",
+                )
+        else:
+            if threshold is None:
+                raise ValueError("threshold must be provided for binary CV fold metrics.")
+            y_valid_score = y_valid_prob[:, 1] if y_valid_prob is not None else y_valid_pred
+            y_valid_pred_threshold = (y_valid_score >= threshold).astype(int)
+            tn, fp, fn, tp = confusion_matrix(
+                y_fold_valid,
+                y_valid_pred_threshold,
+                labels=[0, 1],
+            ).ravel()
+
+            precision = precision_score(y_fold_valid, y_valid_pred_threshold, zero_division=0)
+            recall = recall_score(y_fold_valid, y_valid_pred_threshold, zero_division=0)
+            specificity = tn / (tn + fp) if (tn + fp) > 0 else np.nan
+            npv = tn / (tn + fn) if (tn + fn) > 0 else np.nan
+
+            row.update({
+                "threshold": threshold,
+                "tn": int(tn),
+                "fp": int(fp),
+                "fn": int(fn),
+                "tp": int(tp),
+                "accuracy": accuracy_score(y_fold_valid, y_valid_pred_threshold),
+                "roc_auc": _safe_metric(roc_auc_score, y_fold_valid, y_valid_score),
+                "pr_auc": _safe_metric(average_precision_score, y_fold_valid, y_valid_score),
+                "log_loss": _safe_metric(log_loss, y_fold_valid, y_valid_prob),
+                "precision": precision,
+                "recall": recall,
+                "specificity": specificity,
+                "npv": npv,
+                "f1": f1_score(y_fold_valid, y_valid_pred_threshold, zero_division=0),
+                "f2": fbeta_score(y_fold_valid, y_valid_pred_threshold, beta=2, zero_division=0),
+                "mcc": matthews_corrcoef(y_fold_valid, y_valid_pred_threshold),
+                "youden_index": recall + specificity - 1 if not np.isnan(specificity) else np.nan,
+                "balanced_accuracy": (recall + specificity) / 2 if not np.isnan(specificity) else np.nan,
+                "overtriage": 1 - precision,
+                "undertriage": 1 - npv if not np.isnan(npv) else np.nan,
+                "false_positive_rate": fp / (fp + tn) if (fp + tn) > 0 else np.nan,
+                "false_negative_rate": fn / (fn + tp) if (fn + tp) > 0 else np.nan,
+            })
+
+        rows.append(row)
+
+    cv_metrics_df = pd.DataFrame(rows)
+    numeric_cols = cv_metrics_df.select_dtypes(include=[np.number]).columns.drop("fold", errors="ignore")
+    summary_df = pd.DataFrame([
+        {"fold": "mean", **cv_metrics_df[numeric_cols].mean(numeric_only=True).to_dict()},
+        {"fold": "std", **cv_metrics_df[numeric_cols].std(numeric_only=True).to_dict()},
+    ])
+    cv_metrics_df = pd.concat([cv_metrics_df, summary_df], ignore_index=True, sort=False)
+
+    docx_metrics = [
+        col for col in cv_metrics_df.columns
+        if col not in {"fold", "estimator"}
+    ]
+    docx_rows = []
+    for metric in docx_metrics:
+        row = {"metric": metric}
+        for _, values in cv_metrics_df.iterrows():
+            fold_label = str(values["fold"])
+            col_name = f"fold_{fold_label}" if fold_label.isdigit() else fold_label
+            row[col_name] = values[metric]
+        docx_rows.append(row)
+    cv_metrics_docx_df = pd.DataFrame(docx_rows)
+
+    save_table(
+        cv_metrics_docx_df,
+        filename,
+        title="Final selected model cross-validation fold metrics",
+        footnote=(
+            "Metrics are computed by replaying cross-validation on the training set "
+            "with the final selected estimator and the same outcome-year splitter. "
+            f"Threshold-dependent binary metrics use threshold = {threshold:.4f}. "
+            "The Word table is transposed for readability: rows are metrics and "
+            "columns are validation folds plus mean and standard deviation."
+        ),
+    )
+    print(cv_metrics_df.to_string(index=False))
+    return cv_metrics_df
 
 def set_fb_threshold(y_train, y_train_prob, optimize_beta):
     """Finds the optimal decision threshold based on F-beta score"""
@@ -2329,6 +2608,7 @@ def run_binary_automl_model(
     plot_sa_roc_curve: bool = True,
     sa_roc_alpha_pos: float = 0.60,
     sa_roc_alpha_neg: float = 0.90,
+    export_cv_fold_metrics: bool = True,
 ) -> dict:
 
     
@@ -2366,6 +2646,8 @@ def run_binary_automl_model(
     use_permutation_importance : bool
         If True, use permutation importance (slower but more accurate).
         If False, use built-in feature importance from the model (faster).
+    export_cv_fold_metrics : bool
+        Whether to replay CV for the final selected model and export fold metrics.
 
     Returns
     -------
@@ -2422,6 +2704,7 @@ def run_binary_automl_model(
     # -----------------------------
     y_train_prob = automl.predict_proba(X_train)[:, 1]
     y_test_prob = automl.predict_proba(X_test)[:, 1]
+    print_selected_model_hyperparameters(automl)
     
     if use_clinical_threshold:
         best_threshold = optimize_clinical_threshold(
@@ -2437,6 +2720,20 @@ def run_binary_automl_model(
         )
     else:
         best_threshold = set_fb_threshold(y_train, y_train_prob, optimize_beta)
+
+    cv_fold_metrics = (
+        export_final_model_cv_fold_metrics(
+            automl,
+            X_train,
+            y_train,
+            year_train,
+            n_splits_cv,
+            seed,
+            task="classification",
+            threshold=best_threshold,
+        )
+        if export_cv_fold_metrics else pd.DataFrame()
+    )
     
     # -----------------------------
     # Test set evaluation
@@ -2548,204 +2845,6 @@ def run_binary_automl_model(
         "importance_builtin": importance_df_builtin,
         "shap_values": shap_values,
         "top_interpretability_features": top_interpretability_features,
+        "cv_fold_metrics": cv_fold_metrics,
         "summary": summary_df,
     }
-
-# ===============================================================
-# Generic multiclass classification pipeline using FLAML
-# Optimized for P1-36, P1-58 and Non-Emergency prediction
-# ===============================================================
-
-def run_multiclass_automl_model(
-    cohort_name: str,
-    target_column: str,
-    demand_code: Optional[Union[int, List[int]]] = [36, 58],
-    triage_value: Optional[int] = None,
-    include_embeddings: bool = True,
-    export_table: bool = False, 
-    time_budget: int = 600,
-    test_size: float = 0.2,
-    seed: int = 42,
-    min_age: Optional[int] = None,
-    optimize_metric: str = 'macro_f1',
-    n_splits_cv: int = 5,
-    plot_feature_importance: bool = True,
-    use_permutation_importance: bool = False
-) -> dict:
-    """
-    Runs a complete multiclass classification pipeline using FLAML AutoML.
-
-    Parameters
-    ----------
-    cohort_name : str
-        Name of the cohort.
-    target_column : str
-        Multiclass target column (e.g., 0: None, 1: P1-36, 2: P1-58).
-    demand_code : Optional[Union[int, List[int]]]
-        Filtering codes, default is [36, 58].
-    triage_value : Optional[int]
-        Filter by triage availability.
-    include_embeddings : bool
-        Whether to include text embeddings.
-    time_budget : int
-        FLAML training budget in seconds.
-    test_size : float
-        Proportion of test split.
-    seed : int
-        Random seed.
-    min_age : Optional[int]
-        Optional age filter.
-    optimize_metric : str
-        Metric to optimize (macro_f1 is recommended for multiclass).
-    n_splits_cv : int
-        Number of CV folds.
-    plot_feature_importance : bool
-        Whether to compute and plot feature importance.
-    use_permutation_importance : bool
-        If True, use permutation importance.
-
-    Returns
-    -------
-    dict
-        Dictionary with model, metrics, and summary results.
-    """
-
-    global _current_demand_code, _current_time_budget
-    _current_demand_code = demand_code
-    _current_time_budget = time_budget
-
-    # -----------------------------
-    # Print type of triage-specific cohort
-    # -----------------------------
-    triage_print(triage_value, cohort_name, demand_code)
-
-    # -----------------------------
-    # Data loading & column selection
-    # -----------------------------
-    df = data_load_col_selection(triage_value, include_embeddings)
-
-    # -----------------------------
-    # Create multiclass variable
-    # -----------------------------
-    df.loc[(df["demand_type_1"] == 36) & (df[target_column] == 1), target_column] = 1
-    df.loc[(df["demand_type_1"] == 58) & (df[target_column] == 1), target_column] = 2
-    
-    # -----------------------------
-    # Basic validation
-    # -----------------------------
-    col_validation(df, target_column)
-    
-    # -----------------------------
-    # Cohort & triage filtering
-    # -----------------------------
-    df = data_filtering(df, target_column, demand_code, triage_value, min_age,
-                        export_table, protocol_features=protocol_questions)
-
-    # -----------------------------
-    # Train / test split
-    # -----------------------------
-    X_train, X_test, y_train, y_test, year_train, year_test, sample_weight = train_test_split_weights(
-        df, target_column, test_size, seed)
-
-    # -----------------------------
-    # AutoML training (task set to multiclass)
-    # -----------------------------
-    automl = run_automl_training(
-        X_train, y_train, year_train, sample_weight, time_budget, 
-        optimize_metric, n_splits_cv, seed, task="multiclass"
-    )
-
-    # -----------------------------
-    # Test set evaluation
-    # -----------------------------
-    print("\n--- Test set results (Multiclass) ---")
-    
-    # Multiclass prediction uses the highest probability class (argmax)
-    y_test_pred = automl.predict(X_test)
-    y_test_prob = automl.predict_proba(X_test)
-
-    # -----------------------------
-    # Confusion Matrix Plot
-    # -----------------------------
-    conf_matrix = confusion_matrix(y_test, y_test_pred)
-    
-    label_mapping = {
-    0: "P0",
-    1: "P1-Unconscious",
-    2: "P1-Cardiac Arrest"
-    }
-    class_labels = sorted(df[target_column].unique())
-    labels_str = [label_mapping.get(l, str(l)) for l in class_labels]
-
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(conf_matrix, annot=True, cmap='Purples', fmt='d',
-                xticklabels=labels_str, yticklabels=labels_str)
-    plt.title(f'Multiclass Confusion Matrix - {cohort_name}')
-    plt.xlabel('Predicted')
-    plt.ylabel('Actual')
-    plt.tight_layout()
-    plt.show()
-
-    # -----------------------------
-    # Metrics computation
-    # -----------------------------
-    accuracy = (y_test_pred == y_test).mean()
-    macro_f1 = f1_score(y_test, y_test_pred, average='macro')
-    weighted_f1 = f1_score(y_test, y_test_pred, average='weighted')
-    logloss_val = log_loss(y_test, y_test_prob)
-    
-    # ROC-AUC OvR (One-vs-Rest) is the standard for multiclass
-    roc_auc_ovr = roc_auc_score(y_test, y_test_prob, multi_class='ovr', average='weighted')
-
-    metrics = {
-        "accuracy": accuracy,
-        "macro_f1": macro_f1,
-        "weighted_f1": weighted_f1,
-        "log_loss": logloss_val,
-        "roc_auc_ovr": roc_auc_ovr
-    }
-
-    # -----------------------------
-    # Print metrics 
-    # -----------------------------
-    print("\n" + "="*60)
-    print(f"{'MULTICLASS CLASSIFICATION REPORT':^60}")
-    print("="*60)
-    print(classification_report(y_test, y_test_pred, target_names=labels_str))
-
-    print("\n" + "="*60)
-    print(f"{'PERFORMANCE METRICS (%)':^60}")
-    print("="*60)
-    
-    print(f"\n{'Overall Performance:':<30}")
-    print(f"  Accuracy:                    {metrics['accuracy']*100:.2f}%")
-    print(f"  ROC-AUC (OvR):               {metrics['roc_auc_ovr']*100:.2f}%")
-    print(f"  Macro F1 Score:              {metrics['macro_f1']*100:.2f}%")
-    print(f"  Weighted F1 Score:           {metrics['weighted_f1']*100:.2f}%")
-    
-    print(f"\n{'Model Error:':<30}")
-    print(f"  Log Loss:                    {metrics['log_loss']:.4f}")
-    
-    print("="*60 + "\n")
-
-    # -----------------------------
-    # Feature importance
-    # -----------------------------
-    importance_df = None
-    if plot_feature_importance:
-        importance_df = plot_feature_importances(automl, X_train, use_permutation_importance, 
-                                                 X_test, y_test, seed, task="multiclass")
-
-    # -----------------------------
-    # Build summary DataFrame
-    # -----------------------------
-    summary_df = (
-        pd.DataFrame(metrics, index=[0])
-        .assign(
-            cohort=cohort_name,
-            n_samples=len(df),
-            best_model=automl.best_estimator
-        )
-    )
-
-    display(summary_df)
