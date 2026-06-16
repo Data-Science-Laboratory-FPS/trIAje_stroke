@@ -9,19 +9,46 @@ from IPython.display import display
 
 from kbase.config import settings
 
-def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False, age_group=False, triage_group=False, figures_dir=None, reference_df=None):
+def evaluate_diagnostic_performance(
+    df, y_real_col, y_pred_col,
+    sex_group=False, age_group=False, triage_group=False,
+    figures_dir=None, reference_df=None,
+    n_bootstrap=1000, ci_seed=42,
+    export_tables=False,
+):
     """
-    Calculates clinical metrics and generates plots.
-    If triage_group=True, results are stratified by triage status (General, Triage 1, No Triage 0).
-    If sex_group=True, it performs a cross-stratification: each group above is subdivided by Men and Women.
-    If age_group=True, it performs a cross-stratification: each group above is subdivided by WHO age
-    groups (derived from the age_0_14 ... age_75_plus indicators), keeping only groups with N > 1000.
-    The N > 1000 threshold is evaluated on `reference_df` if provided (e.g. the full dataset, before
-    any train/test split), otherwise on `df` itself.
-    sex_group and age_group are mutually exclusive subgroup dimensions; if both are True, age_group
-    takes precedence.
-    If sex_group, age_group, and triage_group are all False, a single overall result ("General") is
-    computed, with no group breakdown.
+    Calculates clinical metrics with 95% confidence intervals and generates plots.
+
+    Clopper-Pearson exact binomial CIs are used for proportion-based metrics:
+        Accuracy, Precision, Recall, Specificity, NPV, Overtriage, Undertriage.
+
+    Outcome-stratified bootstrap CIs (n_bootstrap resamples, percentile method)
+    are used for composite metrics:
+        F1-Score, F2-Score.
+
+    If triage_group=True, results are stratified by triage status
+    (General, Triage 1, No Triage 0).
+    If sex_group=True, it performs a cross-stratification: each group above is
+    subdivided by Men and Women.
+    If age_group=True, it performs a cross-stratification: each group above is
+    subdivided by WHO age groups (derived from the age_0_14 ... age_75_plus
+    indicators), keeping only groups with N > 1000.
+    The N > 1000 threshold is evaluated on `reference_df` if provided (e.g. the
+    full dataset, before any train/test split), otherwise on `df` itself.
+    sex_group and age_group are mutually exclusive subgroup dimensions; if both
+    are True, age_group takes precedence.
+    If sex_group, age_group, and triage_group are all False, a single overall
+    result ("General") is computed with no group breakdown.
+
+    Parameters
+    ----------
+    n_bootstrap : int
+        Number of bootstrap resamples for F1/F2 confidence intervals.
+    ci_seed : int
+        Random seed for reproducibility of bootstrap sampling.
+    export_tables : bool
+        When True and figures_dir is provided, exports the formatted performance
+        table to a Word (.docx) file under figures_dir/tables/.
     """
     import pandas as pd
     import numpy as np
@@ -29,9 +56,10 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
     import seaborn as sns
     from matplotlib.patches import Patch
     from sklearn.metrics import confusion_matrix, accuracy_score, f1_score, fbeta_score
+    from scipy.stats import beta as _beta
 
     df = df.copy()
-    
+
     # --- BLOCK: Dynamic Triage Column Creation ---
     if triage_group and 'triage' not in df.columns:
         question_cols = [c for c in df.columns if c[0].isdigit() or (c.startswith('q') and len(c) > 1 and c[1].isdigit())]
@@ -83,42 +111,134 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
             subgroup_col = 'age_group_label'
             subgroup_values = [g for g in age_group_order if counts.get(g, 0) > 1000]
 
+    # --- CI helpers ----------------------------------------------------------
+    def _cp(x, n, alpha=0.05):
+        """Clopper-Pearson exact binomial 95% CI. Returns (lo, hi) as proportions."""
+        if n == 0:
+            return (np.nan, np.nan)
+        lo = float(_beta.ppf(alpha / 2,     x,     n - x + 1)) if x > 0 else 0.0
+        hi = float(_beta.ppf(1 - alpha / 2, x + 1, n - x))     if x < n else 1.0
+        return lo, hi
+
+    # Single RNG shared across all subgroup calls for reproducibility.
+    rng = np.random.default_rng(ci_seed)
+
     # --- BLOCK: Internal Metric Calculation Helper ---
     def calculate_metrics(data, group_name, subgroup_name="General"):
         if len(data) == 0:
             return None
-        
+
         y_real = data[y_real_col]
         y_pred = data[y_pred_col]
-        
+
         cm = confusion_matrix(y_real, y_pred, labels=[0, 1])
         tn, fp, fn, tp = cm.ravel()
-        
-        accuracy = accuracy_score(y_real, y_pred) * 100
-        precision = (tp / (tp + fp) if (tp + fp) > 0 else 0) * 100
-        recall = (tp / (tp + fn) if (tp + fn) > 0 else 0) * 100
-        specificity = (tn / (tn + fp) if (tn + fp) > 0 else 0) * 100
-        npv = (tn / (tn + fn) if (tn + fn) > 0 else 0) * 100
-        f1 = f1_score(y_real, y_pred, zero_division=0) * 100
-        f2 = fbeta_score(y_real, y_pred, beta=2, zero_division=0) * 100
+        n = int(tn + fp + fn + tp)
 
-        overtriage = 100 - precision
+        # --- Point estimates -------------------------------------------------
+        accuracy    = (tp + tn) / n * 100
+        precision   = (tp / (tp + fp) if (tp + fp) > 0 else 0) * 100
+        recall      = (tp / (tp + fn) if (tp + fn) > 0 else 0) * 100
+        specificity = (tn / (tn + fp) if (tn + fp) > 0 else 0) * 100
+        npv         = (tn / (tn + fn) if (tn + fn) > 0 else 0) * 100
+        f1          = f1_score(y_real, y_pred, zero_division=0) * 100
+        f2          = fbeta_score(y_real, y_pred, beta=2, zero_division=0) * 100
+        overtriage  = 100 - precision
         undertriage = 100 - npv
-        
+
+        # --- Clopper-Pearson CIs (exact binomial, no resampling) -------------
+        # Overtriage = FP/(TP+FP) and Undertriage = FN/(TN+FN) are also
+        # direct binomial proportions, so CP applies directly to them.
+        acc_ci   = tuple(v * 100 for v in _cp(int(tp + tn), n))
+        prec_ci  = tuple(v * 100 for v in _cp(int(tp),      int(tp + fp)))
+        rec_ci   = tuple(v * 100 for v in _cp(int(tp),      int(tp + fn)))
+        spec_ci  = tuple(v * 100 for v in _cp(int(tn),      int(tn + fp)))
+        npv_ci   = tuple(v * 100 for v in _cp(int(tn),      int(tn + fn)))
+        over_ci  = tuple(v * 100 for v in _cp(int(fp),      int(tp + fp)))
+        under_ci = tuple(v * 100 for v in _cp(int(fn),      int(tn + fn)))
+
+        # --- Outcome-stratified bootstrap CIs for F1 and F2 -----------------
+        # Simple outcome (0/1) stratification — preserves class balance in each
+        # resample without requiring a year column. More robust than outcome-year
+        # stratification for small or heterogeneous subgroups.
+        y_real_arr = np.asarray(y_real)
+        y_pred_arr = np.asarray(y_pred)
+        neg_idx = np.where(y_real_arr == 0)[0]
+        pos_idx = np.where(y_real_arr == 1)[0]
+
+        boot_f1, boot_f2 = [], []
+        n_valid = 0
+
+        if len(neg_idx) >= 2 and len(pos_idx) >= 2:
+            for _ in range(n_bootstrap):
+                idx = np.concatenate([
+                    rng.choice(neg_idx, size=len(neg_idx), replace=True),
+                    rng.choice(pos_idx, size=len(pos_idx), replace=True),
+                ])
+                yt = y_real_arr[idx]
+                yp = y_pred_arr[idx]
+
+                tn_b, fp_b, fn_b, tp_b = confusion_matrix(yt, yp, labels=[0, 1]).ravel()
+                prec_b = tp_b / (tp_b + fp_b) if (tp_b + fp_b) > 0 else np.nan
+                rec_b  = tp_b / (tp_b + fn_b) if (tp_b + fn_b) > 0 else np.nan
+
+                if not (np.isnan(prec_b) or np.isnan(rec_b)):
+                    denom_f1 = prec_b + rec_b
+                    f1_b = 2 * prec_b * rec_b / denom_f1 if denom_f1 > 0 else np.nan
+                    denom_f2 = 4 * prec_b + rec_b
+                    f2_b = 5 * prec_b * rec_b / denom_f2 if denom_f2 > 0 else np.nan
+                else:
+                    f1_b = f2_b = np.nan
+
+                if not np.isnan(f1_b):
+                    boot_f1.append(f1_b)
+                    n_valid += 1
+                if not np.isnan(f2_b):
+                    boot_f2.append(f2_b)
+
+            if n_valid < n_bootstrap // 2:
+                print(
+                    f"Warning [{group_name} / {subgroup_name}]: only {n_valid}/{n_bootstrap} "
+                    f"valid bootstrap replications — F1/F2 CI may be unreliable."
+                )
+
+        def _boot_ci(boot_list):
+            if len(boot_list) >= 10:
+                return (
+                    float(np.percentile(boot_list, 2.5))  * 100,
+                    float(np.percentile(boot_list, 97.5)) * 100,
+                )
+            return (np.nan, np.nan)
+
+        f1_ci = _boot_ci(boot_f1)
+        f2_ci = _boot_ci(boot_f2)
+
+        def _r(v):
+            return round(float(v), 2) if not np.isnan(float(v)) else np.nan
+
         return {
-            "Triage Group": group_name,
-            "Subgroup": subgroup_name,
-            "Display Group": f"{group_name} ({subgroup_name})" if subgroup_name != "General" else group_name,
-            "Accuracy (%)": round(accuracy, 2),
-            "Precision (%)": round(precision, 2),
-            "Recall (%)": round(recall, 2),
-            "F1-Score (%)": round(f1, 2),
-            "F2-Score (%)": round(f2, 2),
-            "Overtriage (%)": round(overtriage, 2),
-            "Undertriage (%)": round(undertriage, 2),
-            "Specificity (%)": round(specificity, 2),
-            "NPV (%)": round(npv, 2),
-            "N": len(data)
+            "Triage Group":   group_name,
+            "Subgroup":       subgroup_name,
+            "Display Group":  f"{group_name} ({subgroup_name})" if subgroup_name != "General" else group_name,
+            "Accuracy (%)":          _r(accuracy),
+            "Accuracy CI lo (%)":    _r(acc_ci[0]),   "Accuracy CI hi (%)":    _r(acc_ci[1]),
+            "Precision (%)":         _r(precision),
+            "Precision CI lo (%)":   _r(prec_ci[0]),  "Precision CI hi (%)":   _r(prec_ci[1]),
+            "Recall (%)":            _r(recall),
+            "Recall CI lo (%)":      _r(rec_ci[0]),   "Recall CI hi (%)":      _r(rec_ci[1]),
+            "F1-Score (%)":          _r(f1),
+            "F1-Score CI lo (%)":    _r(f1_ci[0]),    "F1-Score CI hi (%)":    _r(f1_ci[1]),
+            "F2-Score (%)":          _r(f2),
+            "F2-Score CI lo (%)":    _r(f2_ci[0]),    "F2-Score CI hi (%)":    _r(f2_ci[1]),
+            "Overtriage (%)":        _r(overtriage),
+            "Overtriage CI lo (%)":  _r(over_ci[0]),  "Overtriage CI hi (%)":  _r(over_ci[1]),
+            "Undertriage (%)":       _r(undertriage),
+            "Undertriage CI lo (%)": _r(under_ci[0]), "Undertriage CI hi (%)": _r(under_ci[1]),
+            "Specificity (%)":       _r(specificity),
+            "Specificity CI lo (%)": _r(spec_ci[0]),  "Specificity CI hi (%)": _r(spec_ci[1]),
+            "NPV (%)":               _r(npv),
+            "NPV CI lo (%)":         _r(npv_ci[0]),   "NPV CI hi (%)":         _r(npv_ci[1]),
+            "N": n,
         }
 
     # --- BLOCK: Cross-Stratified Grouping Logic ---
@@ -166,10 +286,130 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
                     if res_sub: results.append(res_sub)
 
     results_df = pd.DataFrame(results)
-    
-    from IPython.display import display
-    display(results_df.drop(columns=["Display Group"]))
-    
+
+    # --- Formatted display: each metric shown as "estimate (lo–hi)" ----------
+    _METRIC_COLS = [
+        "Accuracy", "Precision", "Recall", "F1-Score", "F2-Score",
+        "Overtriage", "Undertriage", "Specificity", "NPV",
+    ]
+
+    def _fmt(row, metric):
+        est = row[f"{metric} (%)"]
+        lo  = row.get(f"{metric} CI lo (%)", np.nan)
+        hi  = row.get(f"{metric} CI hi (%)", np.nan)
+        if pd.isna(lo) or pd.isna(hi):
+            return f"{est:.2f}"
+        return f"{est:.2f} ({lo:.2f}–{hi:.2f})"
+
+    display_rows = []
+    for _, row in results_df.iterrows():
+        d = {
+            "Triage Group": row["Triage Group"],
+            "Subgroup":     row["Subgroup"],
+        }
+        for m in _METRIC_COLS:
+            d[f"{m} (%)"] = _fmt(row, m)
+        d["N"] = int(row["N"])
+        display_rows.append(d)
+
+    from IPython.display import display as _display
+    _display(pd.DataFrame(display_rows))
+
+    # --- Word export ---------------------------------------------------------
+    if export_tables and figures_dir:
+        from docx import Document
+        from docx.shared import Pt, RGBColor
+        from docx.enum.section import WD_ORIENT
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+
+        # Grayscale palette: dark header, alternating white / light-grey rows
+        HDR_BG  = "2D2D2D"
+        HDR_FG  = RGBColor(0xFF, 0xFF, 0xFF)
+        ALT_BG  = "EFEFEF"
+        EVEN_BG = "FFFFFF"
+
+        def _set_cell_bg(cell, hex_color):
+            tc   = cell._tc
+            tcPr = tc.get_or_add_tcPr()
+            shd  = OxmlElement('w:shd')
+            shd.set(qn('w:val'),   'clear')
+            shd.set(qn('w:color'), 'auto')
+            shd.set(qn('w:fill'),  hex_color)
+            tcPr.append(shd)
+
+        if age_group:
+            table_title = "Diagnostic performance by WHO age group (95% CI)"
+            fname       = "performance_age_subgroups.docx"
+        elif sex_group:
+            table_title = "Diagnostic performance by sex subgroup (95% CI)"
+            fname       = "performance_sex_subgroups.docx"
+        else:
+            table_title = "Overall diagnostic performance (95% CI)"
+            fname       = "performance_overall.docx"
+
+        footnote = (
+            "Accuracy, Precision, Recall, Specificity, NPV, Overtriage and Undertriage: "
+            "Clopper-Pearson exact 95% CI. "
+            f"F1-Score and F2-Score: outcome-stratified bootstrap 95% CI ({n_bootstrap} resamples). "
+            "Values shown as estimate (95% CI lower–upper), all in %."
+        )
+
+        display_df = pd.DataFrame(display_rows)
+        cols       = list(display_df.columns)
+        n_data_rows = len(display_df)
+
+        doc = Document()
+        # Landscape page so the wide table fits without wrapping
+        section = doc.sections[0]
+        section.orientation = WD_ORIENT.LANDSCAPE
+        section.page_width, section.page_height = section.page_height, section.page_width
+
+        style = doc.styles['Normal']
+        style.font.name = 'Calibri'
+        style.font.size = Pt(10)
+
+        title_para = doc.add_paragraph()
+        title_run  = title_para.add_run(table_title)
+        title_run.bold = True
+        title_run.font.size = Pt(11)
+        doc.add_paragraph()
+
+        table = doc.add_table(rows=n_data_rows + 1, cols=len(cols))
+        table.style = 'Table Grid'
+
+        # Header row
+        for j, col_name in enumerate(cols):
+            cell = table.rows[0].cells[j]
+            cell.text = col_name
+            run  = cell.paragraphs[0].runs[0]
+            run.bold = True
+            run.font.color.rgb = HDR_FG
+            run.font.size = Pt(8)
+            _set_cell_bg(cell, HDR_BG)
+
+        # Data rows
+        for i, row_vals in enumerate(display_df.itertuples(index=False)):
+            bg = ALT_BG if i % 2 == 1 else EVEN_BG
+            for j, val in enumerate(row_vals):
+                cell = table.rows[i + 1].cells[j]
+                cell.text = str(val)
+                run  = cell.paragraphs[0].runs[0]
+                run.font.size = Pt(8)
+                _set_cell_bg(cell, bg)
+
+        doc.add_paragraph()
+        note_para = doc.add_paragraph()
+        note_run  = note_para.add_run(footnote)
+        note_run.italic = True
+        note_run.font.size = Pt(8)
+
+        tables_dir = os.path.join(figures_dir, 'tables')
+        os.makedirs(tables_dir, exist_ok=True)
+        word_path = os.path.join(tables_dir, fname)
+        doc.save(word_path)
+        print(f"Table saved: {word_path}")
+
     # --- BLOCK: Visualization (2x4 Grid) ---
     # Reordered metrics as requested:
     # Row 1: Accuracy, Recall, Precision, Specificity
@@ -178,12 +418,12 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
         "Accuracy (%)", "Recall (%)", "Precision (%)", "Specificity (%)",
         "F1-Score (%)", "F2-Score (%)", "Overtriage (%)", "Undertriage (%)"
     ]
-    
+
     # 2 rows, 4 columns = 8 slots
     fig, axes = plt.subplots(2, 4, figsize=(24, 12))
     axes = axes.flatten()
     sns.set_theme(style="whitegrid")
-    
+
     c_blue = "#4A90E2"
     c_teal = "#50E3C2"
     c_orange = "#F5A623"
@@ -259,12 +499,12 @@ def evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group=False,
         for p in axes[i].patches:
             height = p.get_height()
             if height > 0:
-                axes[i].annotate(f'{height:{fmt}}%', 
-                                (p.get_x() + p.get_width() / 2., height), 
-                                ha = 'center', va = 'center', 
-                                xytext = (0, 10), 
+                axes[i].annotate(f'{height:{fmt}}%',
+                                (p.get_x() + p.get_width() / 2., height),
+                                ha = 'center', va = 'center',
+                                xytext = (0, 10),
                                 textcoords = 'offset points',
-                                fontsize=label_size, 
+                                fontsize=label_size,
                                 fontweight='bold')
 
     plt.tight_layout()
@@ -372,15 +612,15 @@ def analyze_emergency_performance(demand_type, y_real_col, y_pred_col, sex_group
     df = df.dropna(subset=[y_real_col])
 
     print(f"\nNumber of rows in {demand_type} is: {len(df):,}\n")
-    
+
     # Preprocessing
     df = df.copy()
     if y_pred_col in df.columns and df[y_pred_col].dtype.name == 'category':
         df[y_pred_col] = pd.to_numeric(df[y_pred_col], errors='coerce')
-        
+
     df[y_pred_col] = df[y_pred_col].astype('int8')
     df[y_real_col] = df[y_real_col].astype('int8')
-    
+
     # Execute evaluation and plotting
     evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group, age_group)
 
