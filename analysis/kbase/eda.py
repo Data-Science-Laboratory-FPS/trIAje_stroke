@@ -309,7 +309,7 @@ def evaluate_diagnostic_performance(
         }
         for m in _METRIC_COLS:
             d[f"{m} (%)"] = _fmt(row, m)
-        d["N"] = int(row["N"])
+        d["N"] = f"{int(row['N']):,}"
         display_rows.append(d)
 
     from IPython.display import display as _display
