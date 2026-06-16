@@ -1822,17 +1822,24 @@ def plot_feature_importances(automl, X_train, feature_importance,
 
     return importance_df_permutation, importance_df_builtin
 
-def plot_shap_interpretation(automl, X_test, task="classification", max_display=15, seed=42):
+def _compute_shap_values(automl, X_test, task="classification", seed=42):
     """
-    Computes SHAP values and plots a summary excluding embedding features.
-    SHAP provides directional impact per feature (positive = pushes toward positive class).
+    Computes SHAP values for the fitted estimator, aligning features to what
+    the underlying model was actually trained on and excluding embedding
+    columns. Shared by plot_shap_interpretation and plot_marginal_effects so
+    SHAP is computed at most once per run.
 
-    For binary classification: single summary plot.
-    For multiclass: one summary plot per class.
+    Returns a dict with:
+      - shap_values: raw SHAP output (list / 2D / 3D ndarray, depending on model and task)
+      - train_features: feature names used by the underlying estimator
+      - non_emb_cols: clinical (non-embedding) feature names, in train_features order
+      - non_emb_idx: indices of non_emb_cols within train_features
+      - X_sample_shap: SHAP-ready subsample (categoricals as int32), aligned to train_features
+      - X_plot: X_sample_shap restricted to non-embedding columns, with display labels
+      - labels_map: display-label mapping for non_emb_cols
+
+    Returns None if SHAP computation fails (caller prints a warning).
     """
-
-    print("\n--- Initializing SHAP Explainer ---")
-    _start_time = time.time()
 
     def _prepare_for_shap(X):
         """
@@ -1848,9 +1855,6 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
         return X_shap
 
     try:
-        # Clinical features only — embeddings excluded for interpretability
-        non_emb_cols = [col for col in X_test.columns if not col.startswith('emb')]
-
         # Extract the underlying fitted estimator from FLAML
         model = automl.model.estimator
 
@@ -1938,6 +1942,48 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
 
         print(f"SHAP values computed on {sample_size} samples.")
 
+        return {
+            "shap_values": shap_values,
+            "train_features": train_features,
+            "non_emb_cols": non_emb_cols,
+            "non_emb_idx": non_emb_idx,
+            "X_sample_shap": X_sample_shap,
+            "X_plot": X_plot,
+            "labels_map": labels_map,
+        }
+
+    except Exception as e:
+        print(f"Warning: SHAP computation failed: {e}")
+        return None
+
+def plot_shap_interpretation(automl, X_test, task="classification", max_display=15, seed=42, shap_data=None):
+    """
+    Computes SHAP values and plots a summary excluding embedding features.
+    SHAP provides directional impact per feature (positive = pushes toward positive class).
+
+    For binary classification: single summary plot.
+    For multiclass: one summary plot per class.
+
+    Parameters
+    ----------
+    shap_data : Optional[dict]
+        Precomputed output of _compute_shap_values. If None, it is computed
+        internally.
+    """
+
+    print("\n--- Initializing SHAP Explainer ---")
+    _start_time = time.time()
+
+    if shap_data is None:
+        shap_data = _compute_shap_values(automl, X_test, task=task, seed=seed)
+    if shap_data is None:
+        return None
+
+    shap_values  = shap_data["shap_values"]
+    non_emb_idx  = shap_data["non_emb_idx"]
+    X_plot       = shap_data["X_plot"]
+
+    try:
         # --- Plotting ---
         if task == "multiclass":
             # TreeExplainer returns list of 2D arrays (one per class)
@@ -1994,7 +2040,223 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
     except Exception as e:
         print(f"Warning: SHAP interpretation failed: {e}")
         return None
-    
+
+def _rank_shap_features(shap_values, non_emb_cols, non_emb_idx, task="classification"):
+    """
+    Ranks clinical (non-embedding) features by mean(|SHAP value|), descending.
+
+    For binary classification, uses the positive-class SHAP matrix (handles
+    TreeExplainer list output, 3D ndarray, or plain 2D ndarray). For
+    multiclass, averages |SHAP| across classes.
+
+    Returns
+    -------
+    pd.DataFrame
+        Columns: 'feature', 'mean_abs_shap', sorted descending.
+    """
+    if task == "multiclass":
+        if isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+            class_arrays = [shap_values[:, :, i] for i in range(shap_values.shape[2])]
+        else:
+            class_arrays = shap_values
+        per_class_abs = [np.abs(arr[:, non_emb_idx]) for arr in class_arrays]
+        mean_abs_shap = np.mean([arr.mean(axis=0) for arr in per_class_abs], axis=0)
+    else:
+        if isinstance(shap_values, list):
+            shap_values_binary = shap_values[1]
+        elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
+            shap_values_binary = shap_values[:, :, 1]
+        else:
+            shap_values_binary = shap_values
+
+        shap_filtered = shap_values_binary[:, non_emb_idx]
+        mean_abs_shap = np.abs(shap_filtered).mean(axis=0)
+
+    return (
+        pd.DataFrame({"feature": non_emb_cols, "mean_abs_shap": mean_abs_shap})
+        .sort_values("mean_abs_shap", ascending=False)
+        .reset_index(drop=True)
+    )
+
+def plot_marginal_effects(
+    automl,
+    X_test,
+    y_test,
+    y_test_year,
+    shap_data=None,
+    n_features=5,
+    task="classification",
+    seed=42,
+    n_bootstrap=200,
+    ci_seed=42,
+    n_grid_points=25,
+    cat_max_unique=10,
+):
+    """
+    Plots the marginal predicted probability of the positive class against
+    the value of each of the top-N most important features (ranked by
+    mean(|SHAP value|)), with a 95% bootstrap confidence interval.
+
+    The trained model is held fixed: bootstrap resampling is applied only to
+    a subsample of the test set (no retraining), following the outcome-year
+    stratified bootstrap pattern used in print_test_metrics_with_ci.
+
+    Continuous features (non-category dtype with > cat_max_unique distinct
+    values) are swept across their observed 1st-99th percentile range and
+    plotted as a median curve with a shaded 95% CI band.
+
+    Categorical/binary features (category dtype, or <= cat_max_unique
+    distinct values) are plotted as median points with 95% CI error bars,
+    one per observed category.
+
+    Parameters
+    ----------
+    automl : flaml.AutoML
+        Fitted AutoML object. predict_proba is called on the full feature
+        set; FLAML handles its own feature alignment/encoding internally.
+    X_test, y_test, y_test_year : array-like
+        Test split features, outcome and year (used for the stratified
+        bootstrap resampling).
+    shap_data : Optional[dict]
+        Precomputed output of _compute_shap_values. If None, computed
+        internally.
+    n_features : int
+        Number of top SHAP features to plot.
+    n_bootstrap : int
+        Number of bootstrap resamples of the test subsample.
+    n_grid_points : int
+        Number of grid points swept for continuous features.
+    cat_max_unique : int
+        Features with at most this many distinct values (or category dtype)
+        are treated as categorical/binary.
+
+    Returns
+    -------
+    Optional[pd.DataFrame]
+        Top-N features with columns 'feature' and 'mean_abs_shap'. None if
+        SHAP computation failed.
+    """
+    print("\n--- Generating interpretability (marginal effect) plots ---")
+    _start_time = time.time()
+
+    if shap_data is None:
+        shap_data = _compute_shap_values(automl, X_test, task=task, seed=seed)
+    if shap_data is None:
+        print("Warning: marginal effect plots skipped (SHAP computation failed).")
+        return None
+
+    ranking = _rank_shap_features(
+        shap_data["shap_values"], shap_data["non_emb_cols"], shap_data["non_emb_idx"], task=task
+    )
+    top_features_df = ranking.head(n_features).reset_index(drop=True)
+    top_features = top_features_df["feature"].tolist()
+
+    labels_map = get_labels_map(demand_code=_current_demand_code, columns=top_features)
+
+    # Subsample test set for computational efficiency (consistent with SHAP)
+    sample_size = min(500, len(X_test))
+    sample_pos = np.random.RandomState(seed).choice(len(X_test), size=sample_size, replace=False)
+
+    X_sample    = X_test.iloc[sample_pos].reset_index(drop=True)
+    y_sample    = pd.Series(np.asarray(y_test)[sample_pos]).reset_index(drop=True)
+    year_sample = pd.Series(np.asarray(y_test_year)[sample_pos]).reset_index(drop=True)
+
+    # Outcome-year stratified bootstrap indices (fixed model, resample test subsample only)
+    rng = np.random.default_rng(ci_seed)
+    strata = _make_outcome_year_strata(y_sample, year_sample)
+    strata_indices = [
+        group.index.to_numpy()
+        for _, group in strata.groupby(strata, sort=False)
+    ]
+
+    boot_idx_list = [
+        np.concatenate([
+            rng.choice(stratum_idx, size=len(stratum_idx), replace=True)
+            for stratum_idx in strata_indices
+        ])
+        for _ in range(n_bootstrap)
+    ]
+
+    for feature in top_features:
+        display_label = get_display_label(feature, labels_map)
+        col = X_sample[feature]
+        original_dtype = col.dtype
+
+        is_categorical = (
+            isinstance(original_dtype, pd.CategoricalDtype)
+            or col.nunique(dropna=True) <= cat_max_unique
+        )
+
+        if is_categorical:
+            if isinstance(original_dtype, pd.CategoricalDtype):
+                grid_values = list(original_dtype.categories)
+            else:
+                grid_values = sorted(col.dropna().unique().tolist())
+        else:
+            lo, hi = np.nanpercentile(col.astype(float), [1, 99])
+            grid_values = np.linspace(lo, hi, n_grid_points)
+            if pd.api.types.is_integer_dtype(original_dtype):
+                grid_values = np.unique(np.round(grid_values).astype(np.int64))
+
+        n_vals = len(grid_values)
+
+        def _assign_feature(df_, values_array, _feature=feature, _dtype=original_dtype):
+            if isinstance(_dtype, pd.CategoricalDtype):
+                df_[_feature] = pd.Categorical(values_array, dtype=_dtype)
+            else:
+                df_[_feature] = pd.array(values_array, dtype=_dtype)
+            return df_
+
+        boot_means = np.empty((n_vals, n_bootstrap))
+        for b, boot_idx in enumerate(boot_idx_list):
+            X_boot = X_sample.iloc[boot_idx]
+
+            # Tile the resampled block once per grid value, then make a single
+            # predict_proba call covering all grid points at once.
+            X_tiled = pd.concat([X_boot] * n_vals, ignore_index=True)
+            values_array = np.repeat(grid_values, len(boot_idx))
+            X_tiled = _assign_feature(X_tiled, values_array)
+
+            probs = automl.predict_proba(X_tiled)[:, 1]
+            probs = probs.reshape(n_vals, len(boot_idx))
+            boot_means[:, b] = probs.mean(axis=1)
+
+        medians = np.median(boot_means, axis=1)
+        ci_lo   = np.percentile(boot_means, 2.5, axis=1)
+        ci_hi   = np.percentile(boot_means, 97.5, axis=1)
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+        if is_categorical:
+            x_pos = np.arange(n_vals)
+            yerr = np.vstack([medians - ci_lo, ci_hi - medians])
+            ax.errorbar(x_pos, medians, yerr=yerr, fmt='o', color='steelblue',
+                        capsize=4, markersize=6, label='Median [95% CI]')
+            ax.set_xticks(x_pos)
+            ax.set_xticklabels([str(v) for v in grid_values])
+        else:
+            ax.plot(grid_values, medians, color='steelblue', lw=2, label='Median')
+            ax.fill_between(grid_values, ci_lo, ci_hi, color='steelblue', alpha=0.25,
+                            label='95% CI (bootstrap)')
+
+        ax.set_xlabel(display_label)
+        ax.set_ylabel('Predicted probability of positive class')
+        ax.set_title(f'Marginal effect: {display_label}')
+        ax.set_ylim(0, 1)
+        ax.legend(loc='best')
+        ax.grid(alpha=0.3)
+        plt.tight_layout()
+        save_figure(fig, f'marginal_{feature}.png')
+        plt.show()
+
+    print(f"\nTop {len(top_features)} features by mean(|SHAP value|):")
+    for _, row in top_features_df.iterrows():
+        print(f"  {row['feature']:<20} {row['mean_abs_shap']:.4f}")
+
+    elapsed = time.time() - _start_time
+    print(f"Total marginal-effects time: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+
+    return top_features_df
+
 def run_binary_automl_model(
     cohort_name: str,
     target_column: str,
@@ -2021,9 +2283,10 @@ def run_binary_automl_model(
     max_overtriage: float = 0.50,
     feature_importance: int = 0,
     plot_shap: bool = True,
+    n_interpretability_features: int = 10,
     plot_calibration_curve: bool = True,
     plot_sa_roc_curve: bool = True,
-    sa_roc_alpha_pos: float = 0.85,
+    sa_roc_alpha_pos: float = 0.60,
     sa_roc_alpha_neg: float = 0.95,
 ) -> dict:
 
@@ -2170,18 +2433,21 @@ def run_binary_automl_model(
         plot_df, 'target_real', 'target_pred',
         sex_group=False,
         figures_dir=_get_figures_dir(demand_code),
+        export_tables=True,
     )
     # Fairness analysis by sex
     eda.evaluate_diagnostic_performance(
         plot_df, 'target_real', 'target_pred',
         sex_group=True,
         figures_dir=_get_figures_dir(demand_code),
+        export_tables=True,
     )
     # Fairness analysis by age groups
     eda.evaluate_diagnostic_performance(
         plot_df, 'target_real', 'target_pred',
         age_group=True,
         figures_dir=_get_figures_dir(demand_code),
+        export_tables=True,
     )
 
     # -----------------------------
@@ -2191,14 +2457,28 @@ def run_binary_automl_model(
         automl, X_train, feature_importance, X_test, y_test, seed, task="classification")
 
     # -----------------------------
-    # SHAP plot
+    # SHAP plot & interpretability (marginal effect) plots
     # -----------------------------
+    shap_data = None
     shap_values = None
+    if plot_shap or n_interpretability_features > 0:
+        shap_data = _compute_shap_values(automl, X_test, task="classification", seed=seed)
+
     if plot_shap:
         shap_values = plot_shap_interpretation(
-            automl, X_test, task="classification", seed=seed
+            automl, X_test, task="classification", seed=seed, shap_data=shap_data
         )
-    
+
+    top_interpretability_features = None
+    if n_interpretability_features > 0:
+        top_interpretability_features = plot_marginal_effects(
+            automl, X_test, y_test, year_test,
+            shap_data=shap_data,
+            n_features=n_interpretability_features,
+            task="classification",
+            seed=seed,
+        )
+
     # -----------------------------
     # Build summary DataFrame (one-row, ready to concatenate)
     # -----------------------------
@@ -2218,6 +2498,17 @@ def run_binary_automl_model(
     )
 
     display(summary_df)
+
+    return {
+        "automl": automl,
+        "metrics": metrics,
+        "threshold": best_threshold,
+        "importance_permutation": importance_df_permutation,
+        "importance_builtin": importance_df_builtin,
+        "shap_values": shap_values,
+        "top_interpretability_features": top_interpretability_features,
+        "summary": summary_df,
+    }
 
 # ===============================================================
 # Generic multiclass classification pipeline using FLAML
