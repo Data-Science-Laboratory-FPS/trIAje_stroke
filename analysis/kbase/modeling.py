@@ -902,6 +902,25 @@ def set_fb_threshold(y_train, y_train_prob, optimize_beta):
     
     return best_threshold
 
+def metrics_at_threshold(y_true, y_prob, threshold):
+    """Returns binary classification metrics for a given decision threshold."""
+    y_pred = (np.asarray(y_prob) >= threshold).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) else np.nan
+    specificity = tn / (tn + fp) if (tn + fp) else np.nan
+    fpr = 1.0 - specificity
+    youden_j = (sensitivity + specificity - 1.0
+                if not (np.isnan(sensitivity) or np.isnan(specificity))
+                else np.nan)
+    return {
+        "tn": int(tn), "fp": int(fp), "fn": int(fn), "tp": int(tp),
+        "sensitivity": sensitivity,
+        "specificity": specificity,
+        "fpr": fpr,
+        "youden_j": youden_j,
+    }
+
+
 def compute_youden_threshold(
     y_train,
     y_train_prob,
@@ -910,7 +929,8 @@ def compute_youden_threshold(
     sensitivity_range: Optional[tuple] = (0.80, 0.90),
 ):
     """
-    Finds the optimal decision threshold by maximising the Youden index J = Se + Sp - 1.
+    Finds the optimal decision threshold by maximising the Youden index J = Se + Sp - 1
+    within a target sensitivity range on TRAIN.
 
     Geometrically, J is the maximum vertical distance between the ROC curve and
     the no-discrimination diagonal. The threshold that maximises J provides the
@@ -921,15 +941,15 @@ def compute_youden_threshold(
     higher sensitivity by clinical imperative.
 
     Optimisation is performed on TRAIN to avoid threshold over-fitting on TEST.
-    The ROC curve plotted uses TEST for an unbiased visual assessment.
+    The ROC plot shows the TEST curve with the selected threshold evaluated on TEST.
 
     Parameters
     ----------
     y_train, y_train_prob : train labels and predicted probabilities
     y_test,  y_test_prob  : test labels and predicted probabilities
     sensitivity_range : tuple of float or None
-        If provided, restricts the search to ROC points whose sensitivity falls
-        within [se_min, se_max] (values in [0, 1], e.g. (0.70, 0.90)).
+        If provided, restricts the search to TRAIN ROC points whose sensitivity
+        falls within [se_min, se_max] (values in [0, 1], e.g. (0.70, 0.90)).
         Within that band, the point that maximises J is selected.
         If no ROC point falls in the range, falls back to the global Youden optimum
         with a warning.
@@ -937,15 +957,19 @@ def compute_youden_threshold(
     Returns
     -------
     float
-        Optimal threshold (maximises J on train set, optionally within sensitivity_range).
+        Optimal threshold (maximises Youden J on TRAIN, optionally within
+        sensitivity_range).
     """
     print("\n--- Optimising decision threshold (Youden Index) ---")
 
-    # Compute ROC on TRAIN — threshold selection must not touch TEST
-    fpr_train, tpr_train, thresholds_train = roc_curve(y_train, y_train_prob)
+    # Compute ROC on TRAIN — threshold selection must not touch TEST.
+    # drop_intermediate=False keeps every threshold so no operating point is skipped.
+    fpr_train, tpr_train, thresholds_train = roc_curve(
+        y_train, y_train_prob, drop_intermediate=False
+    )
 
     # J = Se + Sp - 1  ≡  tpr - fpr
-    youden_j = tpr_train - fpr_train
+    youden_j_train = tpr_train - fpr_train
 
     if sensitivity_range is not None:
         se_min, se_max = sensitivity_range
@@ -953,58 +977,70 @@ def compute_youden_threshold(
         mask = (tpr_train >= se_min) & (tpr_train <= se_max)
         if mask.any():
             candidates = np.where(mask)[0]
-            best_idx = int(candidates[np.argmax(youden_j[candidates])])
+            best_idx = int(candidates[np.argmax(youden_j_train[candidates])])
         else:
-            print(f"  WARNING: no ROC point found in sensitivity range "
+            print(f"  WARNING: no TRAIN ROC point found in sensitivity range "
                   f"[{se_min:.2%}, {se_max:.2%}]. Falling back to global Youden optimum.")
-            best_idx = int(np.argmax(youden_j))
+            best_idx = int(np.argmax(youden_j_train))
     else:
-        best_idx = int(np.argmax(youden_j))
+        best_idx = int(np.argmax(youden_j_train))
 
-    best_thr  = float(thresholds_train[best_idx])
-    best_j    = float(youden_j[best_idx])
-    best_se   = float(tpr_train[best_idx])
-    best_sp   = float(1.0 - fpr_train[best_idx])
+    best_thr = float(thresholds_train[best_idx])
 
-    print(f"  Optimal threshold : {best_thr:.4f}")
-    print(f"  Youden J          : {best_j:.4f}")
-    print(f"  Sensitivity (Se)  : {best_se:.4f}")
-    print(f"  Specificity (Sp)  : {best_sp:.4f}")
+    # Evaluate the selected threshold on TRAIN and TEST
+    m_train = metrics_at_threshold(y_train, y_train_prob, best_thr)
+    m_test  = metrics_at_threshold(y_test,  y_test_prob,  best_thr)
 
-    # --- ROC plot on TEST with Youden point (from train optimisation) ---
-    fpr_test, tpr_test, _ = roc_curve(y_test, y_test_prob)
+    print(f"  Threshold selected on TRAIN : {best_thr:.4f}")
+    print(f"  TRAIN metrics at threshold  : "
+          f"Se = {m_train['sensitivity']:.4f}  "
+          f"Sp = {m_train['specificity']:.4f}  "
+          f"J  = {m_train['youden_j']:.4f}")
+    print(f"  TEST  metrics at threshold  : "
+          f"Se = {m_test['sensitivity']:.4f}  "
+          f"Sp = {m_test['specificity']:.4f}  "
+          f"J  = {m_test['youden_j']:.4f}")
+
+    # --- ROC plot on TEST; operating point evaluated on TEST ---
+    fpr_test_curve, tpr_test_curve, _ = roc_curve(y_test, y_test_prob)
     auc_test = roc_auc_score(y_test, y_test_prob)
+
+    test_fpr = m_test["fpr"]
+    test_se  = m_test["sensitivity"]
+    test_sp  = m_test["specificity"]
+    test_j   = m_test["youden_j"]
 
     fig, ax = plt.subplots(figsize=(7, 6))
 
-    ax.plot(fpr_test, tpr_test, color='steelblue', lw=2,
+    ax.plot(fpr_test_curve, tpr_test_curve, color='steelblue', lw=2,
             label=f'ROC curve — test  (AUC = {auc_test:.3f})')
     ax.plot([0, 1], [0, 1], 'k--', lw=1, label='No discrimination')
 
-    # Sensitivity range band
+    # Target sensitivity range (for visual reference in TEST space)
     if sensitivity_range is not None:
-        se_min, se_max = sensitivity_range
         ax.axhspan(se_min, se_max, color='gold', alpha=0.15,
-                   label=f'Sensitivity range [{se_min:.0%}, {se_max:.0%}]')
+                   label=f'Target Se range [{se_min:.0%}, {se_max:.0%}]')
 
-    # Youden point
-    ax.scatter(1.0 - best_sp, best_se, color='crimson', zorder=5, s=120,
-               label=(f'Selected point  J = {best_j:.3f}\n'
-                      f'Se = {best_se:.3f}   Sp = {best_sp:.3f}\n'
-                      f'Threshold = {best_thr:.4f}'))
+    # Selected threshold evaluated on TEST
+    ax.scatter(test_fpr, test_se, color='crimson', zorder=5, s=120,
+               label=(f'Threshold = {best_thr:.4f}  (selected on TRAIN)\n'
+                      f'J$_{{test}}$ = {test_j:.3f}   '
+                      f'Se$_{{test}}$ = {test_se:.3f}   '
+                      f'Sp$_{{test}}$ = {test_sp:.3f}'))
 
-    # Vertical segment from diagonal to selected point (visual magnitude of J)
-    ax.vlines(x=1.0 - best_sp,
-              ymin=1.0 - best_sp, ymax=best_se,
+    # Vertical segment from the diagonal (y = FPR_test) to the operating point:
+    # length equals J_test, the Youden index evaluated on TEST
+    ax.vlines(x=test_fpr,
+              ymin=test_fpr, ymax=test_se,
               colors='crimson', linestyles='dashed', lw=1.5, alpha=0.7,
-              label=f'J = {best_j:.3f}  (vertical distance to diagonal)')
+              label=f'J$_{{test}}$ = {test_j:.3f}  (vertical distance to diagonal)')
 
     ax.set_xlabel('1 − Specificity  (FPR)', fontsize=11)
     ax.set_ylabel('Sensitivity  (TPR)', fontsize=11)
-    title = 'ROC Curve — Youden Index Threshold'
+    title = 'ROC Curve — Youden Index Threshold\n(selected on TRAIN, operating point evaluated on TEST)'
     if sensitivity_range is not None:
-        title += f'  (Se range [{se_min:.0%}, {se_max:.0%}])'
-    ax.set_title(title, fontsize=13)
+        title += f'\nTarget Se range [{se_min:.0%}, {se_max:.0%}]'
+    ax.set_title(title, fontsize=11)
     ax.legend(loc='lower right', fontsize=9)
     ax.set_xlim([0.0, 1.0])
     ax.set_ylim([0.0, 1.02])
