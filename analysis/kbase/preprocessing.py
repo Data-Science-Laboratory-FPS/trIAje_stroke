@@ -218,6 +218,8 @@ dtype_cols = {
     "icd3": "object",
     "icd_emerg_combined": "object",
     "has_icd_emerg": "int8",
+    "icd_codes_bps": "object",
+    "has_icd_bps": "int8",
     "resolution_code_id": "object",
     "demand_resolution_code_id": "category",
     "assistance_resolution_code_id": "category",
