@@ -102,9 +102,7 @@ def evaluate_diagnostic_performance(
             if reference_df is not None:
                 count_source = reference_df
             else:
-                count_source = pq.read_table(
-                    os.path.join(settings.source_tables_path, settings.stroke_table_cleaned_path)
-                ).to_pandas()
+                count_source = df
             count_labels = count_source[present_cols].idxmax(axis=1).map(age_group_cols)
             counts = count_labels.value_counts()
             age_group_order = [age_group_cols[c] for c in present_cols]
@@ -418,6 +416,7 @@ def evaluate_diagnostic_performance(
         "Accuracy (%)", "Recall (%)", "Precision (%)", "Specificity (%)",
         "F1-Score (%)", "F2-Score (%)", "Overtriage (%)", "Undertriage (%)"
     ]
+    metric_y_axis_max = 100
 
     # 2 rows, 4 columns = 8 slots
     fig, axes = plt.subplots(2, 4, figsize=(24, 12))
@@ -482,7 +481,7 @@ def evaluate_diagnostic_performance(
             )
 
         axes[i].set_title(f"{metric}", fontweight='bold', fontsize=20)
-        axes[i].set_ylim(0, 120)
+        axes[i].set_ylim(0, metric_y_axis_max)
         axes[i].set_xlabel("")
         axes[i].set_ylabel("Value (%)", fontsize=15)
         axes[i].tick_params(axis='both', labelsize=14)
@@ -570,7 +569,7 @@ def evaluate_diagnostic_performance(
         ax2.set_title(title, fontweight='bold', fontsize=20)
         ax2.set_xlabel("")
         ax2.set_ylabel("Value (%)", fontsize=15)
-        ax2.set_ylim(0, 120)
+        ax2.set_ylim(0, metric_y_axis_max)
         ax2.tick_params(axis='both', labelsize=14)
         plt.setp(ax2.get_xticklabels(), rotation=0, ha='center')
 
@@ -589,9 +588,11 @@ def analyze_emergency_performance(demand_type, y_real_col, y_pred_col, sex_group
     High-level function to load data and call evaluation.
     This function no longer returns specific objects to avoid redundant printing.
     """
-    # Load data
+    # Load the complete preprocessed triage table and filter by demand below.
+    # Demand-specific exports may already be target-filtered, which would
+    # undercount outcomes such as p1_real_emerg_bps.
     df = pq.read_table(
-        os.path.join(settings.source_tables_path, settings.stroke_table_cleaned_path)
+        os.path.join(settings.source_tables_path, settings.triaje_table_cleaned_path)
     ).to_pandas()
 
     # Mapping and filtering
@@ -608,6 +609,7 @@ def analyze_emergency_performance(demand_type, y_real_col, y_pred_col, sex_group
         return
 
     df = df[df['demand_type_1'].isin(target_codes)]
+    reference_df = df.copy()
     # Filter by valid values in target_column
     df = df.dropna(subset=[y_real_col])
 
@@ -622,7 +624,12 @@ def analyze_emergency_performance(demand_type, y_real_col, y_pred_col, sex_group
     df[y_real_col] = df[y_real_col].astype('int8')
 
     # Execute evaluation and plotting
-    evaluate_diagnostic_performance(df, y_real_col, y_pred_col, sex_group, age_group)
+    evaluate_diagnostic_performance(
+        df, y_real_col, y_pred_col,
+        sex_group=sex_group,
+        age_group=age_group,
+        reference_df=reference_df,
+    )
 
 # Example usage in a cell:
 # analyze_emergency_performance("Non-traumatic Chest Pain")
