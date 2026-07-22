@@ -12,8 +12,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     roc_auc_score, f1_score, fbeta_score,
     precision_score, recall_score, accuracy_score, confusion_matrix,
-    classification_report, average_precision_score, 
-    log_loss, precision_recall_curve, roc_curve
+    classification_report, average_precision_score,
+    log_loss, precision_recall_curve, roc_curve, brier_score_loss
 )
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.inspection import permutation_importance
@@ -37,6 +37,13 @@ _FIGURES_DIR_MAP = {
     54: 'figures/04_stroke',
     'cardiac_arrest': 'figures/01_cardiac_arrest',
 }
+
+_OUTCOME_COLUMNS = [
+    "p1_assigned",
+    "p1_real_emerg",
+    "p1_real_bps",
+    "p1_real_emerg_bps",
+]
 
 # Set by run_*_automl_model at the start of each pipeline run.
 # All internal plot functions read from here via save_figure().
@@ -306,7 +313,7 @@ def triage_print(triage_value, cohort_name, demand_code):
         raise ValueError("triage_value must be None, 0, or 1")
 
 def data_load_col_selection(target_column, triage_value,
-                            include_lr, include_history, include_com,
+                            include_lr, include_hist,
                             include_medication, include_embeddings)-> pd.DataFrame:
     """Loads data and performs initial feature selection based on settings"""
     # Load preprocessed cleaned table
@@ -355,13 +362,15 @@ def data_load_col_selection(target_column, triage_value,
         "demand_date",
         "demand_type_1",
         "has_icd_emerg",
-        "p1_assigned",
+        "has_icd_bps",
         "triage",
         "year",
         "has_history",
         "has_med",
-        "has_com"
+        "literal_reason", 
+        "hcdm_id"
     ]
+    base_cols += _OUTCOME_COLUMNS
 
     # Initialize modelling columns with base columns
     modelling_cols = base_cols.copy()
@@ -376,23 +385,22 @@ def data_load_col_selection(target_column, triage_value,
     # Add literal reason columns (One-Hot Encoded columns)
     if include_lr == True:
         modelling_cols += [col for col in df.columns if col.startswith('lr_')]
-    # Add past history columns (One-Hot Encoded columns)
-    if include_history == True:
-        modelling_cols += [col for col in df.columns if col.startswith('hist_')]
     # Add medication columns (One-Hot Encoded columns)
     if include_medication == True:
         modelling_cols += [col for col in df.columns if col.startswith('atc_')]
-    # Add comorbidity / active problem columns (One-Hot Encoded columns)
-    if include_com == True:
-        modelling_cols += [col for col in df.columns if col.startswith('com_')]
+    # Add past history and active problem columns
+    # sourced from antecedentes-problemas-motivoliteral (one-hot encoded columns)
+    if include_hist == True:
+        modelling_cols += [col for col in df.columns if col.startswith('hist_')]
     # Include NLP text embeddings if flag is set to True
     if include_embeddings:
         embedding_cols = [col for col in df.columns if col.startswith('emb_')]
         modelling_cols += embedding_cols
         print(f"Feature Set: Including {len(embedding_cols)} text embedding dimensions.")
             
-    # Select base columns for modeling
-    selected_cols = [c for c in modelling_cols if c in df.columns]
+    # Select base columns for modeling, preserving order while preventing
+    # duplicate labels from repeated feature-family inclusion.
+    selected_cols = list(dict.fromkeys(c for c in modelling_cols if c in df.columns))
     df_model = df[selected_cols].copy()
     # Transform data types
     df_model = dp.transform_column_dtypes(df_model)
@@ -439,11 +447,11 @@ def data_filtering(df, target_column, demand_code,
     )
 
     # Group all atc_ columns together (including the grouped categories created
-    # above, which pandas appends at the end) and all com_ columns together
+    # above, which pandas appends at the end) and all hist_ columns together
     atc_cols = [c for c in df.columns if c.startswith('atc_')]
-    com_cols = [c for c in df.columns if c.startswith('com_')]
-    other_cols = [c for c in df.columns if c not in atc_cols and c not in com_cols]
-    df = df[other_cols + atc_cols + com_cols]
+    hist_cols = [c for c in df.columns if c.startswith('hist_')]
+    other_cols = [c for c in df.columns if c not in atc_cols and c not in hist_cols]
+    df = df[other_cols + atc_cols + hist_cols]
 
     # Filter by triage patients
     if triage_value is not None:
@@ -506,19 +514,21 @@ def data_filtering(df, target_column, demand_code,
         if export_path is None:
             raise ValueError(f"Unknown export path: {rule_key}")
         
-        df.to_parquet(
-            os.path.join(settings.source_tables_path, export_path),
-            index=False
-        )
+        full_export_path = os.path.join(settings.source_tables_path, export_path)
+        if not df.columns.is_unique:
+            duplicated_cols = df.columns[df.columns.duplicated()].unique().tolist()
+            raise ValueError(f"Duplicate columns before export: {duplicated_cols}")
+
+        df.to_parquet(full_export_path, index=False)
 
         # Check if the export file was created correctly
-        if os.path.exists(export_path):
-            file_size_mb = os.path.getsize(export_path) / (1024 * 1024)
+        if os.path.exists(full_export_path):
+            file_size_mb = os.path.getsize(full_export_path) / (1024 * 1024)
             print(f"✅ Export successful!")
-            print(f"--- Path: {export_path}")
+            print(f"--- Path: {full_export_path}")
             print(f"--- Size: {file_size_mb:.2f} MB")
         else:
-            print(f"❌ Export failed: File not found at {export_path}")
+            print(f"❌ Export failed: File not found at {full_export_path}")
 
     # Drop columns after cohort filtering and data export
     # for preparation to modeling.
@@ -529,10 +539,11 @@ def data_filtering(df, target_column, demand_code,
         c for c in df.columns
         if c.startswith('age_') and c.split('_')[1].isdigit()
     ]
+    non_target_outcomes = [c for c in _OUTCOME_COLUMNS if c != target_column]
     cols_to_drop = ["demandpk", "demand_date", "demand_type_1",
-                    "has_history", "has_med", "has_icd_emerg", "has_com",
-                    "p1_assigned",
-                    "triage", "literal_reason", "hcdm_id"] + age_group_cols
+                    "has_history", "has_med",
+                    "has_icd_emerg", "has_icd_bps",
+                    "triage", "literal_reason", "hcdm_id"] + non_target_outcomes + age_group_cols
     cols_to_drop = [c for c in cols_to_drop if c in df.columns]
     if cols_to_drop:
         df = df.drop(columns=cols_to_drop)
@@ -553,16 +564,15 @@ def print_feature_summary(X_train):
     triage_cols  = [c for c in X_train.columns if c[0].isdigit()]
     lr_cols      = [c for c in X_train.columns if c.startswith("lr_")]
     hist_cols    = [c for c in X_train.columns if c.startswith("hist_")]
-    com_cols     = [c for c in X_train.columns if c.startswith("com_")]
     atc_cols     = [c for c in X_train.columns if c.startswith("atc")]
-    other_cols   = [c for c in X_train.columns if c not in triage_cols + lr_cols + hist_cols + com_cols + atc_cols]
+    other_cols   = [c for c in X_train.columns if c not in triage_cols + lr_cols + hist_cols + atc_cols]
 
     print("\n" + "="*40)
     print("FEATURE SUMMARY BY GROUP")
     print("="*40)
     print(f"  Triage questions  (digit prefix): {len(triage_cols):>4}")
     print(f"  Literal reason    (lr_):           {len(lr_cols):>4}")
-    print(f"  Comorbidities     (com_):          {len(com_cols):>4}")
+    print(f"  Clinical history  (hist_):          {len(hist_cols):>4}")
     print(f"  Medication        (atc):           {len(atc_cols):>4}")
     print(f"  Other:                             {len(other_cols):>4}")
     print(f"  {'-'*30}")
@@ -743,6 +753,16 @@ def export_final_model_cv_fold_metrics(
     if estimator is None:
         print("No final estimator available; skipping CV fold metrics export.")
         return pd.DataFrame()
+
+    # FLAML normally converts categorical columns to numeric codes internally
+    # before fitting the underlying estimator. Cloning and fitting the raw
+    # estimator directly here bypasses that step, so categorical columns
+    # (e.g. "sex") must be converted ourselves — otherwise XGBoost raises
+    # ValueError on category dtype columns (requires enable_categorical=True).
+    X = X.copy()
+    cat_cols = X.select_dtypes(include="category").columns
+    for col in cat_cols:
+        X[col] = X[col].cat.codes.astype("int32")
 
     cv_strata = _make_outcome_year_strata(y, year)
     cv_splitter = OutcomeYearStratifiedKFold(
@@ -1244,6 +1264,52 @@ def optimize_clinical_threshold(
 
     return clinical_threshold
 
+def _fit_calibration_logreg(y, p, eps=1e-6, max_iter=100, tol=1e-10):
+    """
+    Cox calibration regression: fits y ~ logit(p) by unregularized logistic
+    regression (Newton-Raphson / IRLS) and returns the calibration intercept
+    (calibration-in-the-large, ideal=0) and slope (ideal=1), each with a 95%
+    Wald CI derived from the observed Fisher information at convergence.
+
+    Implemented manually (no statsmodels dependency) since this only needs a
+    2-parameter (intercept + slope) unregularized logistic fit.
+    """
+    p_clipped = np.clip(np.asarray(p, dtype=float), eps, 1 - eps)
+    logit_p = np.log(p_clipped / (1 - p_clipped))
+    X = np.column_stack([np.ones_like(logit_p), logit_p])
+    y = np.asarray(y, dtype=float)
+
+    beta = np.zeros(2)
+    for _ in range(max_iter):
+        mu = 1.0 / (1.0 + np.exp(-(X @ beta)))
+        w = np.clip(mu * (1 - mu), 1e-12, None)
+        xtwx = X.T @ (X * w[:, None])
+        grad = X.T @ (y - mu)
+        try:
+            delta = np.linalg.solve(xtwx, grad)
+        except np.linalg.LinAlgError:
+            delta = np.linalg.lstsq(xtwx, grad, rcond=None)[0]
+        beta = beta + delta
+        if np.max(np.abs(delta)) < tol:
+            break
+
+    mu = 1.0 / (1.0 + np.exp(-(X @ beta)))
+    w = np.clip(mu * (1 - mu), 1e-12, None)
+    cov = np.linalg.inv(X.T @ (X * w[:, None]))
+    se = np.sqrt(np.diag(cov))
+
+    z = 1.959963984540054  # 97.5th percentile of N(0, 1)
+    intercept, slope = beta
+    se_intercept, se_slope = se
+    return {
+        "intercept": intercept,
+        "intercept_ci_lo": intercept - z * se_intercept,
+        "intercept_ci_hi": intercept + z * se_intercept,
+        "slope": slope,
+        "slope_ci_lo": slope - z * se_slope,
+        "slope_ci_hi": slope + z * se_slope,
+    }
+
 def plot_calibration(
     y_train, y_train_prob,
     y_test,  y_test_prob,
@@ -1299,12 +1365,63 @@ def plot_calibration(
     ax2.set_title('Calibration curve\n(are predicted probabilities reliable?)')
     ax2.set_xlabel('Mean predicted probability')
     ax2.set_ylabel('Fraction of positives')
-    ax2.legend(fontsize=8)
+    ax2.legend(fontsize=8, loc='upper left')
     ax2.grid(alpha=0.3)
+
+    # --- Quantitative calibration metrics: Brier score + Cox calibration ---
+    # regression (intercept = calibration-in-the-large, ideal 0; slope =
+    # calibration slope, ideal 1), fit on logit(predicted probability).
+    brier_train = brier_score_loss(y_train, y_train_prob)
+    brier_test = brier_score_loss(y_test, y_test_prob)
+    calib_train = _fit_calibration_logreg(y_train, y_train_prob)
+    calib_test = _fit_calibration_logreg(y_test, y_test_prob)
+
+    ax2.annotate(
+        f"Test set (N={len(y_test)})\n"
+        f"Brier = {brier_test:.4f}\n"
+        f"Intercept = {calib_test['intercept']:.3f} "
+        f"[{calib_test['intercept_ci_lo']:.3f}, {calib_test['intercept_ci_hi']:.3f}]\n"
+        f"Slope = {calib_test['slope']:.3f} "
+        f"[{calib_test['slope_ci_lo']:.3f}, {calib_test['slope_ci_hi']:.3f}]",
+        xy=(0.95, 0.95), xycoords='axes fraction', ha='right', va='top', fontsize=8,
+        bbox=dict(boxstyle='round', fc='white', ec='gray', alpha=0.9),
+    )
 
     plt.tight_layout()
     save_figure(fig, 'calibration_curve.png')
     plt.show()
+
+    overestimation = calib_test['slope'] < 1 and calib_test['intercept'] < 0
+    print("\n=== CALIBRATION METRICS (logit-scale Cox regression) ===")
+    print(f"Brier score  -> train: {brier_train:.4f}  |  test: {brier_test:.4f}  "
+          f"(diff = {brier_test - brier_train:+.4f}; higher test Brier suggests "
+          f"calibration overfit)")
+    print("-" * 60)
+    print(f"Test set (N={len(y_test)}):")
+    print(f"  Calibration intercept (calibration-in-the-large, ideal = 0): "
+          f"{calib_test['intercept']:.4f}  "
+          f"[95% CI {calib_test['intercept_ci_lo']:.4f}, {calib_test['intercept_ci_hi']:.4f}]")
+    print(f"  Calibration slope     (ideal = 1):                           "
+          f"{calib_test['slope']:.4f}  "
+          f"[95% CI {calib_test['slope_ci_lo']:.4f}, {calib_test['slope_ci_hi']:.4f}]")
+    print(f"Train set (N={len(y_train)}, reference for overfitting check):")
+    print(f"  Calibration intercept: {calib_train['intercept']:.4f}  "
+          f"[95% CI {calib_train['intercept_ci_lo']:.4f}, {calib_train['intercept_ci_hi']:.4f}]")
+    print(f"  Calibration slope:     {calib_train['slope']:.4f}  "
+          f"[95% CI {calib_train['slope_ci_lo']:.4f}, {calib_train['slope_ci_hi']:.4f}]")
+    print("-" * 60)
+    if overestimation:
+        print("Interpretation: test slope < 1 with intercept < 0 -> the model "
+              "systematically OVERESTIMATES P(P1) (predicted probabilities are "
+              "too extreme/high relative to observed frequencies), consistent "
+              "with the reliability curve falling below the diagonal.")
+    elif calib_test['slope'] < 1:
+        print("Interpretation: test slope < 1 -> predicted probabilities are "
+              "too extreme (overconfident) at the tails, but the intercept "
+              "does not indicate a clear systematic over/under-estimation.")
+    else:
+        print("Interpretation: slope >= 1 and/or intercept >= 0 -> no clear "
+              "systematic overestimation pattern detected on the test set.")
 
 
 # ===============================================================
@@ -1391,6 +1508,9 @@ def evaluate_sa_roc(y_true, y_prob, alpha_pos=0.85, alpha_neg=0.95):
         Fraction of the cohort that falls in the Gray Zone.
     gamma_area : float
         Gray Zone Area in ROC space (cost of indecision).
+    zone_stats : dict
+        Per-zone counts, P1/non-P1 breakdown, and achieved NPV (Rule-out) /
+        PPV (Rule-in) with 95% Clopper-Pearson CIs. See body for keys.
 
     Warns
     -----
@@ -1465,9 +1585,12 @@ def evaluate_sa_roc(y_true, y_prob, alpha_pos=0.85, alpha_neg=0.95):
     idx_gray = ~(idx_rule_out | idx_rule_in)
 
     n_total = len(y_true)
-    pct_rule_out = idx_rule_out.sum() / n_total
-    pct_rule_in = idx_rule_in.sum() / n_total
-    pct_gray = idx_gray.sum() / n_total
+    n_rule_out = int(idx_rule_out.sum())
+    n_rule_in = int(idx_rule_in.sum())
+    n_gray = int(idx_gray.sum())
+    pct_rule_out = n_rule_out / n_total
+    pct_rule_in = n_rule_in / n_total
+    pct_gray = n_gray / n_total
 
     # Gray Zone Area (gamma_area) in ROC space:
     #     gamma_area = FPR(tau_safe_neg) * (1 - TPR(tau_safe_pos))
@@ -1475,22 +1598,78 @@ def evaluate_sa_roc(y_true, y_prob, alpha_pos=0.85, alpha_neg=0.95):
     _, tpr_tau_pos = _sa_roc_fpr_tpr_at(y_true, y_prob, tau_safe_pos)
     gamma_area = fpr_tau_neg * (1 - tpr_tau_pos)
 
+    # Per-zone P1 (positive) vs non-P1 (negative) breakdown.
+    n_p1_rule_out = int((y_true[idx_rule_out] == 1).sum())
+    n_nonp1_rule_out = n_rule_out - n_p1_rule_out
+    n_p1_rule_in = int((y_true[idx_rule_in] == 1).sum())
+    n_nonp1_rule_in = n_rule_in - n_p1_rule_in
+    n_p1_gray = int((y_true[idx_gray] == 1).sum())
+    n_nonp1_gray = n_gray - n_p1_gray
+
+    # Achieved NPV (Rule-out) / PPV (Rule-in) with 95% Clopper-Pearson CIs.
+    from scipy.stats import beta as _beta
+
+    def _clopper_pearson(x, n, alpha=0.05):
+        if n == 0:
+            return (np.nan, np.nan)
+        lo = _beta.ppf(alpha / 2, x, n - x + 1) if x > 0 else 0.0
+        hi = _beta.ppf(1 - alpha / 2, x + 1, n - x) if x < n else 1.0
+        return lo, hi
+
+    npv_rule_out = n_nonp1_rule_out / n_rule_out if n_rule_out > 0 else np.nan
+    npv_ci = _clopper_pearson(n_nonp1_rule_out, n_rule_out)
+    ppv_rule_in = n_p1_rule_in / n_rule_in if n_rule_in > 0 else np.nan
+    ppv_ci = _clopper_pearson(n_p1_rule_in, n_rule_in)
+
+    npv_target_met = (not np.isnan(npv_rule_out)) and (npv_rule_out >= alpha_neg)
+    ppv_target_met = (not np.isnan(ppv_rule_in)) and (ppv_rule_in >= alpha_pos)
+
+    zone_stats = {
+        "n_total": n_total,
+        "rule_out": {
+            "n": n_rule_out, "pct": pct_rule_out,
+            "n_p1": n_p1_rule_out, "n_nonp1": n_nonp1_rule_out,
+            "npv": npv_rule_out, "npv_ci_lo": npv_ci[0], "npv_ci_hi": npv_ci[1],
+            "target_met": npv_target_met,
+        },
+        "gray": {
+            "n": n_gray, "pct": pct_gray,
+            "n_p1": n_p1_gray, "n_nonp1": n_nonp1_gray,
+        },
+        "rule_in": {
+            "n": n_rule_in, "pct": pct_rule_in,
+            "n_p1": n_p1_rule_in, "n_nonp1": n_nonp1_rule_in,
+            "ppv": ppv_rule_in, "ppv_ci_lo": ppv_ci[0], "ppv_ci_hi": ppv_ci[1],
+            "target_met": ppv_target_met,
+        },
+    }
+
     print("=== OPERATIONAL SAFETY REPORT (SA-ROC) ===")
     print(f"Clinical target -> desired PPV (Rule-in): {alpha_pos:.0%} | desired NPV (Rule-out): {alpha_neg:.0%}")
     print("-" * 60)
     print(f"[Rule-out Safe] (NPV >= {alpha_neg:.0%}) : P(positive) <  {tau_safe_neg:.4f} | covers {pct_rule_out:.1%} of cases")
+    print(f"    n = {n_rule_out:,} ({pct_rule_out:.1%} of N={n_total:,})  |  P1 = {n_p1_rule_out:,}  |  non-P1 = {n_nonp1_rule_out:,}")
+    print(f"    Achieved NPV = {npv_rule_out:.1%}  [95% CI {npv_ci[0]:.1%}-{npv_ci[1]:.1%}]  "
+          f"-> target {'MET' if npv_target_met else 'NOT MET'} (>= {alpha_neg:.0%})")
     print(f"[Rule-in Safe]  (PPV >= {alpha_pos:.0%}) : P(positive) >= {tau_safe_pos:.4f} | covers {pct_rule_in:.1%} of cases")
+    print(f"    n = {n_rule_in:,} ({pct_rule_in:.1%} of N={n_total:,})  |  P1 = {n_p1_rule_in:,}  |  non-P1 = {n_nonp1_rule_in:,}")
+    print(f"    Achieved PPV = {ppv_rule_in:.1%}  [95% CI {ppv_ci[0]:.1%}-{ppv_ci[1]:.1%}]  "
+          f"-> target {'MET' if ppv_target_met else 'NOT MET'} (>= {alpha_pos:.0%})")
     print(f"[GRAY ZONE]     (mandatory human review)          | covers {pct_gray:.1%} of cases")
+    print(f"    n = {n_gray:,} ({pct_gray:.1%} of N={n_total:,})  |  P1 = {n_p1_gray:,}  |  non-P1 = {n_nonp1_gray:,}")
     print("-" * 60)
     print(f"Gray Zone Area (Gamma_Area): {gamma_area:.4f} (model's cost of indecision)")
 
-    return tau_safe_pos, tau_safe_neg, pct_gray, gamma_area
+    return tau_safe_pos, tau_safe_neg, pct_gray, gamma_area, zone_stats
 
 
-def plot_sa_roc(y_test, y_test_prob, tau_safe_pos, tau_safe_neg):
+def plot_sa_roc(y_test, y_test_prob, tau_safe_pos, tau_safe_neg, zone_stats=None):
     """
     Plots the test-set predicted-probability distributions by class, overlaid
     with the Rule-out Safe / Gray / Rule-in Safe zones from SA-ROC.
+
+    If `zone_stats` (as returned by evaluate_sa_roc) is provided, each zone is
+    annotated with its N (%) and achieved NPV/PPV with 95% CI.
     """
     fig, ax = plt.subplots(figsize=(10, 6))
     ax.hist(y_test_prob[y_test == 0], bins=50, alpha=0.5, color='steelblue',
@@ -1509,6 +1688,34 @@ def plot_sa_roc(y_test, y_test_prob, tau_safe_pos, tau_safe_neg):
     # Mark the two safety thresholds.
     ax.axvline(tau_safe_neg, color='blue', linestyle='--', linewidth=2)
     ax.axvline(tau_safe_pos, color='red', linestyle='--', linewidth=2)
+
+    # Annotate each zone with its N (%) and achieved NPV/PPV [95% CI].
+    # Placed at mid-height so they don't overlap the top legend or the
+    # histogram peaks (which sit near the baseline).
+    if zone_stats is not None:
+        y_mid = ax.get_ylim()[1] * 0.5
+        ro, gr, ri = zone_stats["rule_out"], zone_stats["gray"], zone_stats["rule_in"]
+
+        ax.annotate(
+            f"n={ro['n']:,} ({ro['pct']:.1%})\n"
+            f"P1={ro['n_p1']:,} / non-P1={ro['n_nonp1']:,}\n"
+            f"NPV={ro['npv']:.1%} [{ro['npv_ci_lo']:.1%}-{ro['npv_ci_hi']:.1%}]",
+            xy=(tau_safe_neg / 2, y_mid), ha='center', va='center', fontsize=8.5,
+            color='navy', bbox=dict(boxstyle='round', fc='white', ec='blue', alpha=0.85),
+        )
+        ax.annotate(
+            f"n={gr['n']:,} ({gr['pct']:.1%})\n"
+            f"P1={gr['n_p1']:,} / non-P1={gr['n_nonp1']:,}",
+            xy=((tau_safe_neg + tau_safe_pos) / 2, y_mid), ha='center', va='center', fontsize=8.5,
+            color='dimgray', bbox=dict(boxstyle='round', fc='white', ec='gray', alpha=0.85),
+        )
+        ax.annotate(
+            f"n={ri['n']:,} ({ri['pct']:.1%})\n"
+            f"P1={ri['n_p1']:,} / non-P1={ri['n_nonp1']:,}\n"
+            f"PPV={ri['ppv']:.1%} [{ri['ppv_ci_lo']:.1%}-{ri['ppv_ci_hi']:.1%}]",
+            xy=((tau_safe_pos + 1) / 2, y_mid), ha='center', va='center', fontsize=8.5,
+            color='darkred', bbox=dict(boxstyle='round', fc='white', ec='red', alpha=0.85),
+        )
 
     ax.set_title('SA-ROC framework: triage zones and clinical flow')
     ax.set_xlabel('Predicted probability of positive class')
@@ -2619,8 +2826,7 @@ def run_binary_automl_model(
     demand_code: Optional[Union[int, List[int]]] = None,
     triage_value: Optional[int] = None,
     include_lr: bool = True,
-    include_history: bool = True,
-    include_com: bool = True,
+    include_hist: bool = True,
     include_medication: bool = True,
     include_embeddings: bool = False,
     export_table: bool = False, 
@@ -2710,7 +2916,7 @@ def run_binary_automl_model(
     # Data loading & column selection
     # -----------------------------
     df = data_load_col_selection(target_column, triage_value,
-                                 include_lr, include_history, include_com, include_medication, include_embeddings)
+                                 include_lr, include_hist, include_medication, include_embeddings)
 
     # -----------------------------
     # Basic validation
@@ -2783,10 +2989,10 @@ def run_binary_automl_model(
 
     # Operational safety zones (SA-ROC)
     if plot_sa_roc_curve:
-        tau_safe_pos, tau_safe_neg, pct_gray, gamma_area = evaluate_sa_roc(
+        tau_safe_pos, tau_safe_neg, pct_gray, gamma_area, zone_stats = evaluate_sa_roc(
             y_test, y_test_prob, alpha_pos=sa_roc_alpha_pos, alpha_neg=sa_roc_alpha_neg
         )
-        plot_sa_roc(y_test, y_test_prob, tau_safe_pos, tau_safe_neg)
+        plot_sa_roc(y_test, y_test_prob, tau_safe_pos, tau_safe_neg, zone_stats=zone_stats)
 
     # Train vs Test comparison — overfitting / underfitting diagnosis
     comparison_df = print_train_test_comparison(
