@@ -865,6 +865,7 @@ def export_final_model_cv_fold_metrics(
                 "roc_auc": _safe_metric(roc_auc_score, y_fold_valid, y_valid_score),
                 "pr_auc": _safe_metric(average_precision_score, y_fold_valid, y_valid_score),
                 "log_loss": _safe_metric(log_loss, y_fold_valid, y_valid_prob),
+                "brier": _safe_metric(brier_score_loss, y_fold_valid, y_valid_score),
                 "precision": precision,
                 "recall": recall,
                 "specificity": specificity,
@@ -918,6 +919,82 @@ def export_final_model_cv_fold_metrics(
     )
     print(cv_metrics_df.to_string(index=False))
     return cv_metrics_df
+
+
+def compute_oof_probabilities(
+    automl,
+    X_train,
+    y_train,
+    year_train,
+    n_splits_cv,
+    seed,
+):
+    """Computes out-of-fold positive-class probabilities on the training set."""
+    print("\n--- Computing out-of-fold probabilities for threshold selection ---")
+
+    final_model = getattr(automl, "model", None)
+    estimator = getattr(final_model, "estimator", final_model)
+    if estimator is None:
+        raise RuntimeError(
+            "No final estimator available; cannot compute out-of-fold probabilities."
+        )
+
+    # FLAML encodes categorical columns before fitting underlying estimators.
+    # Cloning the raw estimator bypasses that preprocessing, so replay it here.
+    X = X_train.copy()
+    cat_cols = X.select_dtypes(include="category").columns
+    for col in cat_cols:
+        X[col] = X[col].cat.codes.astype("int32")
+
+    cv_strata = _make_outcome_year_strata(y_train, year_train)
+    cv_splitter = OutcomeYearStratifiedKFold(
+        cv_strata,
+        n_splits=n_splits_cv,
+        random_state=seed,
+    )
+
+    def _take(data, indices):
+        if hasattr(data, "iloc"):
+            return data.iloc[indices]
+        return np.asarray(data)[indices]
+
+    y_array = np.asarray(y_train)
+    oof_prob = np.full(len(X), np.nan, dtype=float)
+
+    for fold_number, (train_idx, valid_idx) in enumerate(cv_splitter.split(X, y_train), start=1):
+        fold_estimator = clone(estimator)
+        X_fold_train = _take(X, train_idx)
+        y_fold_train = y_array[train_idx]
+        X_fold_valid = _take(X, valid_idx)
+
+        fold_sample_weight = compute_sample_weight(
+            class_weight="balanced",
+            y=y_fold_train,
+        )
+
+        try:
+            fold_estimator.fit(X_fold_train, y_fold_train, sample_weight=fold_sample_weight)
+        except TypeError:
+            fold_estimator.fit(X_fold_train, y_fold_train)
+
+        if not hasattr(fold_estimator, "predict_proba"):
+            raise RuntimeError(
+                f"Estimator '{type(fold_estimator).__name__}' has no predict_proba method."
+            )
+
+        oof_prob[valid_idx] = fold_estimator.predict_proba(X_fold_valid)[:, 1]
+        print(f"  Fold {fold_number}/{n_splits_cv}: {len(valid_idx):,} validation samples scored")
+
+    if np.isnan(oof_prob).any():
+        n_missing = int(np.isnan(oof_prob).sum())
+        raise RuntimeError(
+            f"{n_missing} training samples received no out-of-fold prediction; "
+            "check the cross-validation splitter."
+        )
+
+    print(f"Out-of-fold probabilities computed for {len(oof_prob):,} training samples.")
+    return oof_prob
+
 
 def set_fb_threshold(y_train, y_train_prob, optimize_beta):
     """Finds the optimal decision threshold based on F-beta score"""
@@ -2354,6 +2431,91 @@ def plot_feature_importances(automl, X_train, feature_importance,
 
     return importance_df_permutation, importance_df_builtin
 
+
+def report_effective_features(automl, X_train, top_k=15):
+    """Reports how many supplied features the final model effectively uses."""
+    print("\n--- Effective feature usage of the final model ---")
+
+    best_model = getattr(automl, "model", None)
+    estimator = getattr(best_model, "estimator", best_model)
+    if estimator is None:
+        print("No final estimator available; skipping effective feature report.")
+        return None
+
+    if hasattr(estimator, "feature_name_"):
+        feature_names = list(estimator.feature_name_)
+    elif hasattr(estimator, "feature_names_in_"):
+        feature_names = list(estimator.feature_names_in_)
+    elif getattr(automl, "feature_names_in_", None) is not None:
+        feature_names = list(automl.feature_names_in_)
+    else:
+        feature_names = list(X_train.columns)
+
+    if hasattr(estimator, "feature_importances_"):
+        importances = np.asarray(estimator.feature_importances_, dtype=float)
+        basis = "split-based importance (tree ensemble)"
+    elif hasattr(estimator, "coef_"):
+        coef = np.asarray(estimator.coef_, dtype=float)
+        importances = np.abs(coef).mean(axis=0) if coef.ndim > 1 else np.abs(coef.ravel())
+        basis = "absolute coefficient (linear model)"
+    else:
+        print(
+            f"Model type '{type(estimator).__name__}' exposes no importance "
+            "attribute; effective feature count not available."
+        )
+        return None
+
+    if len(importances) != len(feature_names):
+        print(
+            f"Warning: importance length ({len(importances)}) does not match "
+            f"feature count ({len(feature_names)}); skipping report."
+        )
+        return None
+
+    used_df = (
+        pd.DataFrame({"feature": feature_names, "importance": importances})
+        .loc[lambda d: d["importance"] > 0]
+        .sort_values("importance", ascending=False)
+        .reset_index(drop=True)
+    )
+
+    def _family(col):
+        if col and col[0].isdigit():
+            return "Triage questions"
+        for prefix, name in [
+            ("lr_", "Literal reason"),
+            ("hist_", "Clinical history (new)"),
+            ("com_", "Legacy history (old)"),
+            ("atc", "Medication"),
+            ("emb", "Text embeddings"),
+        ]:
+            if col.startswith(prefix):
+                return name
+        return "Other"
+
+    n_supplied = len(feature_names)
+    n_used = len(used_df)
+    supplied_by_family = pd.Series([_family(c) for c in feature_names]).value_counts()
+    used_by_family = used_df["feature"].map(_family).value_counts()
+
+    print(f"  Importance basis          : {basis}")
+    print(f"  Features supplied         : {X_train.shape[1]}")
+    print(f"  Features tracked          : {n_supplied}")
+    print(f"  Features used (non-zero)  : {n_used}  ({n_used / n_supplied:.1%})")
+    print(f"  Features never used       : {n_supplied - n_used}")
+    print("\n  Used / supplied by feature family:")
+    for family in supplied_by_family.index:
+        used_n = int(used_by_family.get(family, 0))
+        supplied_n = int(supplied_by_family[family])
+        print(f"    {family:<28} {used_n:>4} / {supplied_n:<4} ({used_n / supplied_n:.0%})")
+
+    print(f"\n  Top {min(top_k, n_used)} features by importance:")
+    for _, row in used_df.head(top_k).iterrows():
+        print(f"    {row['feature']:<30} {row['importance']:.4f}")
+
+    return used_df
+
+
 def _compute_shap_values(automl, X_test, task="classification", seed=42):
     """
     Computes SHAP values for the fitted estimator, aligning features to what
@@ -2850,6 +3012,7 @@ def run_binary_automl_model(
     optimize_metric: Optional[str] = None,
     n_splits_cv: int = 5,
     optimize_beta: int = 1,
+    train_threshold: str = "oof",
     use_clinical_threshold: bool = False,
     use_youden: bool = False,
     max_undertriage: float = 0.10,
@@ -2861,7 +3024,7 @@ def run_binary_automl_model(
     plot_sa_roc_curve: bool = True,
     sa_roc_alpha_pos: float = 0.60,
     sa_roc_alpha_neg: float = 0.90,
-    export_cv_fold_metrics: bool = True,
+    export_cv_fold_metrics: bool = True
 ) -> dict:
 
     
@@ -2901,12 +3064,22 @@ def run_binary_automl_model(
         If False, use built-in feature importance from the model (faster).
     export_cv_fold_metrics : bool
         Whether to replay CV for the final selected model and export fold metrics.
+    train_threshold : str
+        Training probabilities used to select the decision threshold.
+        Use "oof" for out-of-fold probabilities, or "in-sample" for
+        resubstitution probabilities from the final model refitted on all train.
 
     Returns
     -------
     dict
         Dictionary with model, metrics, threshold and feature importance.
     """
+    valid_train_thresholds = {"oof", "in-sample"}
+    if train_threshold not in valid_train_thresholds:
+        raise ValueError(
+            "train_threshold must be one of "
+            f"{sorted(valid_train_thresholds)}; got {train_threshold!r}."
+        )
 
     # Register the active demand_code and time_budget so save_figure() knows which folder/suffix to use
     global _current_demand_code, _current_time_budget
@@ -2939,6 +3112,7 @@ def run_binary_automl_model(
     # -----------------------------
     df_filtered = data_filtering(df, target_column, demand_code, triage_value, min_age,
                         years, export_table, protocol_features=protocol_questions)
+    subgroup_reference_df = df.loc[df_filtered.index].copy()
 
     # -----------------------------
     # Train / test split
@@ -2955,24 +3129,52 @@ def run_binary_automl_model(
     # -----------------------------
     # Threshold optimization (decision threshold)
     # -----------------------------
+    # In-sample probabilities are retained for calibration and diagnostic plots.
     y_train_prob = automl.predict_proba(X_train)[:, 1]
     y_test_prob = automl.predict_proba(X_test)[:, 1]
     print_selected_model_hyperparameters(automl)
+
+    if train_threshold == "oof":
+        y_train_threshold_prob = compute_oof_probabilities(
+            automl,
+            X_train,
+            y_train,
+            year_train,
+            n_splits_cv,
+            seed,
+        )
+        threshold_basis = "out-of-fold"
+    else:
+        y_train_threshold_prob = y_train_prob
+        threshold_basis = "in-sample (resubstitution)"
+
+    print(f"\nDecision threshold selected on {threshold_basis} training probabilities.")
     
     if use_clinical_threshold:
         best_threshold = optimize_clinical_threshold(
-            y_train, y_train_prob,
+            y_train, y_train_threshold_prob,
             y_test,  y_test_prob,
             max_undertriage=max_undertriage,
             max_overtriage=max_overtriage,
         )
     elif use_youden:
         best_threshold = compute_youden_threshold(
-            y_train, y_train_prob,
+            y_train, y_train_threshold_prob,
             y_test,  y_test_prob,
         )
     else:
-        best_threshold = set_fb_threshold(y_train, y_train_prob, optimize_beta)
+        best_threshold = set_fb_threshold(y_train, y_train_threshold_prob, optimize_beta)
+
+    if train_threshold == "oof":
+        m_insample = metrics_at_threshold(y_train, y_train_prob, best_threshold)
+        m_oof = metrics_at_threshold(y_train, y_train_threshold_prob, best_threshold)
+        print("\n--- Threshold behaviour on training data ---")
+        print(f"  In-sample   : Se = {m_insample['sensitivity']:.4f}  Sp = {m_insample['specificity']:.4f}")
+        print(f"  Out-of-fold : Se = {m_oof['sensitivity']:.4f}  Sp = {m_oof['specificity']:.4f}")
+        print(
+            "  Sensitivity optimism (in-sample - OOF): "
+            f"{(m_insample['sensitivity'] - m_oof['sensitivity']) * 100:+.2f}pp"
+        )
 
     cv_fold_metrics = (
         export_final_model_cv_fold_metrics(
@@ -3024,6 +3226,7 @@ def run_binary_automl_model(
         plot_df, 'target_real', 'target_pred',
         sex_group=False,
         figures_dir=_get_figures_dir(demand_code),
+        reference_df=subgroup_reference_df,
         export_tables=True,
     )
     # Fairness analysis by sex
@@ -3031,6 +3234,7 @@ def run_binary_automl_model(
         plot_df, 'target_real', 'target_pred',
         sex_group=True,
         figures_dir=_get_figures_dir(demand_code),
+        reference_df=subgroup_reference_df,
         export_tables=True,
     )
     # Fairness analysis by age groups
@@ -3038,6 +3242,7 @@ def run_binary_automl_model(
         plot_df, 'target_real', 'target_pred',
         age_group=True,
         figures_dir=_get_figures_dir(demand_code),
+        reference_df=subgroup_reference_df,
         export_tables=True,
     )
 
@@ -3046,6 +3251,7 @@ def run_binary_automl_model(
     # -----------------------------
     importance_df_permutation, importance_df_builtin = plot_feature_importances(
         automl, X_train, feature_importance, X_test, y_test, seed, task="classification")
+    effective_features_df = report_effective_features(automl, X_train)
 
     # -----------------------------
     # SHAP plot & interpretability (marginal effect) plots
@@ -3082,6 +3288,7 @@ def run_binary_automl_model(
             optimize_metric=optimize_metric,
             optimize_beta=optimize_beta,
             threshold=best_threshold,
+            train_threshold=train_threshold,
             n_samples=len(df_filtered),
             n_train=len(X_train),
             n_test=len(X_test),
@@ -3096,6 +3303,7 @@ def run_binary_automl_model(
         "threshold": best_threshold,
         "importance_permutation": importance_df_permutation,
         "importance_builtin": importance_df_builtin,
+        "effective_features": effective_features_df,
         "shap_values": shap_values,
         "top_interpretability_features": top_interpretability_features,
         "cv_fold_metrics": cv_fold_metrics,
