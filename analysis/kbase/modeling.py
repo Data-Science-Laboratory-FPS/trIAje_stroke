@@ -313,7 +313,7 @@ def triage_print(triage_value, cohort_name, demand_code):
         raise ValueError("triage_value must be None, 0, or 1")
 
 def data_load_col_selection(target_column, triage_value,
-                            include_lr, include_hist,
+                            include_lr, include_hist, include_com,
                             include_medication, include_embeddings)-> pd.DataFrame:
     """Loads data and performs initial feature selection based on settings"""
     # Load preprocessed cleaned table
@@ -366,6 +366,9 @@ def data_load_col_selection(target_column, triage_value,
         "triage",
         "year",
         "has_history",
+        "has_history_old",
+        "has_problems_old",
+        "has_com",
         "has_med",
         "literal_reason", 
         "hcdm_id"
@@ -392,6 +395,10 @@ def data_load_col_selection(target_column, triage_value,
     # sourced from antecedentes-problemas-motivoliteral (one-hot encoded columns)
     if include_hist == True:
         modelling_cols += [col for col in df.columns if col.startswith('hist_')]
+    # Add legacy past history and active problem columns
+    # sourced from old antecedentes/problemas tables unified into com_* columns.
+    if include_com == True:
+        modelling_cols += [col for col in df.columns if col.startswith('com_')]
     # Include NLP text embeddings if flag is set to True
     if include_embeddings:
         embedding_cols = [col for col in df.columns if col.startswith('emb_')]
@@ -446,12 +453,13 @@ def data_filtering(df, target_column, demand_code,
         drop_columns=True,
     )
 
-    # Group all atc_ columns together (including the grouped categories created
-    # above, which pandas appends at the end) and all hist_ columns together
+    # Group all atc_, hist_ and com_ columns together (including the grouped
+    # categories created above, which pandas appends at the end).
     atc_cols = [c for c in df.columns if c.startswith('atc_')]
     hist_cols = [c for c in df.columns if c.startswith('hist_')]
-    other_cols = [c for c in df.columns if c not in atc_cols and c not in hist_cols]
-    df = df[other_cols + atc_cols + hist_cols]
+    com_cols = [c for c in df.columns if c.startswith('com_')]
+    other_cols = [c for c in df.columns if c not in atc_cols and c not in hist_cols and c not in com_cols]
+    df = df[other_cols + atc_cols + hist_cols + com_cols]
 
     # Filter by triage patients
     if triage_value is not None:
@@ -541,7 +549,7 @@ def data_filtering(df, target_column, demand_code,
     ]
     non_target_outcomes = [c for c in _OUTCOME_COLUMNS if c != target_column]
     cols_to_drop = ["demandpk", "demand_date", "demand_type_1",
-                    "has_history", "has_med",
+                    "has_history", "has_history_old", "has_problems_old", "has_com", "has_med",
                     "has_icd_emerg", "has_icd_bps",
                     "triage", "literal_reason", "hcdm_id"] + non_target_outcomes + age_group_cols
     cols_to_drop = [c for c in cols_to_drop if c in df.columns]
@@ -564,15 +572,17 @@ def print_feature_summary(X_train):
     triage_cols  = [c for c in X_train.columns if c[0].isdigit()]
     lr_cols      = [c for c in X_train.columns if c.startswith("lr_")]
     hist_cols    = [c for c in X_train.columns if c.startswith("hist_")]
+    com_cols     = [c for c in X_train.columns if c.startswith("com_")]
     atc_cols     = [c for c in X_train.columns if c.startswith("atc")]
-    other_cols   = [c for c in X_train.columns if c not in triage_cols + lr_cols + hist_cols + atc_cols]
+    other_cols   = [c for c in X_train.columns if c not in triage_cols + lr_cols + hist_cols + com_cols + atc_cols]
 
     print("\n" + "="*40)
     print("FEATURE SUMMARY BY GROUP")
     print("="*40)
     print(f"  Triage questions  (digit prefix): {len(triage_cols):>4}")
     print(f"  Literal reason    (lr_):           {len(lr_cols):>4}")
-    print(f"  Clinical history  (hist_):          {len(hist_cols):>4}")
+    print(f"  Clinical history  (hist_ new):      {len(hist_cols):>4}")
+    print(f"  Legacy history    (com_ old):       {len(com_cols):>4}")
     print(f"  Medication        (atc):           {len(atc_cols):>4}")
     print(f"  Other:                             {len(other_cols):>4}")
     print(f"  {'-'*30}")
@@ -2827,6 +2837,7 @@ def run_binary_automl_model(
     triage_value: Optional[int] = None,
     include_lr: bool = True,
     include_hist: bool = True,
+    include_com: bool = True,
     include_medication: bool = True,
     include_embeddings: bool = False,
     export_table: bool = False, 
@@ -2916,7 +2927,7 @@ def run_binary_automl_model(
     # Data loading & column selection
     # -----------------------------
     df = data_load_col_selection(target_column, triage_value,
-                                 include_lr, include_hist, include_medication, include_embeddings)
+                                 include_lr, include_hist, include_com, include_medication, include_embeddings)
 
     # -----------------------------
     # Basic validation

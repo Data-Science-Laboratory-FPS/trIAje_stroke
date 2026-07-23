@@ -521,9 +521,9 @@ def transform_column_dtypes(df: pd.DataFrame, dtype_dict=dtype_cols):
     # 1. Create a local copy of the dictionary to avoid modifying the original global one
     working_dtype_dict = dtype_dict.copy()
 
-    # 2. Dynamically add columns starting with 'lr_' or 'hist_' as 'int8'
+    # 2. Dynamically add columns starting with 'lr_', 'hist_' or 'com_' as 'int8'
     for col in df.columns:
-        if col.startswith(('lr_', 'has_hist', 'hist_', 'has_med', 'atc_')):
+        if col.startswith(('lr_', 'has_hist', 'hist_', 'has_med', 'atc_', 'has_com', 'com_')):
             working_dtype_dict[col] = "int8"
 
     # 3. Keep only dtype rules that apply to existing columns
@@ -1041,7 +1041,6 @@ def analyze_missing_values(df):
     plt.title("Missingness (Blank Strings) by Variable")
     plt.tight_layout()
     plt.show()
-
 
 
 
