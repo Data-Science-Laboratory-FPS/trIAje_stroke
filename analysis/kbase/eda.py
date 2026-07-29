@@ -15,6 +15,8 @@ def evaluate_diagnostic_performance(
     figures_dir=None, reference_df=None,
     n_bootstrap=1000, ci_seed=42,
     export_tables=False,
+    evaluation_label=None,
+    filename_suffix="",
 ):
     """
     Calculates clinical metrics with 95% confidence intervals and generates plots.
@@ -49,6 +51,12 @@ def evaluate_diagnostic_performance(
     export_tables : bool
         When True and figures_dir is provided, exports the formatted performance
         table to a Word (.docx) file under figures_dir/tables/.
+    evaluation_label : Optional[str]
+        Label appended to plot and table titles to identify the prediction
+        source, for example "Predicted by the model".
+    filename_suffix : str
+        Suffix appended to exported figure and table filenames to avoid
+        overwriting outputs from different prediction sources.
     """
     import pandas as pd
     import numpy as np
@@ -59,6 +67,8 @@ def evaluate_diagnostic_performance(
     from scipy.stats import beta as _beta
 
     df = df.copy()
+    filename_suffix = filename_suffix or ""
+    title_suffix = f" ({evaluation_label})" if evaluation_label else ""
 
     # --- BLOCK: Dynamic Triage Column Creation ---
     if triage_group and 'triage' not in df.columns:
@@ -338,13 +348,14 @@ def evaluate_diagnostic_performance(
 
         if age_group:
             table_title = "Diagnostic performance by WHO age group (95% CI)"
-            fname       = "performance_age_subgroups.docx"
+            fname       = f"performance_age_subgroups{filename_suffix}.docx"
         elif sex_group:
             table_title = "Diagnostic performance by sex subgroup (95% CI)"
-            fname       = "performance_sex_subgroups.docx"
+            fname       = f"performance_sex_subgroups{filename_suffix}.docx"
         else:
             table_title = "Overall diagnostic performance (95% CI)"
-            fname       = "performance_overall.docx"
+            fname       = f"performance_overall{filename_suffix}.docx"
+        table_title = f"{table_title}{title_suffix}"
 
         footnote = (
             "Accuracy, Precision, Recall, Specificity, NPV, Overtriage and Undertriage: "
@@ -506,11 +517,20 @@ def evaluate_diagnostic_performance(
                                 fontsize=label_size,
                                 fontweight='bold')
 
-    plt.tight_layout()
+    if evaluation_label:
+        fig.suptitle(
+            f"Diagnostic performance metrics{title_suffix}",
+            fontweight='bold',
+            fontsize=22,
+            y=1.02,
+        )
+        plt.tight_layout(rect=[0, 0, 1, 0.96])
+    else:
+        plt.tight_layout()
     if figures_dir:
         os.makedirs(figures_dir, exist_ok=True)
         suffix = '_age' if age_group else '_sex' if sex_group else ''
-        path = os.path.join(figures_dir, f'metrics_barplots_2x4{suffix}.png')
+        path = os.path.join(figures_dir, f'metrics_barplots_2x4{suffix}{filename_suffix}.png')
         fig.savefig(path, dpi=300, bbox_inches='tight')
         print(f"Figure saved: {path}")
     plt.show()
@@ -520,33 +540,107 @@ def evaluate_diagnostic_performance(
     if not sex_group and not age_group:
         metric_labels = [m.replace(" (%)", "") for m in metrics_to_plot]
         error_metrics = {"Overtriage", "Undertriage"}
-
-        melted = results_df.melt(
-            id_vars=["Triage Group"],
-            value_vars=metrics_to_plot,
-            var_name="Metric",
-            value_name="Value (%)",
-        )
-        melted["Metric"] = melted["Metric"].str.replace(" (%)", "", regex=False)
+        combined_rows = []
+        for _, row in results_df.iterrows():
+            for metric in metric_labels:
+                value = row[f"{metric} (%)"]
+                ci_lo = row.get(f"{metric} CI lo (%)", np.nan)
+                ci_hi = row.get(f"{metric} CI hi (%)", np.nan)
+                combined_rows.append({
+                    "Triage Group": row["Triage Group"],
+                    "Metric": metric,
+                    "Value (%)": value,
+                    "CI lo (%)": ci_lo,
+                    "CI hi (%)": ci_hi,
+                })
+        melted = pd.DataFrame(combined_rows)
 
         fig2, ax2 = plt.subplots(figsize=(16, 8))
 
         if triage_group:
-            sns.barplot(
-                data=melted, x="Metric", y="Value (%)", hue="Triage Group",
-                order=metric_labels, hue_order=["General", "Triage (1)", "No Triage (0)"],
-                palette=palette_dict, ax=ax2,
-            )
+            x = np.arange(len(metric_labels))
+            hue_order = [g for g in ["General", "Triage (1)", "No Triage (0)"]
+                         if g in set(melted["Triage Group"])]
+            width = min(0.24, 0.8 / max(len(hue_order), 1))
+
+            for j, group in enumerate(hue_order):
+                group_df = (
+                    melted[melted["Triage Group"] == group]
+                    .set_index("Metric")
+                    .reindex(metric_labels)
+                )
+                values = group_df["Value (%)"].to_numpy(dtype=float)
+                ci_lo = group_df["CI lo (%)"].to_numpy(dtype=float)
+                ci_hi = group_df["CI hi (%)"].to_numpy(dtype=float)
+                yerr = np.vstack([
+                    np.maximum(values - ci_lo, 0),
+                    np.maximum(ci_hi - values, 0),
+                ])
+                yerr[:, np.isnan(yerr).any(axis=0)] = 0
+                positions = x + (j - (len(hue_order) - 1) / 2) * width
+                bars = ax2.bar(
+                    positions,
+                    values,
+                    width=width,
+                    color=palette_dict.get(group),
+                    edgecolor="black",
+                    linewidth=0.7,
+                    yerr=yerr,
+                    capsize=4,
+                    error_kw={"elinewidth": 1.2, "capthick": 1.2},
+                    label=group,
+                )
+                for bar, value in zip(bars, values):
+                    label_y = 4.0
+                    if value >= 10:
+                        ax2.text(
+                            bar.get_x() + bar.get_width() / 2,
+                            label_y,
+                            f"{value:.2f}%",
+                            ha="center",
+                            va="bottom",
+                            fontsize=11,
+                            fontweight="bold",
+                            color="white",
+                        )
+                    elif value > 0:
+                        ax2.text(
+                            bar.get_x() + bar.get_width() / 2,
+                            value + 2,
+                            f"{value:.2f}%",
+                            ha="center",
+                            va="bottom",
+                            fontsize=11,
+                            fontweight="bold",
+                            color="black",
+                        )
+
             ax2.legend(title="Patient group", loc="upper right", frameon=True,
                        fontsize=12, title_fontsize=13)
             title = "Summary of diagnostic performance metrics, by patient group"
         else:
             c_perf, c_error = "#4A90E2", "#5CB85C"
             bar_palette = {m: (c_error if m in error_metrics else c_perf) for m in metric_labels}
-            sns.barplot(
-                data=melted, x="Metric", y="Value (%)", hue="Metric",
-                order=metric_labels, palette=bar_palette, dodge=False,
-                legend=False, ax=ax2,
+            plot_df = melted.set_index("Metric").reindex(metric_labels)
+            values = plot_df["Value (%)"].to_numpy(dtype=float)
+            ci_lo = plot_df["CI lo (%)"].to_numpy(dtype=float)
+            ci_hi = plot_df["CI hi (%)"].to_numpy(dtype=float)
+            yerr = np.vstack([
+                np.maximum(values - ci_lo, 0),
+                np.maximum(ci_hi - values, 0),
+            ])
+            yerr[:, np.isnan(yerr).any(axis=0)] = 0
+            x = np.arange(len(metric_labels))
+            bars = ax2.bar(
+                x,
+                values,
+                width=0.72,
+                color=[bar_palette[m] for m in metric_labels],
+                edgecolor="black",
+                linewidth=0.7,
+                yerr=yerr,
+                capsize=5,
+                error_kw={"elinewidth": 1.3, "capthick": 1.3},
             )
             legend_handles = [
                 Patch(facecolor=c_perf, edgecolor="black",
@@ -558,32 +652,56 @@ def evaluate_diagnostic_performance(
                        frameon=True, fontsize=12, title_fontsize=13)
             title = "Summary of diagnostic performance metrics"
 
-        for p in ax2.patches:
-            height = p.get_height()
-            if height > 0:
-                ax2.annotate(f'{height:.2f}%',
-                              (p.get_x() + p.get_width() / 2., height),
-                              ha='center', va='center', xytext=(0, 10),
-                              textcoords='offset points', fontsize=13, fontweight='bold')
+            for bar, value in zip(bars, values):
+                label_y = 4.0
+                if value >= 10:
+                    ax2.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        label_y,
+                        f"{value:.2f}%",
+                        ha="center",
+                        va="bottom",
+                        fontsize=12,
+                        fontweight="bold",
+                        color="white",
+                    )
+                elif value > 0:
+                    ax2.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        value + 2,
+                        f"{value:.2f}%",
+                        ha="center",
+                        va="bottom",
+                        fontsize=12,
+                        fontweight="bold",
+                        color="black",
+                    )
 
+        title = f"{title}{title_suffix}"
         ax2.set_title(title, fontweight='bold', fontsize=20)
         ax2.set_xlabel("")
         ax2.set_ylabel("Value (%)", fontsize=15)
         ax2.set_ylim(0, metric_y_axis_max)
+        ax2.set_xticks(np.arange(len(metric_labels)))
+        ax2.set_xticklabels(metric_labels)
         ax2.tick_params(axis='both', labelsize=14)
         plt.setp(ax2.get_xticklabels(), rotation=0, ha='center')
 
         plt.tight_layout()
         if figures_dir:
             os.makedirs(figures_dir, exist_ok=True)
-            path2 = os.path.join(figures_dir, 'metrics_barplots_combined.png')
+            path2 = os.path.join(figures_dir, f'metrics_barplots_combined{filename_suffix}.png')
             fig2.savefig(path2, dpi=300, bbox_inches='tight')
             print(f"Figure saved: {path2}")
         plt.show()
 
     return results_df
 
-def analyze_emergency_performance(demand_type, y_real_col, y_pred_col, sex_group=False, age_group=False):
+def analyze_emergency_performance(
+    demand_type, y_real_col, y_pred_col,
+    sex_group=False, age_group=False,
+    evaluation_label=None, filename_suffix="",
+):
     """
     High-level function to load data and call evaluation.
     This function no longer returns specific objects to avoid redundant printing.
@@ -629,6 +747,8 @@ def analyze_emergency_performance(demand_type, y_real_col, y_pred_col, sex_group
         sex_group=sex_group,
         age_group=age_group,
         reference_df=reference_df,
+        evaluation_label=evaluation_label,
+        filename_suffix=filename_suffix,
     )
 
 # Example usage in a cell:
