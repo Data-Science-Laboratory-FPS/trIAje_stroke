@@ -17,10 +17,14 @@ COMMON_LABELS = {
     "triage": "Structured triage performed",
     "p1_assigned": "Assigned P1 priority",
     "p1_real_emerg": "Real emergency P1 priority",
+    "p1_real_bps": "BPS P1 priority",
+    "p1_real_emerg_bps": "Emergency or BPS P1 priority",
     "has_icd_emerg": "Emergency ICD diagnosis available",
     "has_history": "Past medical history available",
+    "has_history_old": "Legacy past medical history available",
+    "has_problems_old": "Legacy active problems available",
+    "has_com": "Legacy history or active problem available",
     "has_med": "Medication history available",
-    "has_com": "Comorbidity",
     "alert_receiver_112": "112 emergency line",
     "alert_receiver_user": "User or patient",
     "alert_receiver_pol_fg": "Police or Civil Guard",
@@ -78,7 +82,7 @@ def label_from_suffix(column: str, prefix: str, label_prefix: str = "") -> str:
 
 
 def label_from_coded_suffix(column: str, prefix: str, label_prefix: str = "") -> str:
-    """Like label_from_suffix, but drops purely numeric segments (e.g. com_1_diabetes -> Diabetes)."""
+    """Like label_from_suffix, but drops purely numeric segments (e.g. hist_1_diabetes -> Diabetes)."""
     parts = column.removeprefix(prefix).split("_")
     label_parts = [part for part in parts if not part.isdigit()]
     label = " ".join(label_parts).title()
@@ -92,6 +96,7 @@ _SUFFIX_RULES = [
     ("province_", label_from_suffix),
     ("lr_", label_from_suffix),
     ("atc_group_", label_from_suffix),
+    ("hist_", label_from_coded_suffix),
     ("com_", label_from_coded_suffix),
 ]
 
@@ -102,7 +107,7 @@ def get_labels_map(demand_code=None, columns=None) -> dict:
 
     Combines COMMON_LABELS, the demand-specific triage question labels
     (TRIAGE_LABELS_BY_DEMAND), and auto-generated labels for grouped
-    one-hot columns (day_week_*, month_*, province_*, lr_*, atc_group_*, com_*)
+    one-hot columns (day_week_*, month_*, province_*, lr_*, atc_group_*, hist_*, com_*)
     found in `columns`.
     """
     labels = dict(COMMON_LABELS)

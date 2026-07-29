@@ -233,6 +233,7 @@ dtype_cols = {
     "p1_assigned": "Int8",
     "p1_real_emerg": "Int8",
     "p1_real_bps": "Int8",
+    "p1_real_emerg_bps": "Int8",
     "hcdm_id": "object",
     "location_patient": "category",
     "location_patient_home": "int8",
