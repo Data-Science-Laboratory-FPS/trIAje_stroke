@@ -30,6 +30,7 @@ import kbase.preprocessing as dp
 import kbase.eda as eda
 from kbase.config import settings
 from kbase.labels import get_labels_map, get_display_label, resolve_demand_key
+from kbase.model_hyperparameters import AVAILABLE_CONFIGS, FIXED_XGBOOST_CONFIG
 
 _FIGURES_DIR_MAP = {
     16: 'figures/03_dyspnea',
@@ -644,14 +645,61 @@ def train_test_split_weights(df, target_column, test_size, seed):
 import pandas as pd
 from flaml import AutoML
 
-def run_automl_training(X_train, y_train, year_train, sample_weight, time_budget, 
-                        optimize_metric, n_splits_cv, seed, task):
-    """Executes the FLAML AutoML optimization process and prints a benchmarking table"""
-    print(f"\n--- Starting AutoML ({task.upper()}) | Budget: {time_budget}s ---")
-    if optimize_metric is None:
-        print("Training metric: FLAML default")
+def run_automl_training(
+    X_train,
+    y_train,
+    year_train,
+    sample_weight,
+    time_budget,
+    optimize_metric,
+    n_splits_cv,
+    seed,
+    task,
+    max_iter=None,
+    fixed_config=None,
+    fixed_estimator="xgboost",
+):
+    """Executes FLAML AutoML under time, iteration, or fixed-configuration mode."""
+    time_budget_set = time_budget is not None and time_budget != -1
+    max_iter_set = max_iter is not None
+    fixed_config_set = fixed_config is not None
+
+    if fixed_config_set:
+        if time_budget_set or max_iter_set:
+            raise ValueError(
+                "fixed_config is mutually exclusive with time_budget and max_iter. "
+                "Pass time_budget=-1 and omit max_iter when fixed_config is supplied."
+            )
+        budget_label = f"Fixed configuration | estimator: {fixed_estimator}"
+        fit_time_budget = -1
     else:
-        print(f"Training metric: {optimize_metric}")
+        if time_budget_set and max_iter_set:
+            raise ValueError(
+                "Supply either time_budget or max_iter, not both. Use "
+                "time_budget=-1 together with max_iter for an iteration-bounded search."
+            )
+        if not time_budget_set and not max_iter_set:
+            raise ValueError(
+                "A search budget is required: pass time_budget in seconds, "
+                "time_budget=-1 with max_iter for an iteration-bounded search, "
+                "or fixed_config to evaluate a single configuration."
+            )
+        if time_budget_set and time_budget <= 0:
+            raise ValueError(
+                "time_budget must be a positive number of seconds, or -1 with max_iter."
+            )
+        if max_iter_set and max_iter <= 0:
+            raise ValueError("max_iter must be a positive integer.")
+
+        if max_iter_set:
+            budget_label = f"Iteration-bounded | max_iter: {max_iter}"
+            fit_time_budget = -1
+        else:
+            budget_label = f"Time-bounded | budget: {time_budget}s"
+            fit_time_budget = time_budget
+
+    print(f"\n--- Starting AutoML ({task.upper()}) | {budget_label} ---")
+    print(f"Training metric: {optimize_metric if optimize_metric else 'FLAML default'}")
         
     cv_strata = _make_outcome_year_strata(y_train, year_train)
     cv_splitter = OutcomeYearStratifiedKFold(
@@ -661,24 +709,75 @@ def run_automl_training(X_train, y_train, year_train, sample_weight, time_budget
     )
 
     automl = AutoML()
-    automl.fit(
-        X_train=X_train, 
-        y_train=y_train, 
+    fit_kwargs = dict(
+        X_train=X_train,
+        y_train=y_train,
         sample_weight=sample_weight,
-        time_budget=time_budget, 
-        metric=optimize_metric, 
+        time_budget=fit_time_budget,
+        metric=optimize_metric,
         task=task,
-        eval_method="cv", 
-        n_splits=n_splits_cv, 
+        eval_method="cv",
+        n_splits=n_splits_cv,
         split_type=cv_splitter,
-        seed=seed, 
+        seed=seed,
         verbose=1,
         log_training_metric=True,
     )
-    
+    if fixed_config_set:
+        # FLAML 2.3.6 records but does not score a single dict starting point
+        # when max_iter=1, leaving best_loss=inf. Supplying the same starting
+        # point twice with max_iter=2 evaluates that fixed configuration while
+        # preventing exploration of any different hyperparameter set.
+        fit_kwargs["starting_points"] = {fixed_estimator: [fixed_config, fixed_config]}
+        fit_kwargs["max_iter"] = 2
+        fit_kwargs["estimator_list"] = [fixed_estimator]
+    elif max_iter_set:
+        fit_kwargs["max_iter"] = max_iter
+
+    start_time = time.time()
+    automl.fit(**fit_kwargs)
+    elapsed = time.time() - start_time
+    n_iter_done = getattr(automl, "_track_iter", None)
+    if n_iter_done is not None:
+        n_iter_done += 1
+
+    automl.search_iterations_ = n_iter_done
+    automl.search_elapsed_time_ = elapsed
+    automl.search_mode_ = (
+        "fixed_config" if fixed_config_set
+        else "max_iter" if max_iter_set
+        else "time_budget"
+    )
+    automl.search_budget_ = (
+        "fixed" if fixed_config_set
+        else max_iter if max_iter_set
+        else time_budget
+    )
+
     print("\n--- Training completed ---")
     print(f"Best estimator: {automl.best_estimator}")
     print(f"Best CV score:  {1 - automl.best_loss:.4f}")
+    print(f"Elapsed time:   {elapsed:.1f}s ({elapsed / 60:.1f} min)")
+    print(f"Total FLAML iterations: {n_iter_done}")
+    if fixed_config_set:
+        print("Search mode:    fixed configuration (no search; fully reproducible)")
+        selected = getattr(automl, "best_config", None)
+        if selected is not None:
+            mismatches = {
+                key: (value, selected.get(key))
+                for key, value in fixed_config.items()
+                if key in selected and selected[key] != value
+            }
+            if mismatches:
+                print("WARNING: the configuration used differs from the one supplied:")
+                for key, (requested, actual) in mismatches.items():
+                    print(f"  {key}: requested {requested}, used {actual}")
+            else:
+                print("Configuration verified: hyperparameters match those supplied.")
+    elif max_iter_set:
+        print("Search mode:    iteration-bounded (fixed max_iter and seed)")
+    else:
+        print("Search mode:    time-bounded (number of configurations depends on runtime)")
 
     # ---------------------------------------------------------
     # Benchmarking: Best Per Estimator Analysis
@@ -2240,6 +2339,7 @@ def plot_feature_importances(automl, X_train, feature_importance,
     """
     # Return early if no importance requested
     if feature_importance == 0:
+        print("\n--- Feature importance skipped (feature_importance=0) ---")
         return None, None
 
     importance_df_permutation = None
@@ -2336,12 +2436,24 @@ def plot_feature_importances(automl, X_train, feature_importance,
         print("--- Computing built-in feature importance ---")
 
         try:
-            best_model = automl.model
-            feature_names = automl.feature_names_in_.tolist()
+            best_model_wrapper = getattr(automl, "model", None)
+            best_model = getattr(best_model_wrapper, "estimator", best_model_wrapper)
+
+            if best_model is None:
+                raise RuntimeError("No final estimator available.")
+
+            if hasattr(best_model, "feature_name_"):
+                feature_names = list(best_model.feature_name_)
+            elif hasattr(best_model, "feature_names_in_"):
+                feature_names = list(best_model.feature_names_in_)
+            elif getattr(automl, "feature_names_in_", None) is not None:
+                feature_names = list(automl.feature_names_in_)
+            else:
+                feature_names = list(X_train.columns)
 
             if hasattr(best_model, 'feature_importances_'):
                 # Tree-based models: cumulative impurity reduction across all splits
-                importances = best_model.feature_importances_
+                importances = np.asarray(best_model.feature_importances_, dtype=float)
 
                 if len(importances) == len(feature_names):
                     importance_df_builtin = (
@@ -2359,8 +2471,8 @@ def plot_feature_importances(automl, X_train, feature_importance,
                 # Linear models: absolute coefficients as proxy for importance.
                 # For multiclass, coef_ is 2D (n_classes x n_features) →
                 # average across classes to get a single importance per feature
-                coef = best_model.coef_
-                importances = np.abs(coef).mean(axis=0) if coef.ndim > 1 else np.abs(coef[0])
+                coef = np.asarray(best_model.coef_, dtype=float)
+                importances = np.abs(coef).mean(axis=0) if coef.ndim > 1 else np.abs(coef.ravel())
 
                 if len(importances) == len(feature_names):
                     importance_df_builtin = (
@@ -3003,7 +3115,10 @@ def run_binary_automl_model(
     include_medication: bool = True,
     include_embeddings: bool = False,
     export_table: bool = False, 
-    time_budget: int = 600,
+    time_budget: Optional[int] = 600,
+    max_iter: Optional[int] = None,
+    fixed_config: Optional[dict] = None,
+    fixed_estimator: str = "xgboost",
     test_size: float = 0.2,
     seed: int = 42,
     min_age: Optional[int] = None,
@@ -3043,8 +3158,20 @@ def run_binary_automl_model(
     triage_value : Optional[int]
         If provided, filters to triage == triage_value.
         If triage_value == 0, q1-q7 are removed from the feature set.
-    time_budget : int
-        FLAML training budget in seconds.
+    time_budget : Optional[int]
+        FLAML search budget in seconds. Mutually exclusive with max_iter.
+        Use time_budget=-1 together with max_iter for an iteration-bounded search.
+    max_iter : Optional[int]
+        Number of FLAML configurations to evaluate. Mutually exclusive with a
+        positive time_budget.
+    fixed_config : Optional[dict]
+        Explicit hyperparameters to use instead of searching. When supplied,
+        FLAML evaluates this single configuration and no search is performed,
+        making the execution reproducible and reducing runtime. Use
+        FIXED_XGBOOST_CONFIG for the current stroke hist_ reference
+        configuration.
+    fixed_estimator : str
+        Learner the fixed configuration belongs to. Defaults to "xgboost".
     test_size : float
         Proportion of test split.
     seed : int
@@ -3084,7 +3211,7 @@ def run_binary_automl_model(
     # Register the active demand_code and time_budget so save_figure() knows which folder/suffix to use
     global _current_demand_code, _current_time_budget
     _current_demand_code = demand_code
-    _current_time_budget = time_budget
+    _current_time_budget = time_budget if max_iter is None and fixed_config is None else None
 
     # -----------------------------
     # Print time
@@ -3123,8 +3250,20 @@ def run_binary_automl_model(
     # -----------------------------
     # AutoML training
     # -----------------------------
-    automl = run_automl_training(X_train, y_train, year_train, sample_weight, time_budget, 
-                                 optimize_metric, n_splits_cv, seed, task = "classification")
+    automl = run_automl_training(
+        X_train,
+        y_train,
+        year_train,
+        sample_weight,
+        time_budget,
+        optimize_metric,
+        n_splits_cv,
+        seed,
+        task="classification",
+        max_iter=max_iter,
+        fixed_config=fixed_config,
+        fixed_estimator=fixed_estimator,
+    )
 
     # -----------------------------
     # Threshold optimization (decision threshold)
@@ -3221,30 +3360,58 @@ def run_binary_automl_model(
     # Create an evaluation dataframe by mapping back to the filtered data
     plot_df = df.loc[y_test.index].copy() 
     plot_df['target_real'] = y_test
-    plot_df['target_pred'] = y_test_pred
+    plot_df['target_pred_model'] = y_test_pred
+    plot_df['target_pred'] = plot_df['target_pred_model']
     eda.evaluate_diagnostic_performance(
-        plot_df, 'target_real', 'target_pred',
+        plot_df, 'target_real', 'target_pred_model',
         sex_group=False,
         figures_dir=_get_figures_dir(demand_code),
         reference_df=subgroup_reference_df,
         export_tables=True,
+        evaluation_label="Predicted by the model",
+        filename_suffix="_model",
     )
     # Fairness analysis by sex
     eda.evaluate_diagnostic_performance(
-        plot_df, 'target_real', 'target_pred',
+        plot_df, 'target_real', 'target_pred_model',
         sex_group=True,
         figures_dir=_get_figures_dir(demand_code),
         reference_df=subgroup_reference_df,
         export_tables=True,
+        evaluation_label="Predicted by the model",
+        filename_suffix="_model",
     )
     # Fairness analysis by age groups
     eda.evaluate_diagnostic_performance(
-        plot_df, 'target_real', 'target_pred',
+        plot_df, 'target_real', 'target_pred_model',
         age_group=True,
         figures_dir=_get_figures_dir(demand_code),
         reference_df=subgroup_reference_df,
         export_tables=True,
+        evaluation_label="Predicted by the model",
+        filename_suffix="_model",
     )
+    if "p1_assigned" in plot_df.columns:
+        triage_plot_df = plot_df.copy()
+        triage_plot_df["p1_assigned"] = pd.to_numeric(
+            triage_plot_df["p1_assigned"], errors="coerce"
+        )
+        triage_plot_df = triage_plot_df.dropna(subset=["target_real", "p1_assigned"])
+        triage_plot_df["p1_assigned"] = triage_plot_df["p1_assigned"].astype("int8")
+
+        print("\n--- Telephonic triage system diagnostic performance on test set ---")
+        print(f"Rows evaluated: {len(triage_plot_df):,} / {len(plot_df):,} test rows")
+        eda.evaluate_diagnostic_performance(
+            triage_plot_df, "target_real", "p1_assigned",
+            sex_group=False,
+            figures_dir=_get_figures_dir(demand_code),
+            reference_df=subgroup_reference_df,
+            export_tables=True,
+            evaluation_label="Assigned by the telephonic triage system",
+            filename_suffix="_telephonic_triage",
+        )
+    else:
+        print("\nWARNING: p1_assigned not found; skipping telephonic triage system evaluation.")
 
     # -----------------------------
     # Feature importance
@@ -3289,6 +3456,26 @@ def run_binary_automl_model(
             optimize_beta=optimize_beta,
             threshold=best_threshold,
             train_threshold=train_threshold,
+            search_mode=getattr(
+                automl,
+                "search_mode_",
+                (
+                    "fixed_config" if fixed_config is not None
+                    else "max_iter" if max_iter is not None
+                    else "time_budget"
+                ),
+            ),
+            search_budget=getattr(
+                automl,
+                "search_budget_",
+                (
+                    "fixed" if fixed_config is not None
+                    else max_iter if max_iter is not None
+                    else time_budget
+                ),
+            ),
+            search_iterations=getattr(automl, "search_iterations_", None),
+            search_elapsed_time=getattr(automl, "search_elapsed_time_", None),
             n_samples=len(df_filtered),
             n_train=len(X_train),
             n_test=len(X_test),
@@ -3301,6 +3488,8 @@ def run_binary_automl_model(
         "automl": automl,
         "metrics": metrics,
         "threshold": best_threshold,
+        "search_iterations": getattr(automl, "search_iterations_", None),
+        "search_elapsed_time": getattr(automl, "search_elapsed_time_", None),
         "importance_permutation": importance_df_permutation,
         "importance_builtin": importance_df_builtin,
         "effective_features": effective_features_df,
