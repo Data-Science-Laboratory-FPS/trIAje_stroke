@@ -1,0 +1,155 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>TRIAJE // Stroke General // OOF R80/AP</title>
+  <style>
+    :root{--bg:#070914;--panel:#0d1224;--line:#263866;--c:#00f6ff;--p:#ff2bd6;--g:#52ff8a;--y:#ffe66d;--r:#ff6b6b;--muted:#8b9abb}
+    *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 78% 0,#18204a,transparent 34%),var(--bg);color:#eaf4ff;font:13px ui-monospace,monospace}
+    main{max-width:1500px;margin:auto;padding:22px}h1{margin:0 0 6px;color:var(--c);letter-spacing:3px;text-shadow:0 0 14px #00f6ff88}.sub{color:var(--muted);line-height:1.55}
+    .modules{display:grid;grid-template-columns:1.12fr 1.35fr .9fr;gap:10px;margin-top:10px}.module{background:#0d1224ee;border:1px solid var(--line);padding:10px}.module.run{border-color:#00f6ff66;background:linear-gradient(180deg,#0c1728ee,#09101fee)}.module.progress{border-color:#52ff8a66;background:linear-gradient(180deg,#0d1b21ee,#09131bee)}.module.runtime{border-color:#ffe66d66;background:linear-gradient(180deg,#1a1720ee,#0d1020ee)}.moduleTitle{font-size:10px;letter-spacing:1.5px;text-transform:uppercase;margin-bottom:8px}.module.run .moduleTitle{color:var(--c)}.module.progress .moduleTitle{color:var(--g)}.module.runtime .moduleTitle{color:var(--y)}
+    .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}.module.progress .grid{grid-template-columns:repeat(3,minmax(0,1fr))}.card{background:#0b1021;border:1px solid #1d2a4a;padding:12px;margin-top:0}.card.tight{padding:10px}.card.timeHot{border-color:#00f6ff88;background:linear-gradient(180deg,#10223a,#0b1021);box-shadow:inset 0 1px 0 #00f6ff33}.card.timeEtaCard{border-color:#ffe66d88;background:linear-gradient(180deg,#211f1d,#0b1021);box-shadow:inset 0 1px 0 #ffe66d33}
+    .label{color:var(--p);font-size:10px;letter-spacing:1.5px;text-transform:uppercase}.value{color:var(--c);font-size:18px;margin-top:7px;overflow-wrap:anywhere}.value.timePrimary,.value.timeEta,.value.timeSoft{font-weight:800;text-shadow:0 0 9px currentColor}.value.timePrimary{color:var(--c);font-size:22px}.value.timeEta{color:var(--y);font-size:21px}.value.timeSoft{color:#9eb5da;font-size:18px;text-shadow:none}.timeUnit{font-size:10px;color:var(--muted);font-weight:500;margin-left:2px;text-shadow:none}.small{font-size:11px;color:var(--muted)}
+    .clickValue{cursor:pointer}.clickValue:hover{color:var(--y)}.phaseHelp{display:none;margin-top:8px;border-top:1px solid #1d2a4a;padding-top:8px;color:#9eb5da;font-size:11px;line-height:1.5}.phaseHelp.show{display:block}.phaseHelp b{color:var(--c)}
+    .bar{position:relative;height:18px;border:1px solid var(--c);background:#050811;margin:46px 0 8px;overflow:visible}.fill{height:100%;width:0%;background:linear-gradient(90deg,var(--p),var(--c));box-shadow:0 0 14px #00f6ff77;transition:width .3s}
+    table{width:100%;border-collapse:collapse;min-width:1050px}th,td{padding:8px;border-bottom:1px solid #1d2a4a;text-align:right}th{color:var(--c)}th:first-child,td:first-child{text-align:left}.matrix{overflow:auto}
+    .good{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}.activeText{color:var(--c)}.muted{color:var(--muted)}pre{white-space:pre-wrap;max-height:180px;overflow:auto;color:#9eb5da;margin:0}
+    .statusPill{display:inline-flex;align-items:center;justify-content:center;min-width:78px;border:1px solid currentColor;padding:3px 7px;font-size:10px;font-weight:bold;letter-spacing:1px}.sig-green{color:var(--g);background:#17361f}.sig-amber{color:var(--y);background:#373016}.sig-red{color:var(--r);background:#3a171d}.sig-blue{color:var(--c);background:#10293a}.sig-grey{color:var(--muted);background:#141a28}
+    .workers,.charts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.worker,.chartbox{border:1px solid var(--line);background:#080d1ddd;padding:10px;min-height:96px}.worker.running{border-color:var(--c);box-shadow:0 0 10px #00f6ff33}.worker.done{border-color:var(--g)}.worker.failed{border-color:var(--r)}
+    .workerhead{display:flex;justify-content:space-between;color:var(--c);font-size:11px}.workerdata{color:#9eb5da;margin-top:8px;line-height:1.6}.workerbar{height:5px;background:#111a32;margin-top:7px}.workerfill{height:100%;background:var(--c);width:0%;transition:width .3s}
+    canvas{width:100%;height:220px}.charttitle{color:var(--c);font-size:11px;margin-bottom:4px}.pager{display:flex;align-items:center;justify-content:space-between;gap:12px;margin:10px 0;color:var(--c)}button{background:#101a38;color:var(--c);border:1px solid var(--c);padding:7px 10px;font:11px ui-monospace,monospace}button:disabled{opacity:.35}
+    .runner{position:absolute;left:max(8px,min(calc(100% - 62px),var(--rx,0%)));top:-42px;width:62px;height:58px;z-index:4;filter:drop-shadow(0 0 12px #00f6ff77);animation:pulling-effort .55s steps(2,end) infinite}
+    .runner .antenna{position:absolute;left:28px;top:0;width:3px;height:9px;background:var(--p)}.runner .antenna:after{content:'';position:absolute;left:-3px;top:-5px;width:9px;height:9px;border-radius:50%;background:var(--p);box-shadow:0 0 12px var(--p)}
+    .runner .rhead{position:absolute;left:17px;top:7px;width:29px;height:20px;border:2px solid var(--c);border-radius:6px;background:#101a38;transform:rotate(8deg)}.runner .rhead:before{content:'• •';position:absolute;left:7px;top:3px;color:var(--g);font:bold 8px monospace;letter-spacing:2px}
+    .runner .rbody{position:absolute;left:22px;top:25px;width:22px;height:13px;border:2px solid var(--p);background:#161332;transform:skewX(-16deg) rotate(-15deg)}
+    .runner .arm{position:absolute;top:27px;width:4px;height:11px;background:var(--p);transform-origin:top}.runner .arm-left{left:15px;transform:rotate(85deg)}.runner .arm-right{left:39px;transform:rotate(85deg)}
+    .runner .forearm{position:absolute;left:0;top:8px;width:4px;height:13px;background:var(--p);transform-origin:top;transform:rotate(-5deg)}.runner .hand{position:absolute;left:-2px;bottom:-3px;width:8px;height:5px;border:1px solid var(--c);border-radius:4px;background:#101a38}
+    .runner .leg{position:absolute;top:35px;width:5px;height:10px;background:var(--c);transform-origin:top}.runner .leg-left{left:20px;animation:leg-drive-left 1s linear infinite}.runner .leg-right{left:39px;animation:leg-drive-right 1s linear infinite .5s}
+    .runner .lower-leg{position:absolute;left:0;top:8px;width:5px;height:12px;background:var(--c);transform-origin:top}.runner .leg-left .lower-leg{transform:rotate(-10deg)}.runner .leg-right .lower-leg{transform:rotate(-25deg)}.runner .foot{position:absolute;left:-3px;bottom:-3px;width:12px;height:4px;border:1px solid var(--c);background:#101a38}
+    .runner .grip-line{position:absolute;left:-6px;top:33px;width:24px;height:3px;background:var(--c);box-shadow:0 0 8px var(--c);transform:rotate(-8deg);transform-origin:left center}.runner .grip-line:before{content:'';position:absolute;left:-4px;top:-3px;width:7px;height:7px;border:2px solid var(--c);border-radius:50%;background:#050811;box-shadow:0 0 6px var(--c)}
+    .runner .effort-mark{position:absolute;width:3px;height:3px;border-radius:50%;background:var(--y);animation:effort .55s steps(2,end) infinite}.runner .effort-mark-1{left:14px;top:14px}.runner .effort-mark-2{left:10px;top:23px;animation-delay:.2s}
+    .runner .skid{position:absolute;top:54px;width:10px;height:2px;border-top:1px solid var(--p);transform:skewX(-25deg);animation:skidding .55s steps(2,end) infinite}.runner .skid-left{left:10px}.runner .skid-right{left:43px;animation-delay:.2s}
+    .runnerBubble{position:absolute;left:25px;top:-46px;display:none;background:#f4fbff;color:#101a38;border:2px solid var(--p);border-radius:8px;padding:5px 7px;white-space:nowrap;font:bold 10px ui-monospace,monospace;box-shadow:0 0 12px #ff2bd688}.runnerBubble:after{content:'';position:absolute;left:7px;bottom:-7px;border-width:6px 6px 0 0;border-style:solid;border-color:var(--p) transparent transparent transparent}.runner.cheer{animation:celebrate-jump .7s ease-out 3!important}.runner.cheer .runnerBubble{display:block}.runner.cheer .arm,.runner.cheer .leg{animation:none}
+    .paused .runner{filter:grayscale(.8);animation:none}.paused .runner .leg,.paused .runner .effort-mark,.paused .runner .skid{animation:none}.ok .runner{filter:drop-shadow(0 0 18px var(--g))}.error .runner{filter:drop-shadow(0 0 18px var(--r));animation:shake .12s infinite alternate}
+    @keyframes pulling-effort{0%{transform:translateX(0) rotate(-11deg)}50%{transform:translateX(-5px) rotate(-17deg)}100%{transform:translateX(0) rotate(-11deg)}}@keyframes effort{50%{opacity:0;transform:translate(-4px,2px)}}@keyframes skidding{50%{opacity:0;transform:translateX(-5px)}}@keyframes leg-drive-left{0%{transform:translate(6px,0) rotate(64deg)}78%{transform:translate(-9px,1px) rotate(72deg)}82%{transform:translate(-9px,-2px) rotate(66deg)}90%,100%{transform:translate(6px,0) rotate(64deg)}}@keyframes leg-drive-right{0%{transform:translate(6px,0) rotate(-14deg)}78%{transform:translate(-8px,1px) rotate(-6deg)}82%{transform:translate(-8px,-2px) rotate(-12deg)}90%,100%{transform:translate(6px,0) rotate(-14deg)}}@keyframes celebrate-jump{0%{transform:translateY(0) scaleY(.9)}35%{transform:translateY(-30px) rotate(-8deg) scaleY(1.05)}55%{transform:translateY(-34px) rotate(8deg)}100%{transform:translateY(0) rotate(0) scaleY(1)}}@keyframes shake{to{transform:translateX(3px)}}
+    @media(max-width:1100px){.modules{grid-template-columns:1fr}.module.progress .grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
+    @media(max-width:900px){main{padding:10px}.grid,.module.progress .grid{grid-template-columns:repeat(2,minmax(0,1fr))}.workers,.charts{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+<main>
+  <h1>TRIAJE // STROKE GENERAL // OOF RECALL-CONSTRAINED</h1>
+  <div class="sub"><b>PRIMARY OBJECTIVE: MAXIMISE OOF SPECIFICITY WITH RECALL >= 0.80</b><br>3-fold AP screening -> 5-fold AP HPO -> 10-fold OOF threshold | secondary operating points stored separately | held-out 20% evaluated once</div>
+
+  <section class="modules">
+    <div class="module run">
+      <div class="moduleTitle">Run Control</div>
+      <div class="grid">
+        <div class="card"><div class="label">Status</div><div id="status" class="value">loading</div></div>
+        <div class="card"><div class="label">Phase</div><div id="phase" class="value clickValue" title="Click for phase details">loading</div><div id="phaseHelp" class="phaseHelp"></div></div>
+        <div class="card"><div class="label">Runtime State</div><div id="runtimeState" class="value">-</div></div>
+        <div class="card"><div class="label">State Age</div><div id="stateAge" class="value">-</div></div>
+        <div class="card"><div class="label">Runtime PID</div><div id="runtimePid" class="value">-</div></div>
+        <div class="card"><div class="label">CPU / Memory / Cores</div><div id="runtimeLoad" class="value">-</div></div>
+      </div>
+    </div>
+    <div class="module progress">
+      <div class="moduleTitle">Model Progress</div>
+      <div class="grid">
+        <div class="card"><div class="label">Active Model</div><div id="model" class="value">loading</div></div>
+        <div class="card"><div class="label">Candidate</div><div id="candidate" class="value">-</div></div>
+        <div class="card"><div class="label">CV Fold</div><div id="fold" class="value">-</div></div>
+        <div class="card"><div class="label">Winner</div><div id="winner" class="value">-</div></div>
+        <div class="card"><div class="label">Best HPO AP</div><div id="refitBestAp" class="value">-</div></div>
+        <div class="card"><div class="label">Refit ETA</div><div id="refitEta" class="value">-</div></div>
+      </div>
+    </div>
+    <div class="module runtime">
+      <div class="moduleTitle">Runtime / ETA</div>
+      <div class="grid">
+        <div class="card timeHot"><div class="label">Total Elapsed</div><div id="totalElapsed" class="value timePrimary">00:00:00</div></div>
+        <div class="card"><div class="label">Model Elapsed</div><div id="modelElapsed" class="value timeSoft">00:00:00</div></div>
+        <div class="card timeEtaCard"><div class="label">Phase ETA</div><div id="phaseEta" class="value timeEta">calculating</div></div>
+        <div class="card timeEtaCard"><div class="label">Total ETA</div><div id="totalEta" class="value timeEta">calculating</div></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="label">Search Progress</div>
+    <div class="bar"><div id="fill" class="fill"></div><div id="runner" class="runner"><div class="runnerBubble">ALMOST THERE!</div><div class="antenna"></div><div class="rhead"></div><div class="rbody"></div><div class="arm arm-left"><div class="forearm"><div class="hand"></div></div></div><div class="arm arm-right"><div class="forearm"><div class="hand"></div></div></div><div class="leg leg-left"><div class="lower-leg"><div class="foot"></div></div></div><div class="leg leg-right"><div class="lower-leg"><div class="foot"></div></div></div><div class="grip-line"></div><div class="effort-mark effort-mark-1"></div><div class="effort-mark effort-mark-2"></div><div class="skid skid-left"></div><div class="skid skid-right"></div></div></div>
+    <div id="progress" class="sub">loading</div>
+  </section>
+
+  <section class="card">
+    <div class="label">Training State // Models x Phases</div>
+    <div class="matrix"><table>
+      <thead><tr><th>Model</th><th>Status</th><th>Screen AP</th><th>Screen AUROC</th><th>HPO Candidates</th><th>Best HPO AP</th><th>Best HPO LogLoss</th><th>OOF Spec @ R80</th><th>OOF Recall</th><th>OOF PPV</th><th>Test Spec</th><th>Elapsed</th></tr></thead>
+      <tbody id="modelRows"></tbody>
+    </table></div>
+  </section>
+
+  <section class="card">
+    <div class="label">Final Refit Insights</div>
+    <div id="refitInsights" class="sub">No final refit heartbeat yet.</div>
+  </section>
+
+  <section class="card">
+    <div class="label">CV Workers // Multicore</div>
+    <div id="workers" class="workers"></div>
+    <div id="workerSummary" class="sub">Waiting for workers.</div>
+  </section>
+
+  <section class="card">
+    <div class="label">Metric Curves // AP + Log-Loss</div>
+    <div class="pager"><button id="prevModel" type="button">&lt; Previous</button><span id="pageModel">loading</span><button id="nextModel" type="button">Next &gt;</button></div>
+    <canvas id="chart"></canvas>
+    <div id="chartNote" class="sub">Waiting for saved metrics.</div>
+  </section>
+
+  <section class="card">
+    <div class="label">Results // Ranked By OOF Specificity At Recall >= 0.80</div>
+    <div class="matrix"><table>
+      <thead><tr><th>Model</th><th>OOF Spec</th><th>OOF Recall</th><th>OOF PPV</th><th>OOF AP</th><th>OOF AUROC</th><th>Test Spec</th><th>Test Recall</th><th>Test PPV</th><th>Test AP</th><th>Threshold</th></tr></thead>
+      <tbody id="rows"></tbody>
+    </table></div>
+  </section>
+
+  <section class="card">
+    <div class="label">Latest Log Event</div>
+    <pre id="latest">loading</pre>
+  </section>
+</main>
+<script>
+const MODELS=['XGBoost','Random Forest','Logistic Regression','Elastic Net Logistic','Extra Trees','LightGBM','HistGradientBoosting'];
+const n=v=>typeof v==='number'&&isFinite(v)?v.toFixed(4):'-';
+const fmt=s=>{s=Math.max(0,Math.floor(Number(s)||0));return String(Math.floor(s/3600)).padStart(2,'0')+':'+String((s%3600)/60|0).padStart(2,'0')+':'+String(s%60).padStart(2,'0')};
+const fmtTimeHtml=s=>{s=Math.max(0,Math.floor(Number(s)||0));const h=Math.floor(s/3600),m=(s%3600)/60|0,sec=s%60;return `${String(h).padStart(2,'0')}<span class="timeUnit">h</span> ${String(m).padStart(2,'0')}<span class="timeUnit">min</span> ${String(sec).padStart(2,'0')}<span class="timeUnit">seg</span>`};
+const coresUsed=runtime=>{const cpu=Number(runtime?.cpu_percent);return Number.isFinite(cpu)?(cpu/100).toFixed(1):'-'};
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function json(path,fallback){try{const r=await fetch(path+'?x='+Date.now());return r.ok?await r.json():fallback}catch{return fallback}}
+async function text(path){try{const r=await fetch(path+'?x='+Date.now());return r.ok?await r.text():''}catch{return ''}}
+function modelStatus(st,name){const m=st.models?.[name]||{};if(st.completed_models?.[name])return 'DONE';if(st.failed_models?.[name])return 'FAILED';if(st.active_model===name)return 'RUNNING';if((st.survivor_models||[]).includes(name))return 'SURVIVOR';if(m.status==='screened')return 'SCREENED';return 'WAITING'}
+function modelSignal(status){if(status==='DONE')return {code:'DONE',cls:'sig-green'};if(status==='RUNNING')return {code:'RUNNING',cls:'sig-amber'};if(status==='FAILED')return {code:'FAILED',cls:'sig-red'};if(status==='SURVIVOR'||status==='SCREENED')return {code:status,cls:'sig-blue'};return {code:'WAITING',cls:'sig-grey'}}
+function rowClass(status){return status==='DONE'?'good':status==='FAILED'?'bad':status==='RUNNING'?'activeText':'muted'}
+function bestHpo(m){return m.best_hpo||{}}
+function renderModelRows(st){document.getElementById('modelRows').innerHTML=MODELS.map(name=>{const m=st.models?.[name]||{},done=st.completed_models?.[name]||{},status=modelStatus(st,name),signal=modelSignal(status),screen=m.screening||{},hpo=bestHpo(m),hist=m.hpo_history||[],o=done.oof_metrics||m.oof||{},t=done.test_metrics||{},elapsed=done.elapsed_seconds||screen.elapsed_seconds||0;return `<tr><td>${esc(name)}</td><td><span class="statusPill ${signal.cls}">${signal.code}</span></td><td>${n(screen.average_precision)}</td><td>${n(screen.auroc)}</td><td>${hist.length||'-'}</td><td>${n(hpo.average_precision)}</td><td>${n(hpo.log_loss)}</td><td class="good">${n(o.specificity)}</td><td>${n(o.recall)}</td><td>${n(o.ppv??o.precision)}</td><td>${n(t.specificity)}</td><td>${elapsed?fmt(elapsed):'-'}</td></tr>`}).join('')}
+function renderRows(st){const ranked=Object.entries(st.completed_models||{}).sort((a,b)=>Number(b[1].oof_metrics?.feasible)-Number(a[1].oof_metrics?.feasible)||(b[1].oof_metrics?.specificity||0)-(a[1].oof_metrics?.specificity||0)||(b[1].oof_metrics?.average_precision||0)-(a[1].oof_metrics?.average_precision||0));document.getElementById('rows').innerHTML=ranked.map(([name,r])=>{const o=r.oof_metrics||{},t=r.test_metrics||{};return `<tr><td>${esc(name)}</td><td class="good">${n(o.specificity)}</td><td>${n(o.recall)}</td><td>${n(o.ppv??o.precision)}</td><td>${n(o.average_precision)}</td><td>${n(o.auroc)}</td><td>${n(t.specificity)}</td><td>${n(t.recall)}</td><td>${n(t.ppv??t.precision)}</td><td>${n(t.average_precision)}</td><td>${n(r.selected_threshold)}</td></tr>`}).join('')||'<tr><td colspan="11">No completed survivor models yet.</td></tr>'}
+function renderWorkers(workers,st,runtime){if((st.phase||'').includes('FINAL')){document.getElementById('workers').innerHTML=`<div class="worker running"><div class="workerhead"><span>FINAL REFIT</span><span>NO CV FOLDS</span></div><div class="workerdata">${esc(st.active_model||'-')}<br>single full-train fit on the 80% training split<br>PID ${runtime?.pid??'-'} | CPU ${runtime?.cpu_percent??'-'}% | RSS ${runtime?.rss_mb??'-'} MB</div><div class="workerbar"><div class="workerfill" style="width:75%"></div></div></div>`;document.getElementById('workerSummary').textContent='This phase does not create fold workers; progress is visible through PID CPU/memory and the next state update.';return}let items=Object.values(workers||{}).sort((a,b)=>(a.fold||0)-(b.fold||0)).slice(0,4);while(items.length<4)items.push({status:'waiting',fold:'-',pid:'-',model:st.active_model||'-',phase:st.phase||'-',elapsed:0});document.getElementById('workers').innerHTML=items.map((w,i)=>{const status=w.status||'waiting',elapsed=status==='running'?Math.max(0,Date.now()/1000-Number(w.started||Date.now()/1000)):Number(w.elapsed||0),pct=status==='done'?100:status==='running'?Math.min(95,Math.max(7,elapsed/30*100)):0;return `<div class="worker ${esc(status)}"><div class="workerhead"><span>CORE ${i+1} // ${esc(status).toUpperCase()}</span><span>${esc(w.phase||'-')}</span></div><div class="workerdata">${esc(w.model||'-')}<br>fold ${w.fold??'-'} | PID ${w.pid??'-'} | elapsed ${fmt(elapsed)}</div><div class="workerbar"><div class="workerfill" style="width:${pct}%"></div></div></div>`}).join('');const done=Object.values(workers||{}).filter(w=>w.status==='done').length;document.getElementById('workerSummary').textContent=`${done}/${st.active_total_folds||'-'} folds completed in current phase | n_jobs ${Object.values(workers||{}).length||4}`}
+function metricHistory(st,name){const m=st.models?.[name]||{},hist=(m.hpo_history||[]).map(x=>({x:x.candidate,ap:x.average_precision,auroc:x.auroc,log_loss:x.log_loss}));if(m.screening)hist.unshift({x:0,ap:m.screening.average_precision,auroc:m.screening.auroc,log_loss:m.screening.log_loss});return hist}
+function drawCanvas(canvas,hist,title){const ctx=canvas.getContext('2d'),w=canvas.clientWidth||900,h=220,d=devicePixelRatio||1;canvas.width=w*d;canvas.height=h*d;ctx.setTransform(d,0,0,d,0,0);ctx.clearRect(0,0,w,h);ctx.font='11px monospace';if(!hist.length){ctx.fillStyle='#8b9abb';ctx.fillText('waiting for metrics',48,48);document.getElementById('chartNote').textContent=`${title} has no saved screening/HPO metrics yet.`;return}const pad=48,bottom=42,last=Math.max(1,hist.length-1),ap=hist.map(v=>Number(v.ap)||0),ll=hist.map(v=>Number(v.log_loss)||0),llMin=Math.min(...ll),llMax=Math.max(...ll),llSpan=Math.max(1e-6,llMax-llMin);ctx.strokeStyle='#263866';ctx.beginPath();ctx.moveTo(pad,12);ctx.lineTo(pad,h-bottom);ctx.lineTo(w-14,h-bottom);ctx.stroke();ctx.fillStyle='#8b9abb';[0,.25,.5,.75,1].forEach(v=>{let y=h-bottom-v*(h-bottom-22);ctx.strokeStyle='#172442';ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(w-14,y);ctx.stroke();ctx.fillText(v.toFixed(2),8,y+4)});[0,Math.floor(last/2),last].forEach(i=>{let x=pad+(w-pad-14)*i/last;ctx.fillText(String(hist[i]?.x??i),x-5,h-24)});ctx.fillText('0=screening, 1..N=HPO candidates',w/2-110,h-8);[[ap,'#00f6ff',v=>h-bottom-v*(h-bottom-24)],[ll,'#ff2bd6',v=>22+(v-llMin)/llSpan*(h-bottom-24)]].forEach(([vals,col,fn])=>{ctx.strokeStyle=col;ctx.shadowColor=col;ctx.shadowBlur=10;ctx.lineWidth=2;ctx.beginPath();vals.forEach((v,i)=>{let x=pad+(w-pad-14)*i/last,y=fn(v);i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();ctx.shadowBlur=0});ctx.fillStyle='#00f6ff';ctx.fillText('Average Precision',pad,11);ctx.fillStyle='#ff2bd6';ctx.fillText('log-loss normalized',pad+150,11);document.getElementById('chartNote').textContent=`${title} | ${hist.length} saved points | cyan: AP higher is better | pink: log-loss lower is better`}
+function renderCharts(st){let names=[st.active_model,...MODELS.filter(name=>name!==st.active_model)].filter(Boolean);names=names.filter((name,i)=>names.indexOf(name)===i);window._pages=names;if(window._page===undefined)window._page=0;if(st.active_model&&window._lastActive!==st.active_model){window._page=Math.max(0,names.indexOf(st.active_model));window._lastActive=st.active_model}window._page=Math.max(0,Math.min(window._page,names.length-1));const name=names[window._page];document.getElementById('pageModel').textContent=name?`${name} | ${window._page+1}/${names.length}`:'waiting';document.getElementById('prevModel').disabled=window._page<=0;document.getElementById('nextModel').disabled=window._page>=names.length-1;document.getElementById('prevModel').onclick=()=>{if(window._page>0){window._page--;renderCharts(st)}};document.getElementById('nextModel').onclick=()=>{if(window._page<names.length-1){window._page++;renderCharts(st)}};drawCanvas(document.getElementById('chart'),metricHistory(st,name),name||'selected model')}
+function phaseProgress(st){const survivors=Number(st.survivors||4),screened=Object.values(st.models||{}).filter(m=>m.screening).length,completed=Object.keys(st.completed_models||{}).length;let unit=screened,phaseDone=screened,phaseTotal=MODELS.length;if(st.phase?.includes('PHASE 2')){const idx=Math.max(0,(st.survivor_models||[]).indexOf(st.active_model));const frac=Math.max(0,Number(st.active_candidate||0)/Math.max(1,Number(st.active_total||1)));unit=MODELS.length+idx+frac;phaseDone=idx+frac;phaseTotal=survivors}if(st.phase?.includes('PHASE 3')||st.phase?.includes('FINAL')){const idx=Math.max(0,(st.survivor_models||[]).indexOf(st.active_model));const frac=st.phase?.includes('FINAL')?1:Math.max(0,Number(st.active_fold||0)/Math.max(1,Number(st.active_total_folds||1)));unit=MODELS.length+survivors+idx+frac;phaseDone=idx+frac;phaseTotal=survivors}if(st.status==='ok'){unit=MODELS.length+2*survivors;phaseDone=phaseTotal}const totalUnits=MODELS.length+2*survivors;return {pct:Math.max(0,Math.min(100,100*unit/Math.max(1,totalUnits))),unit,totalUnits,phaseDone,phaseTotal,screened,completed}}
+function elapsedFrom(ts){const t=Date.parse(ts||'');return Number.isFinite(t)?Math.max(0,Date.now()/1000-t/1000):0}
+function eta(totalElapsed,done,total){if(done<=0||total<=0||done>=total)return done>=total?'00:00:00':'calculating';const rate=done/Math.max(1,totalElapsed);return fmt((total-done)/rate)}
+function phaseCode(st){const p=String(st.phase||'');if(p.includes('PHASE 1'))return '1/4';if(p.includes('PHASE 2'))return '2/4';if(p.includes('PHASE 3'))return '3/4';if(p.includes('FINAL'))return '4/4';if(st.status==='ok'||p==='finished')return '4/4';return '-/4'}
+function phaseHelpHtml(st){return `<b>${esc(phaseCode(st))} ${esc(st.phase||'ready')}</b><br>1/4 Screening: fast 3-fold cross-validation for all eligible models using Average Precision.<br>2/4 HPO: 5-fold randomized hyperparameter search on survivor models, still scored by Average Precision.<br>3/4 OOF thresholding: 10-fold out-of-fold probabilities are used to select the operating threshold.<br>4/4 Final: refit on the full 80% training split, freeze the threshold, then evaluate once on the held-out 20%.`}
+function renderRefitInsights(st){const r=st.refit_progress||{},params=r.params||{};document.getElementById('refitEta').textContent=r.eta_seconds==null?'-':fmt(r.eta_seconds);document.getElementById('refitBestAp').textContent=n(r.best_hpo_average_precision);document.getElementById('refitInsights').innerHTML=r.model?`model <b>${esc(r.model)}</b> | status <b>${esc(r.status)}</b> | elapsed <b>${fmt(r.elapsed_seconds)}</b> | ETA <b>${r.eta_seconds==null?'calculating':fmt(r.eta_seconds)}</b> | best candidate <b>${r.best_hpo_candidate??'-'}</b> | best AP <b>${n(r.best_hpo_average_precision)}</b> | best log-loss <b>${n(r.best_hpo_log_loss)}</b><br><span class="muted">${esc(JSON.stringify(params))}</span>`:'No final refit heartbeat yet.'}
+async function refresh(){const st=await json('state.json',{}),workers=await json('parallel_progress.json',{}),runtime=await json('runtime_status.json',{}),log=await text('training.log'),prog=phaseProgress(st),cand=Number(st.active_candidate||0),candTotal=Number(st.active_total||0),fold=Number(st.active_fold||0),foldTotal=Number(st.active_total_folds||0),totalElapsed=elapsedFrom(st.started),modelElapsed=elapsedFrom(st.active_model_started||st.updated_at||st.started),stateAge=elapsedFrom(st.updated_at),phaseEtaText=eta(modelElapsed,prog.phaseDone,prog.phaseTotal),totalEtaText=eta(totalElapsed,prog.unit,prog.totalUnits);document.getElementById('status').textContent=(st.status||'ready').toUpperCase();document.getElementById('phase').textContent=phaseCode(st);document.getElementById('phaseHelp').innerHTML=phaseHelpHtml(st);document.getElementById('model').textContent=st.active_model||'none';document.getElementById('candidate').textContent=candTotal?`${cand} / ${candTotal}`:'-';document.getElementById('fold').textContent=foldTotal?`${fold} / ${foldTotal}`:'-';document.getElementById('winner').textContent=st.winner||'-';document.getElementById('totalElapsed').innerHTML=fmtTimeHtml(totalElapsed);document.getElementById('modelElapsed').innerHTML=fmtTimeHtml(modelElapsed);document.getElementById('phaseEta').innerHTML=phaseEtaText.includes(':')?fmtTimeHtml(modelElapsed&&prog.phaseDone<prog.phaseTotal?(prog.phaseTotal-prog.phaseDone)/(prog.phaseDone/Math.max(1,modelElapsed)):0):phaseEtaText;document.getElementById('totalEta').innerHTML=totalEtaText.includes(':')?fmtTimeHtml(totalElapsed&&prog.unit<prog.totalUnits?(prog.totalUnits-prog.unit)/(prog.unit/Math.max(1,totalElapsed)):0):totalEtaText;document.getElementById('runtimePid').textContent=runtime.pid||'-';document.getElementById('runtimeLoad').textContent=runtime.pid?`${runtime.cpu_percent}% / ${runtime.rss_mb} MB / ${coresUsed(runtime)} cores`:'-';document.getElementById('stateAge').textContent=fmt(stateAge);document.getElementById('runtimeState').textContent=runtime.state||'-';renderRefitInsights(st);document.getElementById('fill').style.width=prog.pct+'%';document.getElementById('runner').style.setProperty('--rx',Math.min(99,prog.pct)+'%');document.getElementById('progress').textContent=`${prog.screened}/${MODELS.length} models screened | ${prog.completed}/${Number(st.survivors||4)} survivors completed | ${st.strategy||'3-fold AP screening -> 5-fold AP HPO -> 10-fold OOF specificity threshold at recall >= 0.80'}`;renderModelRows(st);renderWorkers(workers,st,runtime);renderCharts(st);renderRows(st);document.getElementById('latest').textContent=log.trim().split('\n').slice(-14).join('\n')||'waiting for new run'}
+refresh();setInterval(refresh,1000);
+document.getElementById('runner').addEventListener('click',()=>{const runner=document.getElementById('runner');runner.classList.remove('cheer');void runner.offsetWidth;runner.classList.add('cheer');setTimeout(()=>runner.classList.remove('cheer'),2300)});
+document.getElementById('phase').addEventListener('click',()=>document.getElementById('phaseHelp').classList.toggle('show'));
+</script>
+</body>
+</html>

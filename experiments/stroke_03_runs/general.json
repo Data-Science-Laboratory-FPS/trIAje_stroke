@@ -1,0 +1,8 @@
+{
+  "status": "error",
+  "started": "2026-08-06T14:56:10.577295+00:00",
+  "finished": "2026-08-06T14:56:11.089030+00:00",
+  "name": "general",
+  "error": "ModuleNotFoundError(\"No module named 'seaborn'\")",
+  "traceback": "Traceback (most recent call last):\n  File \"/home/marmengol/projects/trIAje_code/experiments/run_stroke_03.py\", line 61, in main\n    from kbase import modeling as ml\n  File \"/home/marmengol/projects/trIAje_code/analysis/kbase/modeling.py\", line 8, in <module>\n    import seaborn as sns\nModuleNotFoundError: No module named 'seaborn'\n"
+}

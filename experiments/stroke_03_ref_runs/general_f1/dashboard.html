@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TRIAJE // Stroke General // 03ref</title>
+  <style>
+    :root { --cyan:#00f6ff; --pink:#ff2bd6; --green:#52ff8a; --yellow:#ffe66d; --bg:#070914; --panel:#0d1224; --line:#24345a; --muted:#8b9abb; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:radial-gradient(circle at 80% 10%, #18204a 0, transparent 35%), var(--bg); color:#eaf4ff; font:14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    main { max-width:1500px; margin:0 auto; padding:24px; }
+    h1 { color:var(--cyan); letter-spacing:5px; text-shadow:0 0 14px #00f6ff88; font-size:clamp(20px,3vw,34px); margin:0 0 6px; }
+    .sub { color:var(--muted); margin-bottom:22px; }
+    .grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+    .card { background:#0d1224dd; border:1px solid var(--line); box-shadow:0 0 18px #00f6ff12; padding:16px; }
+    .label { color:var(--pink); font-size:11px; letter-spacing:2px; }
+    .value { color:var(--cyan); font-size:25px; margin-top:8px; }
+    .live { animation: flicker 1.2s infinite alternate; }
+    .pulse { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--green); box-shadow:0 0 10px var(--green); margin-right:8px; animation:pulse .7s infinite; }
+    @keyframes pulse { 50% { opacity:.25; transform:scale(.65); } }
+    @keyframes flicker { from { text-shadow:0 0 5px #00f6ff55; } to { text-shadow:0 0 18px #00f6ffaa; } }
+    .wide { margin-top:12px; overflow:auto; }
+    .bar { height:18px; border:1px solid var(--cyan); background:#070b18; margin:10px 0 6px; }
+    .fill { height:100%; width:0%; background:linear-gradient(90deg,var(--pink),var(--cyan)); box-shadow:0 0 14px var(--cyan); transition:width .4s; }
+    table { width:100%; min-width:1050px; border-collapse:collapse; margin-top:10px; }
+    th { color:var(--cyan); text-align:right; border-bottom:1px solid var(--cyan); padding:9px 7px; }
+    th:first-child, td:first-child { text-align:left; }
+    td { padding:9px 7px; border-bottom:1px solid #1d2a4a; text-align:right; }
+    tr:hover { background:#172044; }
+    .winner { color:var(--green); text-shadow:0 0 8px #52ff8a77; }
+    .ok { color:var(--green); } .warn { color:var(--yellow); }
+    pre { white-space:pre-wrap; max-height:220px; overflow:auto; color:#9eb5da; line-height:1.45; }
+    @media (max-width:800px) { main { padding:12px; } .grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  </style>
+</head>
+<body>
+<main>
+  <h1>TRIAJE // STROKE GENERAL // 03REF</h1>
+  <div class="sub">SKLEARN + XGBOOST | OPTIMISE F1 | 80/20 STRATIFIED SPLIT | 10-FOLD CV | OOF THRESHOLD | AUTO-REFRESH 0.5s</div>
+  <section class="grid">
+    <div class="card"><div class="label">STATUS</div><div id="status" class="value live"><span class="pulse"></span>LOADING</div></div>
+    <div class="card"><div class="label">MODELS</div><div id="models" class="value live">0 / 6</div></div>
+    <div class="card"><div class="label">ACTIVE MODEL</div><div id="active" class="value live" style="font-size:17px">loading</div></div>
+    <div class="card"><div class="label">ETA</div><div id="eta" class="value live">calculating</div></div>
+  </section>
+  <section class="card wide"><div class="label">GLOBAL PROGRESS</div><div class="bar"><div id="fill" class="fill"></div></div><div id="progress">loading</div></section>
+  <section class="card wide"><div class="label">BENCHMARK RESULTS</div>
+    <table><thead><tr><th>MODEL</th><th>CV F1</th><th>CV LOGLOSS</th><th>TEST AUROC</th><th>TEST AP</th><th>TEST LOGLOSS</th><th>BRIER</th><th>THR</th><th>F1</th><th>PREC</th><th>RECALL</th><th>SPEC</th><th>TP</th><th>TN</th><th>FP</th><th>FN</th></tr></thead><tbody id="rows"></tbody></table>
+  </section>
+  <section class="card wide"><div class="label">LOSS CURVE // SELECTED MODEL</div><canvas id="lossChart" height="180"></canvas><div id="lossNote" class="sub">Waiting for saved per-iteration CV history.</div></section>
+  <section class="card wide"><div class="label">LATEST EVENT</div><pre id="latest">loading</pre></section>
+</main>
+<script>
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const n = (v,d=4) => typeof v === 'number' ? v.toFixed(d) : '-';
+const fmt = s => { s=Math.max(0,Math.floor(s||0)); return String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor(s%3600/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0'); };
+async function refresh() {
+  try {
+    const state = await (await fetch('state.json?ts='+Date.now())).json();
+    const entries = Object.entries(state.completed_models || {});
+    const elapsed = entries.reduce((a,[,r]) => a + Number(r.elapsed_seconds || 0), 0);
+    const started = Date.parse(state.started || '') || Date.now();
+    const liveElapsed = Math.max(0, (Date.now() - started) / 1000);
+    document.getElementById('status').innerHTML = '<span class="pulse"></span>' + (state.status || 'running').toUpperCase();
+    document.getElementById('status').className = 'value ' + (state.status === 'ok' ? 'ok' : 'warn');
+    document.getElementById('models').textContent = entries.length + ' / 6';
+    const log = await (await fetch('training.log?ts='+Date.now())).text();
+    const markers = [...log.matchAll(/\n\[([^\]]+)\] RandomizedSearchCV n_iter=(\d+)/g)];
+    const active = markers.length ? markers[markers.length-1][1] : 'preparing data';
+    const segment = markers.length ? log.slice(markers[markers.length-1].index) : '';
+    const fits = Math.min(200, (segment.match(/\[CV\] END/g)||[]).length);
+    const activeElapsed = Math.max(1, liveElapsed - elapsed);
+    const rate = fits > 0 ? fits / activeElapsed : 0;
+    const currentRemaining = rate ? (200 - fits) / rate : 0;
+    const futureModels = Math.max(0, 6 - entries.length - 1);
+    const fallbackPerModel = entries.length ? elapsed / entries.length : 0;
+    const futurePerModel = rate ? 200 / rate : fallbackPerModel;
+    const eta = currentRemaining + futureModels * futurePerModel;
+    document.getElementById('eta').textContent = eta ? fmt(eta) : 'calculating';
+    document.getElementById('active').textContent = active;
+    document.getElementById('fill').style.width = (entries.length/6*100) + '%';
+    const fitRate = rate.toFixed(2);
+    document.getElementById('progress').textContent = `${entries.length}/6 models | active CV fits ${fits}/200 | speed ${fitRate} fits/s | live elapsed ${fmt(liveElapsed)} | active remaining ${fmt(currentRemaining)} | future estimate ${fmt(futurePerModel)} / model | ETA ${eta ? fmt(eta) : 'calculating'}`;
+    document.getElementById('latest').textContent = log.trim().split('\n').slice(-8).join('\n');
+    const ranked = entries.sort((a,b)=>(b[1].test_metrics?.auroc||0)-(a[1].test_metrics?.auroc||0));
+    document.getElementById('rows').innerHTML = ranked.map(([name,r],i) => { const m=r.test_metrics||{}; const h=r.search_history||[]; const last=h.length?h[h.length-1].cv_log_loss:null; return `<tr class="${i===0?'winner':''}"><td>${esc(name)}${i===0?'  *':''}</td><td>${n(r.best_cv_f1)}</td><td>${last===null?'-':n(last)}</td><td>${n(m.auroc)}</td><td>${n(m.average_precision)}</td><td>${m.log_loss===undefined?'-':n(m.log_loss)}</td><td>${n(m.brier)}</td><td>${n(r.oof_threshold)}</td><td>${n(m.f1)}</td><td>${n(m.precision)}</td><td>${n(m.recall)}</td><td>${n(m.specificity)}</td><td>${m.tp??'-'}</td><td>${m.tn??'-'}</td><td>${m.fp??'-'}</td><td>${m.fn??'-'}</td></tr>`; }).join('');
+    drawLoss(ranked.length ? ranked[0][0] : null, ranked.length ? ranked[0][1] : null);
+  } catch (e) { document.getElementById('latest').textContent = 'Waiting for local server/data: ' + e; }
+}
+function drawLoss(name, row) {
+  const canvas=document.getElementById('lossChart'), ctx=canvas.getContext('2d'), w=canvas.clientWidth||900, h=180, d=devicePixelRatio||1;
+  canvas.width=w*d; canvas.height=h*d; ctx.scale(d,d); ctx.clearRect(0,0,w,h);
+  const hist=(row&&row.search_history)||[]; if(!hist.length){ document.getElementById('lossNote').textContent='Loss curve will appear after a model stores its CV history.'; return; }
+  const vals=hist.map(x=>x.cv_log_loss), min=Math.min(...vals), max=Math.max(...vals), span=Math.max(max-min,1e-6), pad=28;
+  ctx.strokeStyle='#24345a'; ctx.lineWidth=1; ctx.beginPath(); ctx.moveTo(pad,12); ctx.lineTo(pad,h-24); ctx.lineTo(w-10,h-24); ctx.stroke();
+  ctx.strokeStyle='#ff2bd6'; ctx.lineWidth=2; ctx.shadowBlur=12; ctx.shadowColor='#ff2bd6'; ctx.beginPath();
+  vals.forEach((v,i)=>{const x=pad+(w-pad-14)*i/Math.max(1,vals.length-1), y=12+(v-min)/span*(h-38); i?ctx.lineTo(x,y):ctx.moveTo(x,y);}); ctx.stroke(); ctx.shadowBlur=0;
+  ctx.fillStyle='#8b9abb'; ctx.font='11px monospace'; ctx.fillText('lower is better',pad,10); ctx.fillText('iter '+hist.length,w-90,h-7);
+  document.getElementById('lossNote').textContent=`${name} | CV log-loss ${min.toFixed(4)} -> ${vals[vals.length-1].toFixed(4)} | ${hist.length} configurations`;
+}
+refresh(); setInterval(refresh,500);
+</script>
+</body>
+</html>

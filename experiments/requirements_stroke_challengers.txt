@@ -1,0 +1,9 @@
+# CPU challengers for the stroke-general benchmark.
+xgboost==2.1.4
+lightgbm==4.6.0
+catboost==1.2.10
+tabpfn==8.0.7
+tabm==0.0.3
+pytabkit==1.7.3
+skorch==1.2.0
+torch==2.8.0

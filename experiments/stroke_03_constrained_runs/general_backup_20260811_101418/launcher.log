@@ -1,0 +1,6 @@
+/usr/local/lib/python3.9/site-packages/joblib/externals/loky/backend/resource_tracker.py:314: UserWarning: resource_tracker: There appear to be 1 leaked file objects to clean up at shutdown
+  warnings.warn(
+/usr/local/lib/python3.9/site-packages/joblib/externals/loky/backend/resource_tracker.py:314: UserWarning: resource_tracker: There appear to be 10 leaked semlock objects to clean up at shutdown
+  warnings.warn(
+/usr/local/lib/python3.9/site-packages/joblib/externals/loky/backend/resource_tracker.py:314: UserWarning: resource_tracker: There appear to be 29 leaked folder objects to clean up at shutdown
+  warnings.warn(

@@ -1,0 +1,220 @@
+started=2026-08-06T15:01:29.240354+00:00
+name=general time_budget=600
+/home/marmengol/.local/lib/python3.9/site-packages/dask/dataframe/__init__.py:42: FutureWarning: 
+Dask dataframe query planning is disabled because dask-expr is not installed.
+
+You can install it with `pip install dask[dataframe]` or `conda install dask`.
+This will raise in a future version.
+
+  warnings.warn(msg, FutureWarning)
+El directorio de trabajo actual es: /home/marmengol/projects/trIAje_code
+El directorio de trabajo actual es: /media/datos/datos_compartidos/trIAje/data/df_modelling
+Current Date and Time: 06/08/2026 17:01:33
+
+=== Running the model for Stroke cohort - code 54 ===
+Triage subset: ALL patients (no triage-based filtering)
+Filtering by demand_type_1 == 54
+Filtering by age >= 18
+
+Final cohort size for p1_real_emerg: 42062
+Outcome distribution:  p1_real_emerg
+0    28302
+1    13760
+Name: count, dtype: Int64 
+
+
+========================================
+Columns retained before train/test split: 168
+Not used as model features: p1_real_emerg is the outcome; year is used with p1_real_emerg for stratification
+========================================
+
+Train samples: 33649
+Test samples:  8413
+Model features used for training: 166
+
+========================================
+FEATURE SUMMARY BY GROUP
+========================================
+  Triage questions  (digit prefix):    0
+  Literal reason    (lr_):             26
+  Clinical history  (hist_ new):        52
+  Legacy history    (com_ old):          0
+  Medication        (atc):             46
+  Other:                               42
+  ------------------------------
+  Total model features:               166
+========================================
+
+<class 'pandas.core.frame.DataFrame'>
+Index: 33649 entries, 18865 to 32209
+Data columns (total 166 columns):
+ #    Column                                               Dtype   
+---   ------                                               -----   
+ 0    age                                                  Int16   
+ 1    sex                                                  category
+ 2    alert_receiver_112                                   int8    
+ 3    alert_receiver_user                                  int8    
+ 4    alert_receiver_pol_fg                                int8    
+ 5    alert_receiver_hs                                    int8    
+ 6    alert_receiver_tele                                  int8    
+ 7    alert_receiver_others                                int8    
+ 8    location_patient_home                                int8    
+ 9    location_patient_public_road                         int8    
+ 10   location_patient_other                               int8    
+ 11   day_week_monday                                      int8    
+ 12   day_week_tuesday                                     int8    
+ 13   day_week_wednesday                                   int8    
+ 14   day_week_thursday                                    int8    
+ 15   day_week_friday                                      int8    
+ 16   day_week_saturday                                    int8    
+ 17   day_week_sunday                                      int8    
+ 18   time_of_day_early_morning                            int8    
+ 19   time_of_day_morning                                  int8    
+ 20   time_of_day_afternoon                                int8    
+ 21   time_of_day_night                                    int8    
+ 22   month_january                                        int8    
+ 23   month_february                                       int8    
+ 24   month_march                                          int8    
+ 25   month_april                                          int8    
+ 26   month_may                                            int8    
+ 27   month_june                                           int8    
+ 28   month_july                                           int8    
+ 29   month_august                                         int8    
+ 30   month_september                                      int8    
+ 31   month_october                                        int8    
+ 32   month_november                                       int8    
+ 33   month_december                                       int8    
+ 34   province_almeria                                     int8    
+ 35   province_cadiz                                       int8    
+ 36   province_cordoba                                     int8    
+ 37   province_granada                                     int8    
+ 38   province_huelva                                      int8    
+ 39   province_jaen                                        int8    
+ 40   province_malaga                                      int8    
+ 41   province_sevilla                                     int8    
+ 42   lr_suspected_stroke                                  int8    
+ 43   lr_focal_speech_deficit                              int8    
+ 44   lr_focal_facial_weakness                             int8    
+ 45   lr_focal_arm_weakness                                int8    
+ 46   lr_focal_laterality_mentioned                        int8    
+ 47   lr_focal_leg_weakness                                int8    
+ 48   lr_focal_sensory_deficit                             int8    
+ 49   lr_focal_visual_deficit                              int8    
+ 50   lr_acute_confusion                                   int8    
+ 51   lr_altered_consciousness                             int8    
+ 52   lr_onset_hyperacute                                  int8    
+ 53   lr_onset_on_waking                                   int8    
+ 54   lr_onset_subacute                                    int8    
+ 55   lr_headache                                          int8    
+ 56   lr_seizure_or_convulsion                             int8    
+ 57   lr_symptom_dizziness_syncope                         int8    
+ 58   lr_symptom_digestive                                 int8    
+ 59   lr_symptom_infectious                                int8    
+ 60   lr_symptom_tremor_rigidity                           int8    
+ 61   lr_symptom_dysphagia                                 int8    
+ 62   lr_fragility_social_telecare                         int8    
+ 63   lr_fragility_baseline_dependency                     int8    
+ 64   lr_history_prior_stroke                              int8    
+ 65   lr_history_cardiovascular_risk                       int8    
+ 66   lr_caller_is_professional                            int8    
+ 67   lr_no_clinical_data                                  int8    
+ 68   atc_group_inhaled_adrenergics                        int8    
+ 69   atc_group_opioid_analgesics                          int8    
+ 70   atc_group_psycholeptics                              int8    
+ 71   atc_group_peripheral_antiadrenergics                 int8    
+ 72   atc_group_antiarrhythmics                            int8    
+ 73   atc_group_antidepressants                            int8    
+ 74   atc_group_oral_antidiabetic_drugs_excl_insulins      int8    
+ 75   atc_group_antiepileptics                             int8    
+ 76   atc_group_antihistamines_for_systemic_use            int8    
+ 77   atc_group_nsaids                                     int8    
+ 78   atc_group_antipsychotics                             int8    
+ 79   atc_group_antithrombotic_agents                      int8    
+ 80   atc_group_beta_blocking_agents                       int8    
+ 81   atc_group_calcium_channel_blockers                   int8    
+ 82   atc_group_systemic_corticosteroids_plain             int8    
+ 83   atc_group_potassium_sparing_diuretics                int8    
+ 84   atc_group_anti_parkinson_drugs                       int8    
+ 85   atc_group_expectorants                               int8    
+ 86   atc_group_cardiac_glycosides                         int8    
+ 87   atc_group_platelet_aggregation_inhibitors            int8    
+ 88   atc_group_insulins_and_analogues                     int8    
+ 89   atc_group_laxatives                                  int8    
+ 90   atc_group_antivertigo_preparations                   int8    
+ 91   atc_group_anti_dementia_drugs                        int8    
+ 92   atc_group_benign_prostatic_hypertrophy_drugs         int8    
+ 93   atc_group_drugs_for_peptic_ulcer_and_gerd            int8    
+ 94   atc_group_calcium_and_bone_structure_agents          int8    
+ 95   atc_group_lipid_modifying_agents                     int8    
+ 96   atc_group_other_cardiac_therapy                      int8    
+ 97   atc_group_clinical_nutrition_and_electrolytes        int8    
+ 98   atc_group_other_analgesics_and_antipyretics          int8    
+ 99   atc_group_other_urologicals_incl_antispasmodics      int8    
+ 100  atc_group_antiglaucoma_preparations_and_miotics      int8    
+ 101  atc_group_antigout_preparations                      int8    
+ 102  atc_group_thyroid_preparations                       int8    
+ 103  atc_group_absorbent_sanitary_products                int8    
+ 104  atc_group_propulsives                                int8    
+ 105  atc_group_psychostimulants_adhd_and_nootropics       int8    
+ 106  atc_group_peripheral_vasodilators                    int8    
+ 107  atc_group_vitamin_b12_and_folic_acid                 int8    
+ 108  atc_group_vitamins_a_and_d                           int8    
+ 109  atc_group_ace_inhibitors_and_arbs                    int8    
+ 110  atc_group_diuretics                                  int8    
+ 111  atc_group_antibacterials                             int8    
+ 112  atc_group_inhalants_for_obstructive_airway_diseases  int8    
+ 113  atc_group_iron_preparations                          int8    
+ 114  hist_1_1_hypertension                                int8    
+ 115  hist_1_2_diabetes                                    int8    
+ 116  hist_1_3_dyslipidemia                                int8    
+ 117  hist_1_4_smoking                                     int8    
+ 118  hist_1_5_obesity                                     int8    
+ 119  hist_1_6_alcohol                                     int8    
+ 120  hist_1_7_toxicos                                     int8    
+ 121  hist_2_1_dementia                                    int8    
+ 122  hist_2_2_bedridden                                   int8    
+ 123  hist_2_3_polimedicado                                int8    
+ 124  hist_3_1_ischemic_heart                              int8    
+ 125  hist_3_2_heart_failure                               int8    
+ 126  hist_3_3_arrhythmia                                  int8    
+ 127  hist_3_4_peripheral_vasc                             int8    
+ 128  hist_3_5_chronicaortic                               int8    
+ 129  hist_3_6_othercardiovascular                         int8    
+ 130  hist_3_7_sincope                                     int8    
+ 131  hist_4_1_copd                                        int8    
+ 132  hist_4_2_asthma                                      int8    
+ 133  hist_4_3_oxygen_support                              int8    
+ 134  hist_4_4_etev                                        int8    
+ 135  hist_4_5_respiratoryfailure                          int8    
+ 136  hist_5_1_cerebrovascular                             int8    
+ 137  hist_5_2_epilepsy                                    int8    
+ 138  hist_5_3_hemiplegia                                  int8    
+ 139  hist_5_4_neurochronic                                int8    
+ 140  hist_6_1_renal                                       int8    
+ 141  hist_6_2_hepatic                                     int8    
+ 142  hist_6_3_oncologic                                   int8    
+ 143  hist_6_4_connective_tissue                           int8    
+ 144  hist_6_5_digestive                                   int8    
+ 145  hist_6_6_renalchronic                                int8    
+ 146  hist_7_1_otherquiru                                  int8    
+ 147  hist_7_2_other_inmunodepressive                      int8    
+ 148  hist_7_3_allergy                                     int8    
+ 149  hist_7_4_otherinfec                                  int8    
+ 150  hist_7_5_othertrauma                                 int8    
+ 151  hist_7_other                                         int8    
+ 152  hist_8_mentalhealth                                  int8    
+ 153  hist_9_1_plan_cronicos                               int8    
+ 154  hist_10_1_fall_risk                                  int8    
+ 155  hist_10_2_self_care_deficit                          int8    
+ 156  hist_10_3_mobility_impairment                        int8    
+ 157  hist_10_4_cognitive_impairment                       int8    
+ 158  hist_10_5_activity_intolerance                       int8    
+ 159  hist_10_6_urinary_incontinence                       int8    
+ 160  hist_10_7_home_maintenance                           int8    
+ 161  hist_10_8_therapeutic_regimen                        int8    
+ 162  hist_10_9_sleep_impairment                           int8    
+ 163  hist_10_10_skin_integrity_risk                       int8    
+ 164  hist_10_11_pain_chronic                              int8    
+ 165  hist_10_12_other_nursing                             int8    
+dtypes: Int16(1), category(1), int8(164)
+memory usage: 5.6 MB
