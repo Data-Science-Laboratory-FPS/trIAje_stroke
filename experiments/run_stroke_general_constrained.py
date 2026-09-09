@@ -9,6 +9,7 @@ import copy
 import fcntl
 import json
 import os
+import shutil
 import sys
 import threading
 import time
@@ -30,7 +31,8 @@ from sklearn.metrics import (
 from sklearn.model_selection import ParameterSampler, StratifiedKFold, train_test_split
 
 ROOT = Path(__file__).resolve().parents[1]
-RUN_DIR = ROOT / "experiments" / "stroke_03_constrained_runs" / "general"
+DEFAULT_RUN_DIR = ROOT / "experiments" / "stroke_03_constrained_runs" / "general"
+DASHBOARD_TEMPLATE = ROOT / "experiments" / "dashboard_template.html"
 sys.path.insert(0, str(ROOT / "analysis"))
 sys.path.insert(0, str(ROOT / "experiments"))
 
@@ -56,7 +58,7 @@ def ordered_names(names):
 
 
 def setup_env() -> None:
-    from run_stroke_general_ref03 import configure_environment
+    from stroke_data_adapter import configure_environment
 
     configure_environment()
 
@@ -359,22 +361,28 @@ def main() -> int:
     parser.add_argument("--hpo-candidates", type=int, default=12)
     parser.add_argument("--survivors", type=int, default=4)
     parser.add_argument("--n-jobs", type=int, default=4)
+    parser.add_argument("--run-dir", type=Path, default=DEFAULT_RUN_DIR)
+    parser.add_argument("--dashboard-template", type=Path, default=DASHBOARD_TEMPLATE)
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
     setup_env()
-    RUN_DIR.mkdir(parents=True, exist_ok=True)
-    log_path = RUN_DIR / "training.log"
-    state_path = RUN_DIR / "state.json"
-    split_path = RUN_DIR / "split.npz"
-    result_path = RUN_DIR / "results.json"
-    progress_path = RUN_DIR / "parallel_progress.json"
+    run_dir = args.run_dir.expanduser().resolve()
+    run_dir.mkdir(parents=True, exist_ok=True)
+    dashboard_path = run_dir / "dashboard.html"
+    if args.dashboard_template and args.dashboard_template.exists() and not dashboard_path.exists():
+        shutil.copy2(args.dashboard_template, dashboard_path)
+    log_path = run_dir / "training.log"
+    state_path = run_dir / "state.json"
+    split_path = run_dir / "split.npz"
+    result_path = run_dir / "results.json"
+    progress_path = run_dir / "parallel_progress.json"
 
     with log_path.open("a", encoding="utf-8") as log, contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
         started = datetime.now(timezone.utc).isoformat()
         print(f"\nstarted={started} objective=max_oof_specificity_at_recall_0.80 resume={args.resume}", flush=True)
         try:
-            from run_stroke_general_ref03 import prepare_data
+            from stroke_data_adapter import prepare_data
 
             X, y, _year = prepare_data()
             if split_path.exists() and args.resume:
@@ -598,7 +606,7 @@ def main() -> int:
                     }
                     model_state.update({"status": "completed", "oof": oof_metrics, "final": final})
                     state["completed_models"][model_name] = final
-                    joblib.dump(final_estimator, RUN_DIR / f"{model_name.lower().replace(' ', '_')}.joblib")
+                    joblib.dump(final_estimator, run_dir / f"{model_name.lower().replace(' ', '_')}.joblib")
                     update_state(state_path, state, active_fold=args.oof_folds)
                     print(json.dumps({"model": model_name, "oof_specificity_at_recall_0.80": oof_metrics["specificity"], "oof_recall": oof_metrics["recall"], "test_specificity": test_metrics["specificity"], "test_recall": test_metrics["recall"], "secondary_oof_f2": oof_points["f2"]["f2"]}), flush=True)
                 except Exception:
