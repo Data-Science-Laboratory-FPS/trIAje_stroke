@@ -25,12 +25,20 @@ import pyarrow.parquet as pq
 from typing import Optional, List, Union
 import shap
 import warnings
+try:
+    from IPython.display import display
+except ImportError:
+    display = print
 
 import kbase.preprocessing as dp
 import kbase.eda as eda
 from kbase.config import settings
 from kbase.labels import get_labels_map, get_display_label, resolve_demand_key
-from kbase.model_hyperparameters import AVAILABLE_CONFIGS, FIXED_XGBOOST_CONFIG
+from kbase.model_hyperparameters import (
+    AVAILABLE_CONFIGS,
+    FIXED_LGBM_CONFIG,
+    FIXED_LGBM_STROKE_HIST_P1_REAL_EMERG_BPS_20260821,
+)
 
 _FIGURES_DIR_MAP = {
     16: 'figures/03_dyspnea',
@@ -46,6 +54,9 @@ _OUTCOME_COLUMNS = [
     "p1_real_emerg_bps",
 ]
 
+TELEPHONIC_TRIAGE_LABEL = "Telephonic triage system"
+ML_MODEL_LABEL = "ML model"
+
 # Set by run_*_automl_model at the start of each pipeline run.
 # All internal plot functions read from here via save_figure().
 _current_demand_code = None
@@ -59,17 +70,22 @@ def _get_figures_dir(demand_code):
     rel = _FIGURES_DIR_MAP.get(key)
     return os.path.join(_ANALYSIS_DIR, rel) if rel is not None else None
 
-def save_figure(fig, filename, dpi=300):
-    """Saves a matplotlib figure to the demand-specific figures directory with high quality."""
-    folder = _get_figures_dir(_current_demand_code)
+def _resolve_figure_path(filename, figures_dir=None):
+    folder = figures_dir if figures_dir is not None else _get_figures_dir(_current_demand_code)
     if folder is None:
-        print(f"[save_figure] WARNING: no folder for demand_code={_current_demand_code!r}, skipping '{filename}'")
         return
     os.makedirs(folder, exist_ok=True)
     if _current_time_budget is not None:
         stem, ext = os.path.splitext(filename)
         filename = f"{stem}_{int(_current_time_budget // 60)}min{ext}"
-    path = os.path.join(folder, filename)
+    return os.path.join(folder, filename)
+
+def save_figure(fig, filename, dpi=300, figures_dir=None):
+    """Saves a matplotlib figure to the demand-specific figures directory with high quality."""
+    path = _resolve_figure_path(filename, figures_dir=figures_dir)
+    if path is None:
+        print(f"[save_figure] WARNING: no folder for demand_code={_current_demand_code!r}, skipping '{filename}'")
+        return
     fig.savefig(path, dpi=dpi, bbox_inches='tight')
     print(f"Figure saved: {path}")
 
@@ -378,7 +394,7 @@ def data_load_col_selection(target_column, triage_value,
 
     # Initialize modelling columns with base columns
     modelling_cols = base_cols.copy()
-    # Add age groups (One-Hot Encoded columns, e.g. age_0_14, age_75_plus)
+    # Add age groups (One-Hot Encoded columns, e.g. age_15_24, age_75_plus)
     modelling_cols += [
         col for col in df.columns
         if col.startswith('age_') and col.split('_')[1].isdigit()
@@ -542,7 +558,7 @@ def data_filtering(df, target_column, demand_code,
     # Drop columns after cohort filtering and data export
     # for preparation to modeling.
     # Continuous 'age' remains a model feature; the WHO age-group indicators
-    # (age_0_14 ... age_75_plus) are reserved for subgroup fairness evaluation
+    # (age_15_24 ... age_75_plus) are reserved for subgroup fairness evaluation
     # and are therefore excluded from the modeling feature set here.
     age_group_cols = [
         c for c in df.columns
@@ -657,7 +673,7 @@ def run_automl_training(
     task,
     max_iter=None,
     fixed_config=None,
-    fixed_estimator="xgboost",
+    fixed_estimator="lgbm",
 ):
     """Executes FLAML AutoML under time, iteration, or fixed-configuration mode."""
     time_budget_set = time_budget is not None and time_budget != -1
@@ -1913,6 +1929,436 @@ def plot_sa_roc(y_test, y_test_prob, tau_safe_pos, tau_safe_neg, zone_stats=None
     plt.show()
 
 
+def _normalized_confusion_matrix(cm, normalize):
+    """Returns percentages for a confusion matrix under the requested denominator."""
+    valid_normalizers = {"row", "all", "col"}
+    if normalize not in valid_normalizers:
+        raise ValueError(
+            f"normalize must be one of {sorted(valid_normalizers)}; got {normalize!r}."
+        )
+
+    cm_float = cm.astype(float)
+    if normalize == "row":
+        denominator = cm_float.sum(axis=1, keepdims=True)
+    elif normalize == "col":
+        denominator = cm_float.sum(axis=0, keepdims=True)
+    else:
+        denominator = cm_float.sum()
+
+    return np.divide(
+        cm_float,
+        denominator,
+        out=np.zeros_like(cm_float, dtype=float),
+        where=denominator != 0,
+    )
+
+
+def _confusion_matrix_annotations(cm, normalize="row"):
+    cm_norm = _normalized_confusion_matrix(cm, normalize)
+    return np.array([
+        [f"{cm[i, j]:d}\n({cm_norm[i, j] * 100:.1f}%)" for j in range(cm.shape[1])]
+        for i in range(cm.shape[0])
+    ])
+
+
+def plot_confusion_comparison(
+    y_true, y_pred_triage, y_pred_model,
+    figures_dir=None, filename='confusion_comparison.png',
+    normalize='row',
+):
+    """Draws side-by-side test-set confusion matrices for triage and ML model."""
+    labels = ['Negative', 'Positive']
+    cm_triage = confusion_matrix(y_true, y_pred_triage, labels=[0, 1])
+    cm_model = confusion_matrix(y_true, y_pred_model, labels=[0, 1])
+    annot_triage = _confusion_matrix_annotations(cm_triage, normalize=normalize)
+    annot_model = _confusion_matrix_annotations(cm_model, normalize=normalize)
+    vmax = max(cm_triage.max(), cm_model.max())
+
+    fig, axes = plt.subplots(1, 2, figsize=(13, 5.8))
+    sns.heatmap(
+        cm_triage,
+        annot=annot_triage,
+        cmap='Blues',
+        fmt='',
+        xticklabels=labels,
+        yticklabels=labels,
+        vmin=0,
+        vmax=vmax,
+        cbar=False,
+        annot_kws={'fontsize': 11},
+        ax=axes[0],
+    )
+    sns.heatmap(
+        cm_model,
+        annot=annot_model,
+        cmap='Blues',
+        fmt='',
+        xticklabels=labels,
+        yticklabels=labels,
+        vmin=0,
+        vmax=vmax,
+        cbar=True,
+        annot_kws={'fontsize': 11},
+        ax=axes[1],
+    )
+
+    axes[0].set_title(TELEPHONIC_TRIAGE_LABEL)
+    axes[1].set_title(ML_MODEL_LABEL)
+    axes[0].set_xlabel('Predicted')
+    axes[1].set_xlabel('Predicted')
+    axes[0].set_ylabel('Actual')
+    axes[1].set_ylabel('')
+    fig.suptitle('Confusion matrix comparison (test set)')
+    plt.tight_layout()
+    save_figure(fig, filename, figures_dir=figures_dir)
+    plt.show()
+
+
+def _get_general_metrics_row(df):
+    if "Subgroup" in df.columns and (df["Subgroup"] == "General").any():
+        return df.loc[df["Subgroup"] == "General"].iloc[0]
+    return df.iloc[0]
+
+
+def _metric_value_with_ci(row, metric):
+    value = pd.to_numeric(row.get(f"{metric} (%)"), errors="coerce")
+    lo = pd.to_numeric(row.get(f"{metric} CI lo (%)"), errors="coerce")
+    hi = pd.to_numeric(row.get(f"{metric} CI hi (%)"), errors="coerce")
+    return float(value), float(lo), float(hi)
+
+
+def _general_row_n(row):
+    if "N" not in row.index:
+        return np.nan
+    return pd.to_numeric(str(row["N"]).replace(",", ""), errors="coerce")
+
+
+def plot_metrics_comparison(
+    triage_overall_df, model_overall_df,
+    figures_dir=None, filename='metrics_comparison.png',
+    metric_order=('Accuracy', 'Recall', 'Precision', 'Specificity',
+                  'F1-Score', 'F2-Score', 'Overtriage', 'Undertriage'),
+    error_metrics=('Overtriage', 'Undertriage'),
+):
+    """Grouped bar chart comparing triage vs ML diagnostic performance with 95% CIs."""
+    triage_row = _get_general_metrics_row(triage_overall_df)
+    model_row = _get_general_metrics_row(model_overall_df)
+
+    triage_values, triage_lo, triage_hi = [], [], []
+    model_values, model_lo, model_hi = [], [], []
+    for metric in metric_order:
+        value, lo, hi = _metric_value_with_ci(triage_row, metric)
+        triage_values.append(value)
+        triage_lo.append(lo)
+        triage_hi.append(hi)
+
+        value, lo, hi = _metric_value_with_ci(model_row, metric)
+        model_values.append(value)
+        model_lo.append(lo)
+        model_hi.append(hi)
+
+    triage_values = np.array(triage_values, dtype=float)
+    model_values = np.array(model_values, dtype=float)
+    triage_yerr = np.nan_to_num(
+        np.vstack([
+            triage_values - np.array(triage_lo, dtype=float),
+            np.array(triage_hi, dtype=float) - triage_values,
+        ]),
+        nan=0.0,
+    )
+    model_yerr = np.nan_to_num(
+        np.vstack([
+            model_values - np.array(model_lo, dtype=float),
+            np.array(model_hi, dtype=float) - model_values,
+        ]),
+        nan=0.0,
+    )
+
+    x = np.arange(len(metric_order))
+    width = 0.36
+    blues = plt.get_cmap('Blues')
+    triage_color = blues(0.55)
+    model_color = blues(0.85)
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    for idx, metric in enumerate(metric_order):
+        if metric in error_metrics:
+            ax.axvspan(idx - 0.5, idx + 0.5, color='gray', alpha=0.08, zorder=0)
+
+    triage_bars = ax.bar(
+        x - width / 2,
+        triage_values,
+        width,
+        yerr=triage_yerr,
+        capsize=3,
+        label=TELEPHONIC_TRIAGE_LABEL,
+        color=triage_color,
+        edgecolor='white',
+        linewidth=0.6,
+        zorder=2,
+    )
+    model_bars = ax.bar(
+        x + width / 2,
+        model_values,
+        width,
+        yerr=model_yerr,
+        capsize=3,
+        label=ML_MODEL_LABEL,
+        color=model_color,
+        edgecolor='white',
+        linewidth=0.6,
+        zorder=2,
+    )
+
+    for bars in (triage_bars, model_bars):
+        for bar in bars:
+            height = bar.get_height()
+            if not np.isnan(height):
+                ax.annotate(
+                    f"{height:.1f}%",
+                    xy=(bar.get_x() + bar.get_width() / 2, height),
+                    xytext=(0, 4),
+                    textcoords="offset points",
+                    ha='center',
+                    va='bottom',
+                    fontsize=8,
+                )
+
+    triage_n = _general_row_n(triage_row)
+    model_n = _general_row_n(model_row)
+    note = "Overtriage and Undertriage: lower is better; all other metrics: higher is better."
+    if not pd.isna(triage_n) and not pd.isna(model_n) and int(triage_n) != int(model_n):
+        note += f" N differs: {TELEPHONIC_TRIAGE_LABEL} N={int(triage_n):,}; {ML_MODEL_LABEL} N={int(model_n):,}."
+
+    ax.set_title('Diagnostic performance comparison (test set)', fontsize=13)
+    ax.set_ylabel('Value (%)', fontsize=11)
+    ax.set_xticks(x)
+    ax.set_xticklabels(metric_order, rotation=30, ha='right')
+    ax.set_ylim(0, 100)
+    ax.grid(axis='y', alpha=0.25, zorder=1)
+    ax.legend(loc='upper right')
+    fig.text(0.01, 0.01, note, ha='left', va='bottom', fontsize=9)
+    plt.tight_layout(rect=(0, 0.04, 1, 1))
+    save_figure(fig, filename, figures_dir=figures_dir)
+    plt.show()
+
+
+def plot_subgroup_fairness_heatmap(
+    age_df,
+    figures_dir=None,
+    filename='subgroup_fairness_heatmap.png',
+    metric_order=('Accuracy', 'Precision', 'Recall', 'F1-Score', 'F2-Score',
+                  'Specificity', 'NPV', 'Overtriage', 'Undertriage'),
+    lower_is_better=('Overtriage', 'Undertriage'),
+    subgroup_order=('General', 'Young Adults', 'Middle-aged Adults',
+                    'Elderly', 'Seniors'),
+    color_mode='signed_ci',
+    small_n_threshold=1000,
+    color_clip=0.70,
+):
+    """Heatmap of model diagnostic performance by WHO age subgroup vs General."""
+    from matplotlib.colors import TwoSlopeNorm
+
+    valid_color_modes = {"signed_ci", "signed_pp", "general_green"}
+    if color_mode not in valid_color_modes:
+        raise ValueError(
+            f"color_mode must be one of {sorted(valid_color_modes)}; got {color_mode!r}."
+        )
+
+    available_subgroups = set(age_df["Subgroup"]) if "Subgroup" in age_df.columns else set()
+    missing_subgroups = [subgroup for subgroup in subgroup_order if subgroup not in available_subgroups]
+    if missing_subgroups:
+        print(
+            "[plot_subgroup_fairness_heatmap] WARNING: missing age subgroup row(s): "
+            f"{missing_subgroups}. Expected General plus all age subgroups."
+        )
+
+    rows_by_subgroup = {}
+    for subgroup in subgroup_order:
+        subgroup_rows = age_df.loc[age_df["Subgroup"] == subgroup] if "Subgroup" in age_df.columns else pd.DataFrame()
+        rows_by_subgroup[subgroup] = subgroup_rows.iloc[0] if not subgroup_rows.empty else None
+
+    if rows_by_subgroup.get("General") is None:
+        print("[plot_subgroup_fairness_heatmap] WARNING: General row is required; skipping figure.")
+        return None
+
+    values = np.full((len(metric_order), len(subgroup_order)), np.nan)
+    lo_values = np.full_like(values, np.nan)
+    hi_values = np.full_like(values, np.nan)
+    colors = np.zeros_like(values, dtype=float)
+
+    for i, metric in enumerate(metric_order):
+        general_value, _, _ = _metric_value_with_ci(rows_by_subgroup["General"], metric)
+        for j, subgroup in enumerate(subgroup_order):
+            row = rows_by_subgroup.get(subgroup)
+            if row is None:
+                continue
+
+            value, lo, hi = _metric_value_with_ci(row, metric)
+            values[i, j] = value
+            lo_values[i, j] = lo
+            hi_values[i, j] = hi
+
+            delta = value - general_value
+            oriented_delta = -delta if metric in lower_is_better else delta
+            if color_mode == "signed_ci":
+                half_width = (hi - lo) / 2
+                scale = max(half_width, 1e-6) if not np.isnan(half_width) else 1e-6
+                colors[i, j] = oriented_delta / scale
+            elif color_mode == "signed_pp":
+                colors[i, j] = oriented_delta / 15
+            else:
+                colors[i, j] = oriented_delta / 15
+
+    general_col_idx = subgroup_order.index("General")
+    colors[:, general_col_idx] = 0.0
+
+    colors = np.clip(colors, -color_clip, color_clip)
+
+    subgroup_ns = []
+    for subgroup in subgroup_order:
+        row = rows_by_subgroup.get(subgroup)
+        subgroup_ns.append(_general_row_n(row) if row is not None else np.nan)
+
+    col_labels = []
+    has_small_n = False
+    for subgroup, n in zip(subgroup_order, subgroup_ns):
+        if pd.isna(n):
+            col_labels.append(f"{subgroup}\nN=NA")
+            continue
+        n_int = int(n)
+        small_n_marker = "*" if n_int < small_n_threshold else ""
+        has_small_n = has_small_n or bool(small_n_marker)
+        col_labels.append(f"{subgroup}{small_n_marker}\nN={n_int:,}")
+
+    fig_width = max(9, len(subgroup_order) * 2.0)
+    fig_height = max(6, len(metric_order) * 0.62 + 2.1)
+    with sns.axes_style("white"):
+        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+    cmap = plt.get_cmap('RdYlGn')
+    norm = TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
+    im = ax.imshow(colors, cmap=cmap, norm=norm, aspect='auto', zorder=0)
+    ax.grid(False)
+    ax.set_axisbelow(True)
+
+    for i in range(len(metric_order)):
+        for j in range(len(subgroup_order)):
+            if np.isnan(values[i, j]):
+                ax.text(
+                    j, i, "NA",
+                    ha='center', va='center',
+                    fontsize=8,
+                    color='black',
+                )
+            else:
+                ax.text(
+                    j, i - 0.13, f"{values[i, j]:.1f}%",
+                    ha='center', va='center',
+                    fontsize=8.5,
+                    color='black',
+                )
+                ax.text(
+                    j, i + 0.18, f"[{lo_values[i, j]:.1f}-{hi_values[i, j]:.1f}]",
+                    ha='center', va='center',
+                    fontsize=7,
+                    color='black',
+                )
+
+    ax.set_xticks(np.arange(len(subgroup_order)))
+    ax.set_xticklabels(col_labels, fontsize=9)
+    ax.set_yticks(np.arange(len(metric_order)))
+    ax.set_yticklabels(metric_order, fontsize=10)
+    ax.set_title('Diagnostic performance by age subgroup (test set)', fontsize=13)
+    ax.set_xticks(np.arange(-0.5, len(subgroup_order), 1), minor=True)
+    ax.set_yticks(np.arange(-0.5, len(metric_order), 1), minor=True)
+    ax.tick_params(which='minor', bottom=False, left=False)
+    ax.vlines(
+        np.arange(-0.5, len(subgroup_order), 1),
+        -0.5,
+        len(metric_order) - 0.5,
+        colors='white',
+        linewidth=1.2,
+        zorder=1,
+    )
+    ax.hlines(
+        np.arange(-0.5, len(metric_order), 1),
+        -0.5,
+        len(subgroup_order) - 0.5,
+        colors='white',
+        linewidth=1.2,
+        zorder=1,
+    )
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+
+    cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
+    cbar.ax.grid(False)
+    cbar.set_label('Deviation vs General (oriented)', fontsize=9)
+    cbar.set_ticks([-1, 0, 1])
+    cbar.set_ticklabels(['Worse', 'Same', 'Better'])
+
+    notes = [
+        "Cell colour shows each subgroup's deviation from the General column within each row (green = better, orange = worse). "
+        "Overtriage and Undertriage are inverted (lower = better)."
+    ]
+    if has_small_n:
+        notes.append(
+            f"*N small: confidence intervals are wide; subgroup differences may not be statistically distinguishable."
+        )
+    fig.text(0.01, 0.01, " ".join(notes), ha='left', va='bottom', fontsize=8.5)
+    plt.tight_layout(rect=(0, 0.07, 1, 1))
+    save_figure(fig, filename, figures_dir=figures_dir)
+    plt.show()
+    return fig
+
+
+def combine_exported_roc_pr_curves(
+    roc_filename='roc_curve_youden.png',
+    pr_filename='pr_curve.png',
+    output_filename='roc_pr_curves.png',
+    figures_dir=None,
+    padding=24,
+):
+    """Combines the already-exported ROC and PR PNGs without redrawing them."""
+    try:
+        from PIL import Image
+    except ImportError:
+        print("[combine_exported_roc_pr_curves] WARNING: Pillow not available; skipping combined figure.")
+        return None
+
+    roc_path = _resolve_figure_path(roc_filename, figures_dir=figures_dir)
+    pr_path = _resolve_figure_path(pr_filename, figures_dir=figures_dir)
+    output_path = _resolve_figure_path(output_filename, figures_dir=figures_dir)
+    if roc_path is None or pr_path is None or output_path is None:
+        print(
+            "[combine_exported_roc_pr_curves] WARNING: no figures directory; "
+            f"skipping '{output_filename}'."
+        )
+        return None
+    missing = [path for path in (roc_path, pr_path) if not os.path.exists(path)]
+    if missing:
+        print(
+            "[combine_exported_roc_pr_curves] WARNING: missing source figure(s); "
+            f"skipping '{output_filename}': {missing}"
+        )
+        return None
+
+    with Image.open(roc_path) as roc_img, Image.open(pr_path) as pr_img:
+        roc_img = roc_img.convert("RGBA")
+        pr_img = pr_img.convert("RGBA")
+        width = roc_img.width + padding + pr_img.width
+        height = max(roc_img.height, pr_img.height)
+        combined = Image.new("RGBA", (width, height), "white")
+        roc_y = (height - roc_img.height) // 2
+        pr_y = (height - pr_img.height) // 2
+        combined.paste(roc_img, (0, roc_y), roc_img)
+        combined.paste(pr_img, (roc_img.width + padding, pr_y), pr_img)
+        combined.convert("RGB").save(output_path)
+
+    print(f"Figure saved: {output_path}")
+    return output_path
+
+
 def print_test_metrics_with_ci(
     y_test,
     y_test_prob,
@@ -1937,12 +2383,14 @@ def print_test_metrics_with_ci(
     y_test_pred = (y_test_prob >= threshold).astype(int)
 
     # --- Confusion matrix plot -----------------------------------------------
-    conf_matrix = confusion_matrix(y_test, y_test_pred)
+    conf_matrix = confusion_matrix(y_test, y_test_pred, labels=[0, 1])
     labels = ['Negative', 'Positive']
+    annot = _confusion_matrix_annotations(conf_matrix, normalize="row")
 
     fig_cm = plt.figure(figsize=(8, 6))
-    sns.heatmap(conf_matrix, annot=True, cmap='Blues', fmt='d',
-                xticklabels=labels, yticklabels=labels)
+    sns.heatmap(conf_matrix, annot=annot, cmap='Blues', fmt='',
+                xticklabels=labels, yticklabels=labels,
+                cbar=True, annot_kws={'fontsize': 11})
     plt.title('Classification Pipeline Confusion Matrix')
     plt.xlabel('Predicted')
     plt.ylabel('Actual')
@@ -1999,6 +2447,7 @@ def print_test_metrics_with_ci(
     plt.tight_layout()
     save_figure(fig_pr, 'pr_curve.png')
     plt.show()
+    combine_exported_roc_pr_curves()
 
     # --- Clopper–Pearson CIs -------------------------------------------------
     def _cp(x, n, alpha=0.05):
@@ -3118,7 +3567,7 @@ def run_binary_automl_model(
     time_budget: Optional[int] = 600,
     max_iter: Optional[int] = None,
     fixed_config: Optional[dict] = None,
-    fixed_estimator: str = "xgboost",
+    fixed_estimator: str = "lgbm",
     test_size: float = 0.2,
     seed: int = 42,
     min_age: Optional[int] = None,
@@ -3168,10 +3617,10 @@ def run_binary_automl_model(
         Explicit hyperparameters to use instead of searching. When supplied,
         FLAML evaluates this single configuration and no search is performed,
         making the execution reproducible and reducing runtime. Use
-        FIXED_XGBOOST_CONFIG for the current stroke hist_ reference
+        FIXED_LGBM_CONFIG for the current stroke hist_ reference
         configuration.
     fixed_estimator : str
-        Learner the fixed configuration belongs to. Defaults to "xgboost".
+        Learner the fixed configuration belongs to. Defaults to "lgbm".
     test_size : float
         Proportion of test split.
     seed : int
@@ -3362,7 +3811,7 @@ def run_binary_automl_model(
     plot_df['target_real'] = y_test
     plot_df['target_pred_model'] = y_test_pred
     plot_df['target_pred'] = plot_df['target_pred_model']
-    eda.evaluate_diagnostic_performance(
+    model_overall_df = eda.evaluate_diagnostic_performance(
         plot_df, 'target_real', 'target_pred_model',
         sex_group=False,
         figures_dir=_get_figures_dir(demand_code),
@@ -3382,7 +3831,7 @@ def run_binary_automl_model(
         filename_suffix="_model",
     )
     # Fairness analysis by age groups
-    eda.evaluate_diagnostic_performance(
+    age_overall_df = eda.evaluate_diagnostic_performance(
         plot_df, 'target_real', 'target_pred_model',
         age_group=True,
         figures_dir=_get_figures_dir(demand_code),
@@ -3391,17 +3840,51 @@ def run_binary_automl_model(
         evaluation_label="Predicted by the model",
         filename_suffix="_model",
     )
+    plot_subgroup_fairness_heatmap(
+        age_df=age_overall_df,
+        figures_dir=_get_figures_dir(demand_code),
+        filename='subgroup_fairness_heatmap_model.png',
+        color_mode='signed_ci',
+    )
     if "p1_assigned" in plot_df.columns:
         triage_plot_df = plot_df.copy()
         triage_plot_df["p1_assigned"] = pd.to_numeric(
             triage_plot_df["p1_assigned"], errors="coerce"
         )
-        triage_plot_df = triage_plot_df.dropna(subset=["target_real", "p1_assigned"])
+        has_model_prediction = "target_pred_model" in triage_plot_df.columns
+        if not has_model_prediction:
+            print(
+                "\nWARNING: target_pred_model not found; skipping confusion "
+                "comparison. Use y_test_pred aligned to y_test.index to build it."
+            )
+        common_subset_cols = ["target_real", "p1_assigned"]
+        if has_model_prediction:
+            common_subset_cols.append("target_pred_model")
+        triage_plot_df = triage_plot_df.dropna(subset=common_subset_cols)
         triage_plot_df["p1_assigned"] = triage_plot_df["p1_assigned"].astype("int8")
+        if has_model_prediction:
+            triage_plot_df["target_pred_model"] = (
+                triage_plot_df["target_pred_model"].astype("int8")
+            )
 
         print("\n--- Telephonic triage system diagnostic performance on test set ---")
         print(f"Rows evaluated: {len(triage_plot_df):,} / {len(plot_df):,} test rows")
-        eda.evaluate_diagnostic_performance(
+        if len(triage_plot_df) != len(plot_df):
+            print(
+                "WARNING: p1_assigned has missing values; confusion comparison "
+                f"uses the common subset for both matrices "
+                f"(model test N={len(plot_df):,}, common N={len(triage_plot_df):,})."
+            )
+        if has_model_prediction:
+            plot_confusion_comparison(
+                y_true=triage_plot_df['target_real'].astype(int).values,
+                y_pred_triage=triage_plot_df['p1_assigned'].astype(int).values,
+                y_pred_model=triage_plot_df['target_pred_model'].astype(int).values,
+                figures_dir=_get_figures_dir(demand_code),
+                filename='confusion_comparison.png',
+                normalize='row',
+            )
+        triage_overall_df = eda.evaluate_diagnostic_performance(
             triage_plot_df, "target_real", "p1_assigned",
             sex_group=False,
             figures_dir=_get_figures_dir(demand_code),
@@ -3409,6 +3892,12 @@ def run_binary_automl_model(
             export_tables=True,
             evaluation_label="Assigned by the telephonic triage system",
             filename_suffix="_telephonic_triage",
+        )
+        plot_metrics_comparison(
+            triage_overall_df=triage_overall_df,
+            model_overall_df=model_overall_df,
+            figures_dir=_get_figures_dir(demand_code),
+            filename='metrics_comparison.png',
         )
     else:
         print("\nWARNING: p1_assigned not found; skipping telephonic triage system evaluation.")
