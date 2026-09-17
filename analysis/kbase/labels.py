@@ -6,7 +6,6 @@
 # Labels shared across all demand types.
 COMMON_LABELS = {
     "age": "Age (years)",
-    "age_0_14": "Children: 0-14 years",
     "age_15_24": "Youth: 15-24 years",
     "age_25_44": "Young Adults: 25-44 tears",
     "age_45_59": "Middle-aged Adults: 45-59 years",

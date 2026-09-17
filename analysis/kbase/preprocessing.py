@@ -180,7 +180,6 @@ dtype_cols = {
     "national_id": "object",
     "full_name": "object",
     "age": "Int16",
-    "age_0_14": "Int8",
     "age_15_24": "Int8",
     "age_25_44": "Int8",
     "age_45_59": "Int8",
@@ -649,6 +648,12 @@ lr_translation_dict = {
     "lr_sint_infecc":     "lr_symptom_infectious",
     "lr_sint_temblor":    "lr_symptom_tremor_rigidity",
     "lr_sint_disfagia":   "lr_symptom_dysphagia",
+    "lr_caida":           "lr_fall",
+    "lr_high_BP":         "lr_high_blood_pressure",
+    "lr_low_BP":          "lr_low_blood_pressure",
+    "lr_hipox":           "lr_hypoxia",
+    "lr_hipoglucemia":    "lr_hypoglycemia",
+    "lr_hiperglucemia":   "lr_hyperglycemia",
     "lr_frag_social":     "lr_fragility_social_telecare",
     "lr_frag_basal":      "lr_fragility_baseline_dependency",
     "lr_ant_acv_prev":    "lr_history_prior_stroke",
@@ -1042,8 +1047,6 @@ def analyze_missing_values(df):
     plt.title("Missingness (Blank Strings) by Variable")
     plt.tight_layout()
     plt.show()
-
-
 
 
 

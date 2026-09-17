@@ -33,7 +33,7 @@ def evaluate_diagnostic_performance(
     If sex_group=True, it performs a cross-stratification: each group above is
     subdivided by Men and Women.
     If age_group=True, it performs a cross-stratification: each group above is
-    subdivided by WHO age groups (derived from the age_0_14 ... age_75_plus
+    subdivided by WHO age groups (derived from the age_15_24 ... age_75_plus
     indicators), keeping only groups with N > 1000.
     The N > 1000 threshold is evaluated on `reference_df` if provided (e.g. the
     full dataset, before any train/test split), otherwise on `df` itself.
@@ -95,7 +95,6 @@ def evaluate_diagnostic_performance(
     if age_group:
         # WHO age-group indicators -> single categorical label column
         age_group_cols = {
-            "age_0_14":    "Children",
             "age_15_24":   "Youth",
             "age_25_44":   "Young Adults",
             "age_45_59":   "Middle-aged Adults",

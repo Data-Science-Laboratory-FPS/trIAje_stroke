@@ -1,6 +1,7 @@
 from pydantic_settings import BaseSettings
 
 class Settings(BaseSettings):
+    triaje_project_path: str
     source_tables_path: str
     edatoscaso_load_path: str
     master_table_path: str
