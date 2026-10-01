@@ -18,6 +18,7 @@ from sklearn.metrics import (
 from sklearn.utils.class_weight import compute_sample_weight
 from sklearn.inspection import permutation_importance
 import matplotlib.pyplot as plt
+from matplotlib.colors import LinearSegmentedColormap
 import os
 from datetime import datetime
 import time
@@ -56,6 +57,18 @@ _OUTCOME_COLUMNS = [
 
 TELEPHONIC_TRIAGE_LABEL = "Telephonic triage system"
 ML_MODEL_LABEL = "ML model"
+
+SUBGROUP_HEATMAP_CMAP = LinearSegmentedColormap.from_list(
+    "subgroup_pastel",
+    [
+        (0.00, "#EF9496"),
+        (0.30, "#F5BE7D"),
+        (0.50, "#CEC76E"),
+        (0.75, "#B2C764"),
+        (1.00, "#8DC05A"),
+    ],
+)
+SUBGROUP_HEATMAP_CMAP.set_bad("#F2F2F2")
 
 # Set by run_*_automl_model at the start of each pipeline run.
 # All internal plot functions read from here via save_figure().
@@ -2145,18 +2158,25 @@ def plot_metrics_comparison(
 
 def plot_subgroup_fairness_heatmap(
     age_df,
+    sex_df=None,
     figures_dir=None,
     filename='subgroup_fairness_heatmap.png',
     metric_order=('Accuracy', 'Precision', 'Recall', 'F1-Score', 'F2-Score',
                   'Specificity', 'NPV', 'Overtriage', 'Undertriage'),
     lower_is_better=('Overtriage', 'Undertriage'),
-    subgroup_order=('General', 'Young Adults', 'Middle-aged Adults',
-                    'Elderly', 'Seniors'),
+    subgroup_order=None,
+    sex_subgroup_order=('Men', 'Women'),
+    sex_display_labels=None,
     color_mode='signed_ci',
     small_n_threshold=1000,
     color_clip=0.70,
+    title='Diagnostic performance by subgroup (test set)',
+    age_block_title='Age group',
+    sex_block_title='Sex',
+    font_family=None,
 ):
-    """Heatmap of model diagnostic performance by WHO age subgroup vs General."""
+    """Plot diagnostic performance for age and sex subgroups versus General."""
+    import matplotlib.font_manager as fm
     from matplotlib.colors import TwoSlopeNorm
 
     valid_color_modes = {"signed_ci", "signed_pp", "general_green"}
@@ -2165,150 +2185,174 @@ def plot_subgroup_fairness_heatmap(
             f"color_mode must be one of {sorted(valid_color_modes)}; got {color_mode!r}."
         )
 
-    available_subgroups = set(age_df["Subgroup"]) if "Subgroup" in age_df.columns else set()
-    missing_subgroups = [subgroup for subgroup in subgroup_order if subgroup not in available_subgroups]
-    if missing_subgroups:
-        print(
-            "[plot_subgroup_fairness_heatmap] WARNING: missing age subgroup row(s): "
-            f"{missing_subgroups}. Expected General plus all age subgroups."
-        )
+    def _first_row(df, subgroup):
+        if df is None or "Subgroup" not in df.columns:
+            return None
+        rows = df.loc[df["Subgroup"] == subgroup]
+        return rows.iloc[0] if not rows.empty else None
 
-    rows_by_subgroup = {}
-    for subgroup in subgroup_order:
-        subgroup_rows = age_df.loc[age_df["Subgroup"] == subgroup] if "Subgroup" in age_df.columns else pd.DataFrame()
-        rows_by_subgroup[subgroup] = subgroup_rows.iloc[0] if not subgroup_rows.empty else None
-
-    if rows_by_subgroup.get("General") is None:
+    general_row = _first_row(age_df, "General")
+    if general_row is None:
         print("[plot_subgroup_fairness_heatmap] WARNING: General row is required; skipping figure.")
         return None
 
-    values = np.full((len(metric_order), len(subgroup_order)), np.nan)
-    lo_values = np.full_like(values, np.nan)
-    hi_values = np.full_like(values, np.nan)
-    colors = np.zeros_like(values, dtype=float)
+    general_values = {m: _metric_value_with_ci(general_row, m)[0] for m in metric_order}
 
-    for i, metric in enumerate(metric_order):
-        general_value, _, _ = _metric_value_with_ci(rows_by_subgroup["General"], metric)
-        for j, subgroup in enumerate(subgroup_order):
-            row = rows_by_subgroup.get(subgroup)
+    def _build_block(df, subgroups, block_name):
+        missing = [s for s in subgroups if _first_row(df, s) is None]
+        if missing:
+            print(f"[plot_subgroup_fairness_heatmap] WARNING: missing {block_name} "
+                  f"subgroup row(s): {missing}.")
+
+        shape = (len(metric_order), len(subgroups))
+        vals, lo_v, hi_v = (np.full(shape, np.nan) for _ in range(3))
+        cols = np.full(shape, np.nan)
+        ns = []
+        for j, subgroup in enumerate(subgroups):
+            row = _first_row(df, subgroup)
+            ns.append(_general_row_n(row) if row is not None else np.nan)
             if row is None:
                 continue
+            for i, metric in enumerate(metric_order):
+                value, lo, hi = _metric_value_with_ci(row, metric)
+                vals[i, j], lo_v[i, j], hi_v[i, j] = value, lo, hi
+                if np.isnan(value):
+                    continue
+                if subgroup == "General":
+                    cols[i, j] = 0.0
+                    continue
+                delta = value - general_values[metric]
+                oriented = -delta if metric in lower_is_better else delta
+                if color_mode == "signed_ci":
+                    half_width = (hi - lo) / 2
+                    scale = max(half_width, 1e-6) if not np.isnan(half_width) else 1e-6
+                    cols[i, j] = oriented / scale
+                else:
+                    cols[i, j] = oriented / 15
+        return vals, lo_v, hi_v, np.clip(cols, -color_clip, color_clip), ns
 
-            value, lo, hi = _metric_value_with_ci(row, metric)
-            values[i, j] = value
-            lo_values[i, j] = lo
-            hi_values[i, j] = hi
+    if subgroup_order is None:
+        subgroup_order = [s for s in pd.unique(age_df["Subgroup"]) if s != "General"]
+    else:
+        subgroup_order = [s for s in subgroup_order if s != "General"]
 
-            delta = value - general_value
-            oriented_delta = -delta if metric in lower_is_better else delta
-            if color_mode == "signed_ci":
-                half_width = (hi - lo) / 2
-                scale = max(half_width, 1e-6) if not np.isnan(half_width) else 1e-6
-                colors[i, j] = oriented_delta / scale
-            elif color_mode == "signed_pp":
-                colors[i, j] = oriented_delta / 15
-            else:
-                colors[i, j] = oriented_delta / 15
+    blocks = [(None, ["General"], age_df, {})]
+    if subgroup_order:
+        blocks.append((age_block_title, list(subgroup_order), age_df, {}))
+    else:
+        print("[plot_subgroup_fairness_heatmap] WARNING: no age subgroup rows found; "
+              "plotting the available blocks only.")
 
-    general_col_idx = subgroup_order.index("General")
-    colors[:, general_col_idx] = 0.0
+    if sex_df is not None:
+        sex_present = [s for s in sex_subgroup_order if _first_row(sex_df, s) is not None]
+        if not sex_present:
+            found = list(pd.unique(sex_df["Subgroup"])) if "Subgroup" in sex_df.columns else []
+            print("[plot_subgroup_fairness_heatmap] WARNING: none of the sex subgroups "
+                  f"{list(sex_subgroup_order)} found in sex_df (found: {found}); "
+                  "plotting without the sex block.")
+        else:
+            sex_general = _first_row(sex_df, "General")
+            if sex_general is not None:
+                n_age, n_sex = _general_row_n(general_row), _general_row_n(sex_general)
+                if not (pd.isna(n_age) or pd.isna(n_sex)) and int(n_age) != int(n_sex):
+                    print(f"[plot_subgroup_fairness_heatmap] WARNING: General N differs "
+                          f"(age_df N={int(n_age):,}; sex_df N={int(n_sex):,}).")
+            blocks.append((sex_block_title, list(sex_subgroup_order), sex_df,
+                           sex_display_labels or {}))
 
-    colors = np.clip(colors, -color_clip, color_clip)
-
-    subgroup_ns = []
-    for subgroup in subgroup_order:
-        row = rows_by_subgroup.get(subgroup)
-        subgroup_ns.append(_general_row_n(row) if row is not None else np.nan)
-
-    col_labels = []
-    has_small_n = False
-    for subgroup, n in zip(subgroup_order, subgroup_ns):
-        if pd.isna(n):
-            col_labels.append(f"{subgroup}\nN=NA")
-            continue
-        n_int = int(n)
-        small_n_marker = "*" if n_int < small_n_threshold else ""
-        has_small_n = has_small_n or bool(small_n_marker)
-        col_labels.append(f"{subgroup}{small_n_marker}\nN={n_int:,}")
-
-    fig_width = max(9, len(subgroup_order) * 2.0)
-    fig_height = max(6, len(metric_order) * 0.62 + 2.1)
-    with sns.axes_style("white"):
-        fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-    cmap = plt.get_cmap('RdYlGn')
-    norm = TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
-    im = ax.imshow(colors, cmap=cmap, norm=norm, aspect='auto', zorder=0)
-    ax.grid(False)
-    ax.set_axisbelow(True)
-
-    for i in range(len(metric_order)):
-        for j in range(len(subgroup_order)):
-            if np.isnan(values[i, j]):
-                ax.text(
-                    j, i, "NA",
-                    ha='center', va='center',
-                    fontsize=8,
-                    color='black',
-                )
-            else:
-                ax.text(
-                    j, i - 0.13, f"{values[i, j]:.1f}%",
-                    ha='center', va='center',
-                    fontsize=8.5,
-                    color='black',
-                )
-                ax.text(
-                    j, i + 0.18, f"[{lo_values[i, j]:.1f}-{hi_values[i, j]:.1f}]",
-                    ha='center', va='center',
-                    fontsize=7,
-                    color='black',
-                )
-
-    ax.set_xticks(np.arange(len(subgroup_order)))
-    ax.set_xticklabels(col_labels, fontsize=9)
-    ax.set_yticks(np.arange(len(metric_order)))
-    ax.set_yticklabels(metric_order, fontsize=10)
-    ax.set_title('Diagnostic performance by age subgroup (test set)', fontsize=13)
-    ax.set_xticks(np.arange(-0.5, len(subgroup_order), 1), minor=True)
-    ax.set_yticks(np.arange(-0.5, len(metric_order), 1), minor=True)
-    ax.tick_params(which='minor', bottom=False, left=False)
-    ax.vlines(
-        np.arange(-0.5, len(subgroup_order), 1),
-        -0.5,
-        len(metric_order) - 0.5,
-        colors='white',
-        linewidth=1.2,
-        zorder=1,
-    )
-    ax.hlines(
-        np.arange(-0.5, len(metric_order), 1),
-        -0.5,
-        len(subgroup_order) - 0.5,
-        colors='white',
-        linewidth=1.2,
-        zorder=1,
-    )
-    for spine in ax.spines.values():
-        spine.set_visible(False)
-
-    cbar = fig.colorbar(im, ax=ax, fraction=0.035, pad=0.02)
-    cbar.ax.grid(False)
-    cbar.set_label('Deviation vs General (oriented)', fontsize=9)
-    cbar.set_ticks([-1, 0, 1])
-    cbar.set_ticklabels(['Worse', 'Same', 'Better'])
-
-    notes = [
-        "Cell colour shows each subgroup's deviation from the General column within each row (green = better, orange = worse). "
-        "Overtriage and Undertriage are inverted (lower = better)."
+    block_data = [
+        (name, subgroups, labels, _build_block(df, subgroups, name or "General"))
+        for name, subgroups, df, labels in blocks
     ]
-    if has_small_n:
-        notes.append(
-            f"*N small: confidence intervals are wide; subgroup differences may not be statistically distinguishable."
+
+    rc = {}
+    if font_family is not None:
+        available = {f.name for f in fm.fontManager.ttflist}
+        if font_family in available:
+            rc["font.family"] = font_family
+        else:
+            print(f"[plot_subgroup_fairness_heatmap] WARNING: font '{font_family}' not installed; "
+                  "using matplotlib default.")
+
+    n_metrics = len(metric_order)
+    n_cols_total = sum(len(block[1]) for block in block_data)
+    gap = 0.45
+    width_ratios = []
+    for k, (_, subgroups, _, _) in enumerate(block_data):
+        if k > 0:
+            width_ratios.append(gap)
+        width_ratios.append(len(subgroups))
+    width_ratios += [gap, 0.22]
+
+    fig_width = max(9, (n_cols_total + gap * len(block_data)) * 1.85 + 2.5)
+    fig_height = max(6, n_metrics * 0.62 + 2.4)
+    norm = TwoSlopeNorm(vmin=-1, vcenter=0, vmax=1)
+
+    with plt.rc_context(rc), sns.axes_style("white"):
+        fig = plt.figure(figsize=(fig_width, fig_height))
+        gs = fig.add_gridspec(
+            1, len(width_ratios), width_ratios=width_ratios,
+            left=0.10, right=0.95, bottom=0.03,
+            top=0.85 if title else 0.89, wspace=0.0,
         )
-    fig.text(0.01, 0.01, " ".join(notes), ha='left', va='bottom', fontsize=8.5)
-    plt.tight_layout(rect=(0, 0.07, 1, 1))
-    save_figure(fig, filename, figures_dir=figures_dir)
-    plt.show()
+
+        im = None
+        for k, (block_name, subgroups, display_labels, data) in enumerate(block_data):
+            vals, lo_v, hi_v, cols, ns = data
+            ax = fig.add_subplot(gs[0, 2 * k])
+            im = ax.imshow(
+                np.ma.masked_invalid(cols), cmap=SUBGROUP_HEATMAP_CMAP,
+                norm=norm, aspect='auto',
+            )
+            for i in range(n_metrics):
+                for j in range(len(subgroups)):
+                    if np.isnan(vals[i, j]):
+                        ax.text(j, i, "NA", ha='center', va='center', fontsize=8)
+                        continue
+                    ax.text(j, i - 0.13, f"{vals[i, j]:.1f}%", ha='center', va='center',
+                            fontsize=9, fontweight='bold' if subgroups[j] == "General" else 'normal')
+                    ax.text(j, i + 0.20, f"[{lo_v[i, j]:.1f}–{hi_v[i, j]:.1f}]",
+                            ha='center', va='center', fontsize=7, color='#333333')
+
+            col_labels = []
+            for subgroup, n in zip(subgroups, ns):
+                label = display_labels.get(subgroup, subgroup)
+                if pd.isna(n):
+                    col_labels.append(f"{label}\nN=NA")
+                    continue
+                small = (small_n_threshold is not None and subgroup != "General"
+                         and int(n) < small_n_threshold)
+                col_labels.append(f"{label}{'*' if small else ''}\nN={int(n):,}")
+
+            ax.set_xticks(np.arange(len(subgroups)))
+            ax.set_xticklabels(col_labels, fontsize=9)
+            ax.tick_params(axis='x', top=True, bottom=False,
+                           labeltop=True, labelbottom=False, length=0, pad=4)
+            ax.set_yticks(np.arange(n_metrics))
+            ax.set_yticklabels(metric_order if k == 0 else [], fontsize=10,
+                               fontweight='bold' if k == 0 else 'normal')
+            ax.tick_params(axis='y', length=0)
+            ax.vlines(np.arange(-0.5, len(subgroups) + 0.5, 1), -0.5, n_metrics - 0.5,
+                      colors='white', linewidth=2, clip_on=False)
+            ax.hlines(np.arange(-0.5, n_metrics + 0.5, 1), -0.5, len(subgroups) - 0.5,
+                      colors='white', linewidth=2, clip_on=False)
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            ax.grid(False)
+            if block_name:
+                ax.set_title(block_name, fontsize=11, fontweight='bold', pad=6)
+
+        cax = fig.add_subplot(gs[0, -1])
+        cbar = fig.colorbar(im, cax=cax)
+        cbar.outline.set_visible(False)
+        cbar.set_ticks([-1, 0, 1])
+        cbar.set_ticklabels(['Worse', 'Same', 'Better'])
+        cbar.ax.tick_params(length=0, labelsize=9)
+        cbar.set_label('Deviation vs General (oriented)', fontsize=9)
+        if title:
+            fig.suptitle(title, fontsize=14, fontweight='bold', y=0.965)
+        save_figure(fig, filename, figures_dir=figures_dir)
+        plt.show()
     return fig
 
 
@@ -3819,9 +3863,10 @@ def run_binary_automl_model(
         export_tables=True,
         evaluation_label="Predicted by the model",
         filename_suffix="_model",
+        bootstrap_year_col="year",
     )
     # Fairness analysis by sex
-    eda.evaluate_diagnostic_performance(
+    sex_overall_df = eda.evaluate_diagnostic_performance(
         plot_df, 'target_real', 'target_pred_model',
         sex_group=True,
         figures_dir=_get_figures_dir(demand_code),
@@ -3829,6 +3874,7 @@ def run_binary_automl_model(
         export_tables=True,
         evaluation_label="Predicted by the model",
         filename_suffix="_model",
+        bootstrap_year_col="year",
     )
     # Fairness analysis by age groups
     age_overall_df = eda.evaluate_diagnostic_performance(
@@ -3839,9 +3885,11 @@ def run_binary_automl_model(
         export_tables=True,
         evaluation_label="Predicted by the model",
         filename_suffix="_model",
+        bootstrap_year_col="year",
     )
     plot_subgroup_fairness_heatmap(
         age_df=age_overall_df,
+        sex_df=sex_overall_df,
         figures_dir=_get_figures_dir(demand_code),
         filename='subgroup_fairness_heatmap_model.png',
         color_mode='signed_ci',
@@ -3892,6 +3940,7 @@ def run_binary_automl_model(
             export_tables=True,
             evaluation_label="Assigned by the telephonic triage system",
             filename_suffix="_telephonic_triage",
+            bootstrap_year_col="year",
         )
         plot_metrics_comparison(
             triage_overall_df=triage_overall_df,

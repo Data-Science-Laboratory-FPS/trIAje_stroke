@@ -17,6 +17,7 @@ def evaluate_diagnostic_performance(
     export_tables=False,
     evaluation_label=None,
     filename_suffix="",
+    bootstrap_year_col="year",
 ):
     """
     Calculates clinical metrics with 95% confidence intervals and generates plots.
@@ -24,8 +25,8 @@ def evaluate_diagnostic_performance(
     Clopper-Pearson exact binomial CIs are used for proportion-based metrics:
         Accuracy, Precision, Recall, Specificity, NPV, Overtriage, Undertriage.
 
-    Outcome-stratified bootstrap CIs (n_bootstrap resamples, percentile method)
-    are used for composite metrics:
+    Outcome-year-stratified bootstrap CIs (n_bootstrap resamples, percentile
+    method) are used for composite metrics. ``bootstrap_year_col`` is required:
         F1-Score, F2-Score.
 
     If triage_group=True, results are stratified by triage status
@@ -57,6 +58,10 @@ def evaluate_diagnostic_performance(
     filename_suffix : str
         Suffix appended to exported figure and table filenames to avoid
         overwriting outputs from different prediction sources.
+    bootstrap_year_col : str
+        Year column used with the outcome to stratify the F1/F2 bootstrap.
+        Defaults to ``"year"``. A ValueError is raised if it is None or the
+        column is unavailable; outcome-only fallback is intentionally disabled.
     """
     import pandas as pd
     import numpy as np
@@ -129,6 +134,12 @@ def evaluate_diagnostic_performance(
 
     # Single RNG shared across all subgroup calls for reproducibility.
     rng = np.random.default_rng(ci_seed)
+    if bootstrap_year_col is None or bootstrap_year_col not in df.columns:
+        raise ValueError(
+            "evaluate_diagnostic_performance requires a valid bootstrap year "
+            "column for outcome-year stratification; "
+            f"got {bootstrap_year_col!r}. Available columns: {list(df.columns)}"
+        )
 
     # --- BLOCK: Internal Metric Calculation Helper ---
     def calculate_metrics(data, group_name, subgroup_name="General"):
@@ -164,23 +175,28 @@ def evaluate_diagnostic_performance(
         over_ci  = tuple(v * 100 for v in _cp(int(fp),      int(tp + fp)))
         under_ci = tuple(v * 100 for v in _cp(int(fn),      int(tn + fn)))
 
-        # --- Outcome-stratified bootstrap CIs for F1 and F2 -----------------
-        # Simple outcome (0/1) stratification — preserves class balance in each
-        # resample without requiring a year column. More robust than outcome-year
-        # stratification for small or heterogeneous subgroups.
+        # --- Outcome-year-stratified bootstrap CIs for F1 and F2 ------------
+        # Match print_test_metrics_with_ci by preserving each outcome-year cell.
         y_real_arr = np.asarray(y_real)
         y_pred_arr = np.asarray(y_pred)
-        neg_idx = np.where(y_real_arr == 0)[0]
-        pos_idx = np.where(y_real_arr == 1)[0]
+        outcome_s = pd.Series(y_real_arr)
+        year_s = pd.Series(np.asarray(data[bootstrap_year_col]))
+        bootstrap_strata = (
+            outcome_s.astype(str) + "__year_" + year_s.astype(str)
+        )
+        strata_indices = [
+            group.index.to_numpy()
+            for _, group in bootstrap_strata.groupby(bootstrap_strata, sort=False)
+        ]
 
         boot_f1, boot_f2 = [], []
         n_valid = 0
 
-        if len(neg_idx) >= 2 and len(pos_idx) >= 2:
+        if strata_indices:
             for _ in range(n_bootstrap):
                 idx = np.concatenate([
-                    rng.choice(neg_idx, size=len(neg_idx), replace=True),
-                    rng.choice(pos_idx, size=len(pos_idx), replace=True),
+                    rng.choice(stratum_idx, size=len(stratum_idx), replace=True)
+                    for stratum_idx in strata_indices
                 ])
                 yt = y_real_arr[idx]
                 yp = y_pred_arr[idx]
@@ -210,7 +226,7 @@ def evaluate_diagnostic_performance(
                 )
 
         def _boot_ci(boot_list):
-            if len(boot_list) >= 10:
+            if boot_list:
                 return (
                     float(np.percentile(boot_list, 2.5))  * 100,
                     float(np.percentile(boot_list, 97.5)) * 100,
@@ -359,7 +375,7 @@ def evaluate_diagnostic_performance(
         footnote = (
             "Accuracy, Precision, Recall, Specificity, NPV, Overtriage and Undertriage: "
             "Clopper-Pearson exact 95% CI. "
-            f"F1-Score and F2-Score: outcome-stratified bootstrap 95% CI ({n_bootstrap} resamples). "
+            f"F1-Score and F2-Score: outcome-year-stratified bootstrap 95% CI ({n_bootstrap} resamples). "
             "Values shown as estimate (95% CI lower–upper), all in %."
         )
 
@@ -748,6 +764,7 @@ def analyze_emergency_performance(
         reference_df=reference_df,
         evaluation_label=evaluation_label,
         filename_suffix=filename_suffix,
+        bootstrap_year_col="year",
     )
 
 # Example usage in a cell:
