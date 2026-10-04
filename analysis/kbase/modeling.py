@@ -2814,7 +2814,8 @@ def print_train_test_comparison(
     return comparison_df
 
 def plot_feature_importances(automl, X_train, feature_importance,
-                             X_test, y_test, seed, task="classification"):
+                             X_test, y_test, seed, task="classification",
+                             builtin_importance_type="gain"):
     """
     Computes and plots feature importance using permutation or built-in methods.
 
@@ -2827,8 +2828,9 @@ def plot_feature_importances(automl, X_train, feature_importance,
     how much the chosen scoring metric drops. A large drop = high importance.
     Importances are metric decrements (can be negative if the feature adds noise).
 
-    Built-in importance: model-internal scores (e.g. impurity reduction in trees).
-    These are relative scores with no direct metric interpretation.
+    Built-in importance: for LightGBM, gain as a percentage of total gain; for
+    Random Forest and ExtraTrees, impurity reduction. These are relative scores
+    with no direct metric interpretation.
     """
     # Return early if no importance requested
     if feature_importance == 0:
@@ -2944,9 +2946,23 @@ def plot_feature_importances(automl, X_train, feature_importance,
             else:
                 feature_names = list(X_train.columns)
 
-            if hasattr(best_model, 'feature_importances_'):
-                # Tree-based models: cumulative impurity reduction across all splits
-                importances = np.asarray(best_model.feature_importances_, dtype=float)
+            if hasattr(best_model, "booster_") or hasattr(best_model, "feature_importances_"):
+                if hasattr(best_model, "booster_"):
+                    # LightGBM: feature_importances_ defaults to split counts, which favour
+                    # continuous features (more candidate split points). Gain is the total
+                    # loss reduction contributed by each feature; reported as % of total gain.
+                    importances = np.asarray(
+                        best_model.booster_.feature_importance(
+                            importance_type=builtin_importance_type
+                        ),
+                        dtype=float,
+                    )
+                    feature_names = list(best_model.booster_.feature_name())
+                    if builtin_importance_type == "gain" and importances.sum() > 0:
+                        importances = 100 * importances / importances.sum()
+                else:
+                    # sklearn tree ensembles (RF, ExtraTrees): impurity-based importance
+                    importances = np.asarray(best_model.feature_importances_, dtype=float)
 
                 if len(importances) == len(feature_names):
                     importance_df_builtin = (
@@ -3004,15 +3020,29 @@ def plot_feature_importances(automl, X_train, feature_importance,
         feature_labels = plot_df["feature"].map(lambda c: get_display_label(c, labels_map))
 
         fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
-        ax_imp.barh(feature_labels[::-1], plot_df["importance"][::-1])
+
+        if is_permutation:
+            # importances are AP fractions -> convert to percentage points
+            values = plot_df["importance"] * 100
+            errors = plot_df["importance_std"] * 100
+        else:
+            values = plot_df["importance"]
+            errors = None
+
+        ax_imp.barh(
+            feature_labels[::-1], values[::-1],
+            xerr=None if errors is None else errors[::-1], capsize=2,
+        )
 
         if is_permutation:
             ax_imp.set_title(f"Top Features (Permutation Importance — {perm_scoring})")
-            ax_imp.set_xlabel(f"Mean decrease in {perm_scoring} (percentage points)")
+            ax_imp.set_xlabel("Mean decrease in average precision (percentage points)")
             filename = 'permutation_importance.png'
         else:
-            ax_imp.set_title(f"Top Features (Built-in Importance — {automl.best_estimator})")
-            ax_imp.set_xlabel("Feature Importance (relative)")
+            ax_imp.set_title(f"Top Features (Built-in Importance — {automl.best_estimator}, "
+                             f"{builtin_importance_type})")
+            ax_imp.set_xlabel("Share of total gain (%)" if builtin_importance_type == "gain"
+                              else "Number of splits")
             filename = 'builtin_importance.png'
 
         plt.tight_layout()
@@ -3121,7 +3151,7 @@ def report_effective_features(automl, X_train, top_k=15):
     return used_df
 
 
-def _compute_shap_values(automl, X_test, task="classification", seed=42):
+def _compute_shap_values(automl, X_test, task="classification", seed=42, sample_size=None):
     """
     Computes SHAP values for the fitted estimator, aligning features to what
     the underlying model was actually trained on and excluding embedding
@@ -3157,9 +3187,9 @@ def _compute_shap_values(automl, X_test, task="classification", seed=42):
         # Extract the underlying fitted estimator from FLAML
         model = automl.model.estimator
 
-        # Subsample X_test for compute efficiency
-        sample_size = min(500, len(X_test))
-        X_sample = X_test.sample(sample_size, random_state=seed)
+        # sample_size=None -> full test set (TreeExplainer is fast for small ensembles)
+        n_shap = len(X_test) if sample_size is None else min(sample_size, len(X_test))
+        X_sample = X_test if n_shap == len(X_test) else X_test.sample(n_shap, random_state=seed)
 
         # Convert categoricals to int32 — applied to all model types
         X_sample_shap = _prepare_for_shap(X_sample)
@@ -3239,7 +3269,7 @@ def _compute_shap_values(automl, X_test, task="classification", seed=42):
             shap_out    = explainer(X_sample_shap)
             shap_values = shap_out.values
 
-        print(f"SHAP values computed on {sample_size} samples.")
+        print(f"SHAP values computed on {n_shap} samples.")
 
         return {
             "shap_values": shap_values,
@@ -3328,6 +3358,7 @@ def plot_shap_interpretation(automl, X_test, task="classification", max_display=
                     max_display=max_display,
                     show=False,
                 )
+            plt.gca().set_xlabel("SHAP value (log-odds contribution towards P1)")
             save_figure(plt.gcf(), 'shap_importance.png')
             plt.show()
 
@@ -3376,6 +3407,41 @@ def _rank_shap_features(shap_values, non_emb_cols, non_emb_idx, task="classifica
         .sort_values("mean_abs_shap", ascending=False)
         .reset_index(drop=True)
     )
+
+
+def _summarise_shap(shap_data, top_k=15):
+    """Prints mean |SHAP| (log-odds) and mean SHAP when a binary feature is present/absent."""
+    ranking = _rank_shap_features(
+        shap_data["shap_values"], shap_data["non_emb_cols"],
+        shap_data["non_emb_idx"], task="classification",
+    )
+    sv = shap_data["shap_values"]
+    if isinstance(sv, list):
+        sv = sv[1]
+    elif isinstance(sv, np.ndarray) and sv.ndim == 3:
+        sv = sv[:, :, 1]
+
+    X = shap_data["X_sample_shap"]
+    cols = list(shap_data["train_features"])
+    rows = []
+    for feat in ranking["feature"].head(top_k):
+        s = sv[:, cols.index(feat)]
+        x = pd.to_numeric(X[feat], errors="coerce").to_numpy(dtype=float)
+        observed = x[~np.isnan(x)]
+        is_binary = observed.size > 0 and set(np.unique(observed)).issubset({0.0, 1.0})
+        present, absent = (x == 1), (x == 0)
+        rows.append({
+            "feature": feat,
+            "mean_abs_shap": np.abs(s).mean(),
+            "n_present": int(present.sum()) if is_binary else np.nan,
+            "mean_shap_present": s[present].mean() if is_binary and present.any() else np.nan,
+            "mean_shap_absent": s[absent].mean() if is_binary and absent.any() else np.nan,
+        })
+
+    out = pd.DataFrame(rows)
+    print(f"\n--- SHAP summary (log-odds scale, n = {len(X):,}) ---")
+    print(out.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    return out
 
 
 def _grid_dims(n: int):
@@ -3626,8 +3692,10 @@ def run_binary_automl_model(
     max_undertriage: float = 0.10,
     max_overtriage: float = 0.50,
     feature_importance: int = 0,
+    builtin_importance_type: str = "gain",
     plot_shap: bool = True,
-    n_interpretability_features: int = 9,
+    shap_sample_size: Optional[int] = None,
+    n_interpretability_features: int = 0,
     plot_calibration_curve: bool = True,
     plot_sa_roc_curve: bool = True,
     sa_roc_alpha_pos: float = 0.60,
@@ -3955,7 +4023,8 @@ def run_binary_automl_model(
     # Feature importance
     # -----------------------------
     importance_df_permutation, importance_df_builtin = plot_feature_importances(
-        automl, X_train, feature_importance, X_test, y_test, seed, task="classification")
+        automl, X_train, feature_importance, X_test, y_test, seed,
+        task="classification", builtin_importance_type=builtin_importance_type)
     effective_features_df = report_effective_features(automl, X_train)
 
     # -----------------------------
@@ -3963,8 +4032,14 @@ def run_binary_automl_model(
     # -----------------------------
     shap_data = None
     shap_values = None
+    shap_summary = None
     if plot_shap or n_interpretability_features > 0:
-        shap_data = _compute_shap_values(automl, X_test, task="classification", seed=seed)
+        shap_data = _compute_shap_values(
+            automl, X_test, task="classification", seed=seed,
+            sample_size=shap_sample_size,
+        )
+        if shap_data is not None:
+            shap_summary = _summarise_shap(shap_data)
 
     if plot_shap:
         shap_values = plot_shap_interpretation(
@@ -4032,6 +4107,7 @@ def run_binary_automl_model(
         "importance_builtin": importance_df_builtin,
         "effective_features": effective_features_df,
         "shap_values": shap_values,
+        "shap_summary": shap_summary,
         "top_interpretability_features": top_interpretability_features,
         "cv_fold_metrics": cv_fold_metrics,
         "summary": summary_df,
