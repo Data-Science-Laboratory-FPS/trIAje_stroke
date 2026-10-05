@@ -33,6 +33,10 @@ except ImportError:
 
 import kbase.preprocessing as dp
 import kbase.eda as eda
+from kbase.paired_comparison import (
+    compare_model_vs_triage_common,
+    get_common_comparison_subset,
+)
 from kbase.config import settings
 from kbase.labels import get_labels_map, get_display_label, resolve_demand_key
 from kbase.model_hyperparameters import (
@@ -2140,8 +2144,13 @@ def plot_metrics_comparison(
     triage_n = _general_row_n(triage_row)
     model_n = _general_row_n(model_row)
     note = "Overtriage and Undertriage: lower is better; all other metrics: higher is better."
-    if not pd.isna(triage_n) and not pd.isna(model_n) and int(triage_n) != int(model_n):
-        note += f" N differs: {TELEPHONIC_TRIAGE_LABEL} N={int(triage_n):,}; {ML_MODEL_LABEL} N={int(model_n):,}."
+    if not pd.isna(triage_n) and not pd.isna(model_n):
+        if int(triage_n) != int(model_n):
+            raise ValueError(
+                "Model-vs-triage metrics must use the same common test subset; "
+                f"got triage N={int(triage_n):,} and model N={int(model_n):,}."
+            )
+        note += f" Common test subset, N = {int(model_n):,}."
 
     ax.set_title('Diagnostic performance comparison (test set)', fontsize=13)
     ax.set_ylabel('Value (%)', fontsize=11)
@@ -4070,6 +4079,7 @@ def run_binary_automl_model(
     plot_df = df.loc[y_test.index].copy() 
     plot_df['target_real'] = y_test
     plot_df['target_pred_model'] = y_test_pred
+    plot_df['target_prob_model'] = y_test_prob
     plot_df['target_pred'] = plot_df['target_pred_model']
     model_overall_df = eda.evaluate_diagnostic_performance(
         plot_df, 'target_real', 'target_pred_model',
@@ -4110,26 +4120,17 @@ def run_binary_automl_model(
         filename='subgroup_fairness_heatmap_model.png',
         color_mode='signed_ci',
     )
+    model_vs_triage = None
+    common_subset_report = None
+    model_common_df = None
+    triage_overall_df = None
     if "p1_assigned" in plot_df.columns:
-        triage_plot_df = plot_df.copy()
-        triage_plot_df["p1_assigned"] = pd.to_numeric(
-            triage_plot_df["p1_assigned"], errors="coerce"
+        triage_plot_df, common_subset_report = get_common_comparison_subset(
+            plot_df,
+            y_col="target_real",
+            model_col="target_pred_model",
+            triage_col="p1_assigned",
         )
-        has_model_prediction = "target_pred_model" in triage_plot_df.columns
-        if not has_model_prediction:
-            print(
-                "\nWARNING: target_pred_model not found; skipping confusion "
-                "comparison. Use y_test_pred aligned to y_test.index to build it."
-            )
-        common_subset_cols = ["target_real", "p1_assigned"]
-        if has_model_prediction:
-            common_subset_cols.append("target_pred_model")
-        triage_plot_df = triage_plot_df.dropna(subset=common_subset_cols)
-        triage_plot_df["p1_assigned"] = triage_plot_df["p1_assigned"].astype("int8")
-        if has_model_prediction:
-            triage_plot_df["target_pred_model"] = (
-                triage_plot_df["target_pred_model"].astype("int8")
-            )
 
         print("\n--- Telephonic triage system diagnostic performance on test set ---")
         print(f"Rows evaluated: {len(triage_plot_df):,} / {len(plot_df):,} test rows")
@@ -4139,15 +4140,24 @@ def run_binary_automl_model(
                 f"uses the common subset for both matrices "
                 f"(model test N={len(plot_df):,}, common N={len(triage_plot_df):,})."
             )
-        if has_model_prediction:
-            plot_confusion_comparison(
-                y_true=triage_plot_df['target_real'].astype(int).values,
-                y_pred_triage=triage_plot_df['p1_assigned'].astype(int).values,
-                y_pred_model=triage_plot_df['target_pred_model'].astype(int).values,
-                figures_dir=_get_figures_dir(demand_code),
-                filename='confusion_comparison.png',
-                normalize='row',
-            )
+        plot_confusion_comparison(
+            y_true=triage_plot_df['target_real'].astype(int).values,
+            y_pred_triage=triage_plot_df['p1_assigned'].astype(int).values,
+            y_pred_model=triage_plot_df['target_pred_model'].astype(int).values,
+            figures_dir=_get_figures_dir(demand_code),
+            filename='confusion_comparison.png',
+            normalize='row',
+        )
+        model_common_df = eda.evaluate_diagnostic_performance(
+            triage_plot_df, "target_real", "target_pred_model",
+            sex_group=False,
+            figures_dir=_get_figures_dir(demand_code),
+            reference_df=subgroup_reference_df,
+            export_tables=True,
+            evaluation_label="Predicted by the model (common subset)",
+            filename_suffix="_model_common",
+            bootstrap_year_col="year",
+        )
         triage_overall_df = eda.evaluate_diagnostic_performance(
             triage_plot_df, "target_real", "p1_assigned",
             sex_group=False,
@@ -4160,9 +4170,24 @@ def run_binary_automl_model(
         )
         plot_metrics_comparison(
             triage_overall_df=triage_overall_df,
-            model_overall_df=model_overall_df,
+            model_overall_df=model_common_df,
             figures_dir=_get_figures_dir(demand_code),
             filename='metrics_comparison.png',
+        )
+        model_vs_triage = compare_model_vs_triage_common(
+            triage_plot_df,
+            figures_dir=_get_figures_dir(demand_code),
+            export_tables=True,
+            run_inference=True,
+            n_bootstrap=1000,
+            seed=42,
+            model_full_test_df=plot_df,
+            train_threshold=train_threshold,
+            y_train=y_train,
+            y_train_threshold_prob=y_train_threshold_prob,
+            train_triage=df.loc[y_train.index, "p1_assigned"],
+            year_train=year_train,
+            primary_threshold=best_threshold,
         )
     else:
         print("\nWARNING: p1_assigned not found; skipping telephonic triage system evaluation.")
@@ -4275,4 +4300,13 @@ def run_binary_automl_model(
         "top_interpretability_features": top_interpretability_features,
         "cv_fold_metrics": cv_fold_metrics,
         "summary": summary_df,
+        "model_overall_performance": model_overall_df,
+        "model_common_performance": model_common_df,
+        "triage_performance": triage_overall_df,
+        "model_vs_triage": model_vs_triage,
+        "paired_inference": (
+            model_vs_triage.get("paired_inference")
+            if model_vs_triage is not None else None
+        ),
+        "common_subset_report": common_subset_report,
     }
