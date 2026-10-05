@@ -74,6 +74,60 @@ SUBGROUP_HEATMAP_CMAP = LinearSegmentedColormap.from_list(
 )
 SUBGROUP_HEATMAP_CMAP.set_bad("#F2F2F2")
 
+
+class ModelingResult(dict):
+    """Dictionary-like pipeline result with a concise notebook representation.
+
+    All detailed DataFrames and analysis objects remain available by key.  The
+    compact representation prevents notebooks from rendering every exported
+    interpretability and comparison table after a bare function call.
+    """
+
+    @staticmethod
+    def _format_metric(value, decimals=4):
+        if value is None:
+            return "n/a"
+        try:
+            return f"{float(value):.{decimals}f}"
+        except (TypeError, ValueError):
+            return str(value)
+
+    def __repr__(self):
+        metrics = self.get("metrics") or {}
+        summary = self.get("summary")
+        report = self.get("common_subset_report") or {}
+
+        n_test = None
+        if isinstance(summary, pd.DataFrame) and not summary.empty:
+            n_test = summary.iloc[0].get("n_test")
+
+        test_text = "n/a" if pd.isna(n_test) else f"{int(n_test):,}"
+        common_text = "n/a"
+        if report.get("n_common") is not None:
+            common_text = (
+                f"{int(report['n_common']):,} "
+                f"(excluded: {int(report.get('n_excluded', 0)):,})"
+            )
+
+        return (
+            "ModelingResult(\n"
+            f"  test N: {test_text}\n"
+            f"  ROC-AUC: {self._format_metric(metrics.get('roc_auc'))}\n"
+            f"  PR-AUC: {self._format_metric(metrics.get('pr_auc'))}\n"
+            f"  threshold: {self._format_metric(self.get('threshold'))}\n"
+            f"  paired comparison N: {common_text}\n"
+            "  Detailed results remain available by key; tables and figures were exported.\n"
+            ")"
+        )
+
+    def _repr_html_(self):
+        import html
+        return "<pre>{}</pre>".format(html.escape(self.__repr__()))
+
+    def _repr_pretty_(self, printer, cycle):
+        printer.text(self.__repr__())
+
+
 # Set by run_*_automl_model at the start of each pipeline run.
 # All internal plot functions read from here via save_figure().
 _current_demand_code = None
@@ -2183,8 +2237,18 @@ def plot_subgroup_fairness_heatmap(
     age_block_title='Age group',
     sex_block_title='Sex',
     font_family=None,
+    value_fontsize=13,
+    ci_fontsize=11,
+    subgroup_fontsize=11,
+    legend_fontsize=11,
 ):
-    """Plot diagnostic performance for age and sex subgroups versus General."""
+    """Plot diagnostic performance for age and sex subgroups versus General.
+
+    ``value_fontsize`` and ``ci_fontsize`` control the point estimate and
+    confidence-interval annotations inside each heatmap cell.
+    ``subgroup_fontsize`` controls the column labels, while
+    ``legend_fontsize`` controls the colour-bar labels.
+    """
     import matplotlib.font_manager as fm
     from matplotlib.colors import TwoSlopeNorm
 
@@ -2316,12 +2380,17 @@ def plot_subgroup_fairness_heatmap(
             for i in range(n_metrics):
                 for j in range(len(subgroups)):
                     if np.isnan(vals[i, j]):
-                        ax.text(j, i, "NA", ha='center', va='center', fontsize=8)
+                        ax.text(
+                            j, i, "NA", ha='center', va='center',
+                            fontsize=ci_fontsize,
+                        )
                         continue
                     ax.text(j, i - 0.13, f"{vals[i, j]:.1f}%", ha='center', va='center',
-                            fontsize=9, fontweight='bold' if subgroups[j] == "General" else 'normal')
+                            fontsize=value_fontsize,
+                            fontweight='bold' if subgroups[j] == "General" else 'normal')
                     ax.text(j, i + 0.20, f"[{lo_v[i, j]:.1f}–{hi_v[i, j]:.1f}]",
-                            ha='center', va='center', fontsize=7, color='#333333')
+                            ha='center', va='center', fontsize=ci_fontsize,
+                            color='#333333')
 
             col_labels = []
             for subgroup, n in zip(subgroups, ns):
@@ -2334,12 +2403,20 @@ def plot_subgroup_fairness_heatmap(
                 col_labels.append(f"{label}{'*' if small else ''}\nN={int(n):,}")
 
             ax.set_xticks(np.arange(len(subgroups)))
-            ax.set_xticklabels(col_labels, fontsize=9)
+            ax.set_xticklabels(
+                col_labels,
+                fontsize=subgroup_fontsize,
+                fontstyle='italic',
+            )
             ax.tick_params(axis='x', top=True, bottom=False,
                            labeltop=True, labelbottom=False, length=0, pad=4)
             ax.set_yticks(np.arange(n_metrics))
-            ax.set_yticklabels(metric_order if k == 0 else [], fontsize=10,
-                               fontweight='bold' if k == 0 else 'normal')
+            ax.set_yticklabels(
+                metric_order if k == 0 else [],
+                fontsize=10,
+                fontweight='bold' if k == 0 else 'normal',
+                fontstyle='italic',
+            )
             ax.tick_params(axis='y', length=0)
             ax.vlines(np.arange(-0.5, len(subgroups) + 0.5, 1), -0.5, n_metrics - 0.5,
                       colors='white', linewidth=2, clip_on=False)
@@ -2349,15 +2426,23 @@ def plot_subgroup_fairness_heatmap(
                 spine.set_visible(False)
             ax.grid(False)
             if block_name:
-                ax.set_title(block_name, fontsize=11, fontweight='bold', pad=6)
+                ax.set_title(
+                    block_name,
+                    fontsize=11,
+                    fontweight='bold',
+                    fontstyle='italic',
+                    pad=6,
+                )
 
         cax = fig.add_subplot(gs[0, -1])
         cbar = fig.colorbar(im, cax=cax)
         cbar.outline.set_visible(False)
         cbar.set_ticks([-1, 0, 1])
         cbar.set_ticklabels(['Worse', 'Same', 'Better'])
-        cbar.ax.tick_params(length=0, labelsize=9)
-        cbar.set_label('Deviation vs General (oriented)', fontsize=9)
+        cbar.ax.tick_params(length=0, labelsize=legend_fontsize)
+        cbar.set_label(
+            'Deviation vs General (oriented)', fontsize=legend_fontsize
+        )
         if title:
             fig.suptitle(title, fontsize=14, fontweight='bold', y=0.965)
         save_figure(fig, filename, figures_dir=figures_dir)
@@ -3465,8 +3550,11 @@ def _summarise_shap(shap_data, top_k=15):
         })
 
     out = pd.DataFrame(rows)
-    print(f"\n--- SHAP summary (log-odds scale, n = {len(X):,}) ---")
-    print(out.head(top_k).to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    top_shap = out.head(min(top_k, len(out)))
+    print(f"\nTop {len(top_shap)} most important features:")
+    print(f"Metric: Mean absolute SHAP value (log-odds scale, n = {len(X):,})\n")
+    for _, row in top_shap.iterrows():
+        print(f"  {row['feature']:<20} {row['mean_abs_shap']:.4f}")
     return out
 
 
@@ -4285,7 +4373,7 @@ def run_binary_automl_model(
 
     display(summary_df)
 
-    return {
+    return ModelingResult({
         "automl": automl,
         "metrics": metrics,
         "threshold": best_threshold,
@@ -4309,4 +4397,4 @@ def run_binary_automl_model(
             if model_vs_triage is not None else None
         ),
         "common_subset_report": common_subset_report,
-    }
+    })
