@@ -3410,11 +3410,12 @@ def _rank_shap_features(shap_values, non_emb_cols, non_emb_idx, task="classifica
 
 
 def _summarise_shap(shap_data, top_k=15):
-    """Prints mean |SHAP| (log-odds) and mean SHAP when a binary feature is present/absent."""
+    """Summarises SHAP for all features and prints the top-ranked features."""
     ranking = _rank_shap_features(
         shap_data["shap_values"], shap_data["non_emb_cols"],
         shap_data["non_emb_idx"], task="classification",
     )
+    ranking["rank_shap"] = np.arange(1, len(ranking) + 1)
     sv = shap_data["shap_values"]
     if isinstance(sv, list):
         sv = sv[1]
@@ -3424,24 +3425,171 @@ def _summarise_shap(shap_data, top_k=15):
     X = shap_data["X_sample_shap"]
     cols = list(shap_data["train_features"])
     rows = []
-    for feat in ranking["feature"].head(top_k):
+    for _, ranked_feature in ranking.iterrows():
+        feat = ranked_feature["feature"]
         s = sv[:, cols.index(feat)]
         x = pd.to_numeric(X[feat], errors="coerce").to_numpy(dtype=float)
         observed = x[~np.isnan(x)]
         is_binary = observed.size > 0 and set(np.unique(observed)).issubset({0.0, 1.0})
         present, absent = (x == 1), (x == 0)
+
+        levels = ""
+        unique_levels = np.unique(observed)
+        if not is_binary and 0 < len(unique_levels) <= 10:
+            level_parts = []
+            for level in unique_levels:
+                level_mask = x == level
+                level_label = str(int(level)) if float(level).is_integer() else str(level)
+                level_parts.append(
+                    f"{level_label}: n={int(level_mask.sum())}, mean={s[level_mask].mean():.3f}"
+                )
+            levels = "; ".join(level_parts)
+
         rows.append({
             "feature": feat,
-            "mean_abs_shap": np.abs(s).mean(),
+            "mean_abs_shap": ranked_feature["mean_abs_shap"],
             "n_present": int(present.sum()) if is_binary else np.nan,
             "mean_shap_present": s[present].mean() if is_binary and present.any() else np.nan,
             "mean_shap_absent": s[absent].mean() if is_binary and absent.any() else np.nan,
+            "rank_shap": int(ranked_feature["rank_shap"]),
+            "levels": levels,
         })
 
     out = pd.DataFrame(rows)
     print(f"\n--- SHAP summary (log-odds scale, n = {len(X):,}) ---")
-    print(out.to_string(index=False, float_format=lambda v: f"{v:.3f}"))
+    print(out.head(top_k).to_string(index=False, float_format=lambda v: f"{v:.3f}"))
     return out
+
+
+def export_interpretability_table(
+    importance_perm,
+    importance_builtin,
+    effective_features_df,
+    shap_summary_df,
+    demand_code,
+):
+    """Exports combined permutation, gain, split-count, and SHAP results."""
+    perm = importance_perm[["feature", "importance", "importance_std"]].copy()
+    perm["perm_rank"] = perm["importance"].rank(method="min", ascending=False)
+    perm = perm.rename(columns={
+        "importance": "perm_importance",
+        "importance_std": "perm_importance_std",
+    })
+
+    gain = importance_builtin[["feature", "importance"]].copy()
+    gain["gain_rank"] = gain["importance"].rank(method="min", ascending=False)
+    gain = gain.rename(columns={"importance": "gain"})
+
+    splits = effective_features_df[["feature", "importance"]].copy()
+    splits = splits.rename(columns={"importance": "splits"})
+
+    shap_cols = [
+        "feature", "mean_abs_shap", "rank_shap", "n_present",
+        "mean_shap_present", "mean_shap_absent", "levels",
+    ]
+    merged = (
+        shap_summary_df[shap_cols]
+        .merge(perm, on="feature", how="outer")
+        .merge(gain, on="feature", how="outer")
+        .merge(splits, on="feature", how="left")
+    )
+    merged["splits"] = merged["splits"].fillna(0)
+
+    labels_map = get_labels_map(
+        demand_code=demand_code,
+        columns=merged["feature"].dropna().tolist(),
+    )
+
+    def _family(feature):
+        if feature and feature[0].isdigit():
+            return "Triage questions"
+        if feature.startswith("lr_"):
+            return "Literal reason"
+        if feature.startswith(("hist_", "com_")):
+            return "Clinical history"
+        if feature.startswith("atc"):
+            return "Medication"
+        return "Other"
+
+    merged["Feature"] = merged["feature"].map(
+        lambda feature: get_display_label(feature, labels_map)
+    )
+    merged["Family"] = merged["feature"].map(_family)
+    merged = merged.loc[merged["splits"] > 0].sort_values(
+        "rank_shap", na_position="last"
+    ).reset_index(drop=True)
+
+    raw_df = pd.DataFrame({
+        "Feature": merged["Feature"],
+        "Family": merged["Family"],
+        "Permutation, pp (SD)": merged.apply(
+            lambda row: (
+                "" if pd.isna(row["perm_importance"])
+                else f'{row["perm_importance"] * 100} ({row["perm_importance_std"] * 100})'
+            ),
+            axis=1,
+        ),
+        "Perm. rank": merged["perm_rank"],
+        "Gain (%)": merged["gain"],
+        "Gain rank": merged["gain_rank"],
+        "Splits": merged["splits"],
+        "Mean |SHAP|": merged["mean_abs_shap"],
+        "SHAP rank": merged["rank_shap"],
+        "N present": merged["n_present"],
+        "Mean SHAP if present": merged["mean_shap_present"],
+        "Mean SHAP if absent": merged["mean_shap_absent"],
+        "SHAP by level": merged["levels"].fillna(""),
+    })
+
+    def _format_rank(value):
+        return "" if pd.isna(value) else str(int(value))
+
+    def _format_decimal(value, decimals):
+        return "" if pd.isna(value) else f"{value:.{decimals}f}"
+
+    display_df = raw_df.copy()
+    display_df["Permutation, pp (SD)"] = merged.apply(
+        lambda row: (
+            "" if pd.isna(row["perm_importance"])
+            else f'{row["perm_importance"] * 100:.2f} '
+                 f'({row["perm_importance_std"] * 100:.2f})'
+        ),
+        axis=1,
+    )
+    display_df["Perm. rank"] = raw_df["Perm. rank"].map(_format_rank)
+    display_df["Gain (%)"] = raw_df["Gain (%)"].map(lambda value: _format_decimal(value, 2))
+    display_df["Gain rank"] = raw_df["Gain rank"].map(_format_rank)
+    display_df["Splits"] = raw_df["Splits"].map(_format_rank)
+    display_df["Mean |SHAP|"] = raw_df["Mean |SHAP|"].map(
+        lambda value: _format_decimal(value, 3)
+    )
+    display_df["SHAP rank"] = raw_df["SHAP rank"].map(_format_rank)
+    for column in ["N present", "Mean SHAP if present", "Mean SHAP if absent"]:
+        display_df[column] = raw_df[column].map(lambda value: _format_decimal(value, 3))
+
+    title = "Feature contributions of the final LightGBM model (test set)"
+    footnote = (
+        "Permutation: mean (SD) decrease in test-set average precision over five repeats, "
+        "in percentage points. Gain: share of total LightGBM gain. Splits: number of tree "
+        "splits using the feature. SHAP: mean absolute SHAP value on the log-odds scale "
+        "(n = 9,233 test calls); mean SHAP is shown when a binary feature is present or "
+        "absent, or per level for multi-level triage items. Ranks are computed over all "
+        "186 features; features never used in a split are omitted."
+    )
+    save_table(
+        display_df,
+        "interpretability_table.docx",
+        title=title,
+        footnote=footnote,
+    )
+
+    tables_dir = os.path.join(_get_figures_dir(demand_code), "tables")
+    os.makedirs(tables_dir, exist_ok=True)
+    csv_path = os.path.join(tables_dir, "interpretability_table.csv")
+    raw_df.to_csv(csv_path, index=False)
+    print(f"Table saved: {csv_path}")
+
+    return display_df
 
 
 def _grid_dims(n: int):
@@ -4033,6 +4181,7 @@ def run_binary_automl_model(
     shap_data = None
     shap_values = None
     shap_summary = None
+    interpretability_table = None
     if plot_shap or n_interpretability_features > 0:
         shap_data = _compute_shap_values(
             automl, X_test, task="classification", seed=seed,
@@ -4040,6 +4189,20 @@ def run_binary_automl_model(
         )
         if shap_data is not None:
             shap_summary = _summarise_shap(shap_data)
+
+    if all(result is not None for result in [
+        importance_df_permutation,
+        importance_df_builtin,
+        effective_features_df,
+        shap_summary,
+    ]):
+        interpretability_table = export_interpretability_table(
+            importance_df_permutation,
+            importance_df_builtin,
+            effective_features_df,
+            shap_summary,
+            demand_code,
+        )
 
     if plot_shap:
         shap_values = plot_shap_interpretation(
@@ -4108,6 +4271,7 @@ def run_binary_automl_model(
         "effective_features": effective_features_df,
         "shap_values": shap_values,
         "shap_summary": shap_summary,
+        "interpretability_table": interpretability_table,
         "top_interpretability_features": top_interpretability_features,
         "cv_fold_metrics": cv_fold_metrics,
         "summary": summary_df,
