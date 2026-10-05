@@ -80,6 +80,8 @@ def test_identical_systems_have_zero_differences_nri_and_sex_dd():
     for key in ("sensitivity", "specificity", "undertriage", "overtriage"):
         assert result[key]["difference"] == pytest.approx(0)
     assert result["nri"]["nri_overall"] == pytest.approx(0)
+    assert "Recall" in set(result["sex_gaps"]["table"]["Metric"])
+    assert "Sensitivity" not in set(result["sex_gaps"]["table"]["Metric"])
     for row in result["sex_gaps"]["rows"]:
         assert row["difference_in_differences"] == pytest.approx(0)
 
@@ -154,12 +156,28 @@ def test_matched_thresholds_depend_only_on_training_data():
     assert first["tau_spec"] == second["tau_spec"]
     assert first["tau_sens"] == second["tau_sens"]
     assert len(first["table"]) == 4
-    assert set(first["table"]["Metric"]) == {"Sensitivity", "Specificity"}
+    assert set(first["table"]["Metric"]) == {"Recall", "Specificity"}
 
 
 def test_disparity_change_classification():
     assert classify_disparity_change(0.02, -0.03) == "reverses"
     assert classify_disparity_change(-0.07, -0.10) == "widens"
+
+
+def test_zero_exclusions_use_simplified_supplementary_title_and_footnote():
+    result = compare_model_vs_triage_common(
+        _identical_frame(), export_tables=False, run_inference=False
+    )
+    assert result["title"] == (
+        "Supplementary Table X. Paired comparison of the ML model and the "
+        "telephone triage system on the test set (n = 8)."
+    )
+    assert result["footnote"].startswith(
+        "Both systems evaluated on the same 8 test calls."
+    )
+    assert "excluded from this comparison" not in result["footnote"]
+    assert "Recall" in set(result["table"]["Metric"])
+    assert "Sensitivity" not in set(result["table"]["Metric"])
 
 
 def test_common_subset_is_the_same_for_all_inference_sections():
@@ -171,6 +189,12 @@ def test_common_subset_is_the_same_for_all_inference_sections():
     )
     inference = result["paired_inference"]
     assert result["report"]["n_common"] == report["n_common"] == len(common)
+    assert result["title"] == (
+        "Supplementary Table X. Paired comparison of the ML model and the "
+        "telephone triage system on the test set (n = 7)."
+    )
+    assert "1 calls excluded from this comparison only" in result["footnote"]
     assert inference["sensitivity"]["n"] + inference["specificity"]["n"] == len(common)
-    assert len(inference["bootstrap_indices"][0]) == len(common)
+    assert inference["bootstrap"]["replicate_size"] == len(common)
+    assert inference["bootstrap"]["n_resamples"] == 30
     assert inference["sex_gaps"]["n_men"] + inference["sex_gaps"]["n_women"] == len(common)

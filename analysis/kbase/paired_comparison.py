@@ -2,7 +2,7 @@
 
 All comparisons in this module are restricted to the same calls. The module
 includes paired tests, bootstrap inference, sex-gap analyses, and matched
-operating-point sensitivity analyses.
+operating-point recall analyses.
 """
 
 import os
@@ -36,7 +36,7 @@ _PROPORTION_METRICS = (
     "Undertriage",
 )
 
-_DISPLAY_METRIC_LABELS = {"Recall": "Sensitivity"}
+_DISPLAY_METRIC_LABELS = {}
 
 
 def get_common_comparison_subset(
@@ -483,7 +483,6 @@ def compare_paired_error_rate(
         "triage": triage_rate,
         "difference": difference,
         "ci": interval,
-        "bootstrap_differences": np.asarray(bootstrap_differences),
         "valid_bootstrap_replicates": valid_replicates,
         "model_denominator": model_denominator,
         "triage_denominator": triage_denominator,
@@ -560,19 +559,15 @@ def calculate_categorical_nri(
             key: _bootstrap_interval(values)[0]
             for key, values in bootstrap_values.items()
         }
-        result["bootstrap_values"] = {
-            key: np.asarray(values) for key, values in bootstrap_values.items()
-        }
     else:
         result["ci"] = {key: (np.nan, np.nan) for key in bootstrap_values}
-        result["bootstrap_values"] = bootstrap_values
     return result
 
 
 def _metric_fraction(y, prediction, metric):
     y_array = np.asarray(y)
     prediction_array = np.asarray(prediction)
-    if metric == "Sensitivity":
+    if metric == "Recall":
         selected = y_array == 1
         success = prediction_array[selected] == 1
     elif metric == "Specificity":
@@ -626,7 +621,7 @@ def compare_sex_gaps(
         "ML model": common_df["target_pred_model"].to_numpy(),
     }
     rows = []
-    for metric in ("Sensitivity", "Specificity", "Undertriage"):
+    for metric in ("Recall", "Specificity", "Undertriage"):
         system_results = {}
         for system, prediction in predictions.items():
             men_mask = sex_numeric == 0
@@ -687,7 +682,6 @@ def compare_sex_gaps(
             "difference_in_differences_ci": dd_ci,
             "p_value": _bootstrap_two_sided_p(bootstrap_dd),
             "valid_bootstrap_replicates": valid_replicates,
-            "bootstrap_difference_in_differences": np.asarray(bootstrap_dd),
             "disparity_change": classify_disparity_change(
                 system_results["Telephone triage"]["gap"],
                 system_results["ML model"]["gap"],
@@ -699,7 +693,7 @@ def compare_sex_gaps(
         full_sex = pd.to_numeric(model_full_test_df["sex"], errors="coerce").to_numpy()
         full_y = model_full_test_df["target_real"].to_numpy()
         full_prediction = model_full_test_df["target_pred_model"].to_numpy()
-        for metric in ("Sensitivity", "Specificity", "Undertriage"):
+        for metric in ("Recall", "Specificity", "Undertriage"):
             model_full_values[metric] = {}
             for sex_value, label in ((0, "Men"), (1, "Women")):
                 mask = full_sex == sex_value
@@ -836,13 +830,13 @@ def matched_operating_point_analysis(
     rows = []
     for label, threshold in (
         ("Iso-specificity", tau_specificity),
-        ("Iso-sensitivity", tau_sensitivity),
+        ("Iso-recall", tau_sensitivity),
     ):
         test_prediction = (test_probability >= threshold).astype(np.int8)
         model_metrics = _system_metrics(test_y, test_prediction)
         triage_metrics = _system_metrics(test_y, test_triage)
         for paired_metric, metrics_key, outcome_value, correct_value in (
-            ("Sensitivity", "Recall", 1, 1),
+            ("Recall", "Recall", 1, 1),
             ("Specificity", "Specificity", 0, 0),
         ):
             population = test_y == outcome_value
@@ -1064,7 +1058,7 @@ def run_paired_inference(
     sensitivity = compare_paired_proportion(
         (model[event] == 1).astype(np.int8),
         (triage[event] == 1).astype(np.int8),
-        "Sensitivity",
+        "Recall",
     )
     specificity = compare_paired_proportion(
         (model[nonevent] == 0).astype(np.int8),
@@ -1093,7 +1087,7 @@ def run_paired_inference(
 
     print("\n--- Paired inference summary (ML model − Telephone triage) ---")
     for label, result in (
-        ("Sensitivity", sensitivity),
+        ("Recall", sensitivity),
         ("Specificity", specificity),
         ("Undertriage", undertriage),
         ("Overtriage", overtriage),
@@ -1126,9 +1120,12 @@ def run_paired_inference(
     )
     return {
         "report": report,
-        "bootstrap_indices": bootstrap_indices,
-        "n_bootstrap": n_bootstrap,
-        "seed": seed,
+        "bootstrap": {
+            "method": "Outcome-year stratified paired bootstrap",
+            "n_resamples": n_bootstrap,
+            "seed": seed,
+            "replicate_size": int(len(common_df)),
+        },
         "sensitivity": sensitivity,
         "specificity": specificity,
         "undertriage": undertriage,
@@ -1199,15 +1196,24 @@ def compare_model_vs_triage_common(
         triage_metrics, model_metrics, differences, inference=paired_inference
     )
     title = (
-        "Comparison of the model and the telephone triage system "
-        "(common test subset, N = {:,})".format(report["n_common"])
-    )
-    if paired_inference is None:
-        footnote = (
+        "Supplementary Table X. Paired comparison of the ML model and the "
+        "telephone triage system on the test set (n = {:,})."
+    ).format(report["n_common"])
+    if report["n_excluded"] == 0:
+        population_note = "Both systems evaluated on the same {:,} test calls.".format(
+            report["n_common"]
+        )
+    else:
+        population_note = (
             "Both systems evaluated on the same {:,} calls of the test set with an "
             "assigned triage priority ({:,} calls excluded from this comparison "
-            "only). Individual metrics: Clopper–Pearson 95% CI."
+            "only)."
         ).format(report["n_common"], report["n_excluded"])
+    if paired_inference is None:
+        footnote = (
+            population_note
+            + " Individual metrics: Clopper–Pearson 95% CI."
+        )
     else:
         error_test = (
             "GEE Wald z-test with cluster-robust variance"
@@ -1215,15 +1221,14 @@ def compare_model_vs_triage_common(
             else "paired-bootstrap two-sided test"
         )
         footnote = (
-            "Both systems evaluated on the same {:,} calls of the test set with an "
-            "assigned triage priority ({:,} calls excluded from this comparison "
-            "only). Individual metrics: Clopper–Pearson 95% CI. Sensitivity and "
+            population_note
+            + " Individual metrics: Clopper–Pearson 95% CI. Recall and "
             "specificity differences: Newcombe method 10 paired 95% CI and McNemar "
             "test. Undertriage and overtriage differences: outcome–year stratified "
             "paired bootstrap 95% CI and {}. NRI: categorical NRI; for two binary "
-            "classifiers its components equal the differences in sensitivity and "
+            "classifiers its components equal the differences in recall and "
             "specificity."
-        ).format(report["n_common"], report["n_excluded"], error_test)
+        ).format(error_test)
 
     table_paths = {"docx": None, "csv": None}
     if export_tables:
@@ -1244,7 +1249,8 @@ def compare_model_vs_triage_common(
             )
             _export_word_table(
                 paired_inference["sex_gaps"]["table"],
-                "Sex-gap comparison between the ML model and telephone triage",
+                "Supplementary Table Z. Sex differences in recall, specificity and "
+                "under-triage for each system, and difference between the systems' gaps.",
                 "Gaps are Men minus Women on the test set. DD is the ML model gap "
                 "minus the telephone triage gap. Because gaps can be negative or "
                 "change sign, whether the disparity widens, narrows or reverses "
@@ -1256,10 +1262,11 @@ def compare_model_vs_triage_common(
             matched_result = paired_inference["matched_operating_point"]
             _export_word_table(
                 matched_result["table"],
-                "Model versus telephone triage at matched operating points",
+                "Supplementary Table Y. Comparison at matched operating points "
+                "(thresholds selected on out-of-fold training probabilities).",
                 "Thresholds were selected exclusively from out-of-fold training "
                 "probabilities and applied unchanged to the common test subset. At "
-                "each threshold both sensitivity and specificity are compared; the "
+                "each threshold both recall and specificity are compared; the "
                 "matched metric is approximate on the test set because thresholds "
                 "were selected on OOF training probabilities.",
                 matched_path,
