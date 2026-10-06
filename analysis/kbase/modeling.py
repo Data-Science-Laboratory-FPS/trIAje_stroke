@@ -2512,8 +2512,8 @@ def print_test_metrics_with_ci(
     Clopper–Pearson (exact binomial) for binary proportions:
         Accuracy, Precision, Recall, Specificity, NPV
 
-    Outcome-year stratified bootstrap for composite metrics:
-        F1, F2, MCC, Youden Index, Balanced Accuracy
+    Outcome-year stratified bootstrap for discrimination and composite metrics:
+        ROC-AUC, PR-AUC, F1, F2, MCC, Youden Index, Balanced Accuracy
     """
     from scipy.stats import beta as _beta
     from sklearn.metrics import matthews_corrcoef
@@ -2610,6 +2610,9 @@ def print_test_metrics_with_ci(
     rng     = np.random.default_rng(ci_seed)
     y_te_s  = pd.Series(y_test.values if hasattr(y_test, "values") else y_test).reset_index(drop=True)
     y_pr_s  = pd.Series(y_test_pred).reset_index(drop=True)
+    y_prob_s = pd.Series(
+        y_test_prob.values if hasattr(y_test_prob, "values") else y_test_prob
+    ).reset_index(drop=True)
     year_s  = pd.Series(y_test_year.values if hasattr(y_test_year, "values") else y_test_year).reset_index(drop=True)
     boot_strata = _make_outcome_year_strata(y_te_s, year_s)
     strata_indices = [
@@ -2617,7 +2620,15 @@ def print_test_metrics_with_ci(
         for _, group in boot_strata.groupby(boot_strata, sort=False)
     ]
 
-    boot = {"f1": [], "f2": [], "mcc": [], "youden": [], "bal_acc": []}
+    boot = {
+        "roc_auc": [],
+        "pr_auc": [],
+        "f1": [],
+        "f2": [],
+        "mcc": [],
+        "youden": [],
+        "bal_acc": [],
+    }
 
     for _ in range(n_bootstrap):
         idx   = np.concatenate([
@@ -2626,6 +2637,7 @@ def print_test_metrics_with_ci(
         ])
         yt    = y_te_s.iloc[idx]
         yp    = y_pr_s.iloc[idx]
+        yprob = y_prob_s.iloc[idx]
 
         tn_b, fp_b, fn_b, tp_b = confusion_matrix(yt, yp, labels=[0, 1]).ravel()
         prec_b = _safe_div(tp_b, tp_b + fp_b)
@@ -2645,7 +2657,16 @@ def print_test_metrics_with_ci(
         youden_b  = (rec_b + spec_b - 1) if not (np.isnan(rec_b) or np.isnan(spec_b)) else np.nan
         bal_b     = _safe_div(rec_b + spec_b, 2)
 
-        for key, val in [("f1", f1_b), ("f2", f2_b), ("mcc", mcc_b), ("youden", youden_b), ("bal_acc", bal_b)]:
+        bootstrap_values = (
+            ("roc_auc", roc_auc_score(yt, yprob)),
+            ("pr_auc", average_precision_score(yt, yprob)),
+            ("f1", f1_b),
+            ("f2", f2_b),
+            ("mcc", mcc_b),
+            ("youden", youden_b),
+            ("bal_acc", bal_b),
+        )
+        for key, val in bootstrap_values:
             if not np.isnan(val):
                 boot[key].append(val)
 
@@ -2682,10 +2703,12 @@ def print_test_metrics_with_ci(
     print(f"{'PERFORMANCE METRICS WITH 95% CI':^70}")
     print("="*70)
 
+    print(f"\n  Discrimination metrics  (Outcome-year Stratified Bootstrap CI):")
+    print(f"  ROC-AUC:               {_pct(roc_auc, ci_boot['roc_auc'])}")
+    print(f"  PR-AUC:                {_pct(pr_auc,  ci_boot['pr_auc'])}")
+
     print(f"\n  Binary metrics  (Clopper–Pearson CI):")
     print(f"  Accuracy:              {_pct(acc,  ci_cp['acc'])}")
-    print(f"  ROC-AUC:               {roc_auc*100:.2f}%")
-    print(f"  PR-AUC:                {pr_auc*100:.2f}%")
     print(f"  Precision (PPV):       {_pct(prec, ci_cp['prec'])}")
     print(f"  Recall (Sensitivity):  {_pct(rec,  ci_cp['rec'])}")
     print(f"  Specificity:           {_pct(spec, ci_cp['spec'])}")
@@ -2715,7 +2738,11 @@ def print_test_metrics_with_ci(
     return {
         "accuracy":            acc,
         "roc_auc":             roc_auc,
+        "roc_auc_ci_lower":    ci_boot["roc_auc"][0],
+        "roc_auc_ci_upper":    ci_boot["roc_auc"][1],
         "pr_auc":              pr_auc,
+        "pr_auc_ci_lower":     ci_boot["pr_auc"][0],
+        "pr_auc_ci_upper":     ci_boot["pr_auc"][1],
         "precision":           prec,
         "recall":              rec,
         "specificity":         spec,
