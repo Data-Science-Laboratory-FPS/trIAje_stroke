@@ -21,6 +21,7 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LinearSegmentedColormap
 import os
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 import time
 import pyarrow.parquet as pq
 from typing import Optional, List, Union
@@ -73,6 +74,14 @@ SUBGROUP_HEATMAP_CMAP = LinearSegmentedColormap.from_list(
     ],
 )
 SUBGROUP_HEATMAP_CMAP.set_bad("#F2F2F2")
+
+AGE_SUBGROUP_DISPLAY_LABELS = {
+    "Youth": "Youth\n(15–24 years)",
+    "Young Adults": "Young Adults\n(25–44 years)",
+    "Middle-aged Adults": "Middle-aged Adults\n(45–59 years)",
+    "Elderly": "Elderly\n(60–74 years)",
+    "Seniors": "Seniors\n(≥75 years)",
+}
 
 
 class ModelingResult(dict):
@@ -159,6 +168,43 @@ def save_figure(fig, filename, dpi=300, figures_dir=None):
         return
     fig.savefig(path, dpi=dpi, bbox_inches='tight')
     print(f"Figure saved: {path}")
+
+
+def _add_panel_label(ax, label, x=-0.08, y=1.05):
+    """Add a bold publication-style panel label above an axes' top-left corner."""
+    ax.text(
+        x,
+        y,
+        label,
+        transform=ax.transAxes,
+        fontsize=14,
+        fontweight='bold',
+        ha='left',
+        va='bottom',
+        clip_on=False,
+    )
+
+
+def _format_decimal_half_up(value, decimals, source_decimals=None):
+    """Format a number using conventional decimal half-up rounding.
+
+    ``source_decimals`` is useful when a figure is a shortened rendering of a
+    value reported elsewhere at a fixed precision.  For example, a published
+    value of 0.6955 is first fixed at four decimals and then shown as 0.696 in
+    a three-decimal figure label.
+    """
+    decimal_value = Decimal(str(value))
+    if source_decimals is not None:
+        source_quantum = Decimal(1).scaleb(-source_decimals)
+        decimal_value = decimal_value.quantize(
+            source_quantum, rounding=ROUND_HALF_UP
+        )
+    quantum = Decimal(1).scaleb(-decimals)
+    rounded = decimal_value.quantize(quantum, rounding=ROUND_HALF_UP)
+    if rounded == 0:
+        rounded = abs(rounded)
+    return f"{rounded:.{decimals}f}"
+
 
 def save_table(df, filename, title=None, footnote=None):
     """Saves a dataframe as a Word table in the demand-specific tables directory."""
@@ -1081,13 +1127,26 @@ def export_final_model_cv_fold_metrics(
         col for col in cv_metrics_df.columns
         if col not in {"fold", "estimator"}
     ]
+    count_metrics = {"n_train", "n_validation", "tn", "fp", "fn", "tp"}
+
+    def _format_cv_value(metric, value):
+        """Format CV counts as integers and all other numbers to four decimals."""
+        if pd.isna(value):
+            return ""
+        if isinstance(value, (int, float, np.number)):
+            numeric_value = float(value)
+            if metric in count_metrics and numeric_value.is_integer():
+                return f"{int(numeric_value)}"
+            return _format_decimal_half_up(numeric_value, 4)
+        return value
+
     docx_rows = []
     for metric in docx_metrics:
         row = {"metric": metric}
         for _, values in cv_metrics_df.iterrows():
             fold_label = str(values["fold"])
             col_name = f"fold_{fold_label}" if fold_label.isdigit() else fold_label
-            row[col_name] = values[metric]
+            row[col_name] = _format_cv_value(metric, values[metric])
         docx_rows.append(row)
     cv_metrics_docx_df = pd.DataFrame(docx_rows)
 
@@ -1103,7 +1162,12 @@ def export_final_model_cv_fold_metrics(
             "columns are validation folds plus mean and standard deviation."
         ),
     )
-    print(cv_metrics_df.to_string(index=False))
+    cv_metrics_print_df = cv_metrics_df.copy()
+    for column in docx_metrics:
+        cv_metrics_print_df[column] = cv_metrics_print_df[column].map(
+            lambda value, metric=column: _format_cv_value(metric, value)
+        )
+    print(cv_metrics_print_df.to_string(index=False))
     return cv_metrics_df
 
 
@@ -1305,8 +1369,16 @@ def compute_youden_threshold(
 
     fig, ax = plt.subplots(figsize=(7, 6))
 
-    ax.plot(fpr_test_curve, tpr_test_curve, color='steelblue', lw=2,
-            label=f'ROC curve — test  (AUC = {auc_test:.3f})')
+    ax.plot(
+        fpr_test_curve,
+        tpr_test_curve,
+        color='steelblue',
+        lw=2,
+        label=(
+            'ROC curve — test  (AUC = '
+            f'{_format_decimal_half_up(auc_test, 3, 4)})'
+        ),
+    )
     ax.plot([0, 1], [0, 1], 'k--', lw=1, label='No discrimination')
 
     # Target sensitivity range (for visual reference in TEST space)
@@ -1317,16 +1389,19 @@ def compute_youden_threshold(
     # Selected threshold evaluated on TEST
     ax.scatter(test_fpr, test_se, color='crimson', zorder=5, s=120,
                label=(f'Threshold = {best_thr:.4f}  (selected on TRAIN)\n'
-                      f'J$_{{test}}$ = {test_j:.3f}   '
-                      f'Se$_{{test}}$ = {test_se:.3f}   '
-                      f'Sp$_{{test}}$ = {test_sp:.3f}'))
+                      f'J$_{{test}}$ = {_format_decimal_half_up(test_j, 3, 4)}   '
+                      f'Se$_{{test}}$ = {_format_decimal_half_up(test_se, 3, 4)}   '
+                      f'Sp$_{{test}}$ = {_format_decimal_half_up(test_sp, 3, 4)}'))
 
     # Vertical segment from the diagonal (y = FPR_test) to the operating point:
     # length equals J_test, the Youden index evaluated on TEST
     ax.vlines(x=test_fpr,
               ymin=test_fpr, ymax=test_se,
               colors='crimson', linestyles='dashed', lw=1.5, alpha=0.7,
-              label=f'J$_{{test}}$ = {test_j:.3f}  (vertical distance to diagonal)')
+              label=(
+                  f'J$_{{test}}$ = {_format_decimal_half_up(test_j, 3, 4)}  '
+                  '(vertical distance to diagonal)'
+              ))
 
     ax.set_xlabel('1 − Specificity  (FPR)', fontsize=11)
     ax.set_ylabel('Sensitivity  (TPR)', fontsize=11)
@@ -1337,6 +1412,7 @@ def compute_youden_threshold(
     ax.legend(loc='lower right', fontsize=9)
     ax.set_xlim([0.0, 1.0])
     ax.set_ylim([0.0, 1.02])
+    _add_panel_label(ax, '(A)')
     plt.tight_layout()
     save_figure(fig, 'roc_curve_youden.png')
     plt.show()
@@ -1522,7 +1598,11 @@ def optimize_clinical_threshold(
     opt_prec = precision_score(y_test, test_pred_opt, zero_division=0)
     opt_rec  = recall_score(y_test, test_pred_opt, zero_division=0)
     ax3.scatter([opt_rec], [opt_prec], color='black', zorder=5, s=80,
-                label=f'Threshold = {clinical_threshold:.4f}  |  P={opt_prec:.3f}  R={opt_rec:.3f}')
+                label=(
+                    f'Threshold = {clinical_threshold:.4f}  |  '
+                    f'P={_format_decimal_half_up(opt_prec, 3, 4)}  '
+                    f'R={_format_decimal_half_up(opt_rec, 3, 4)}'
+                ))
 
     ax3.set_title('Precision-Recall Curve (Test Set)')
     ax3.set_xlabel('Recall (Sensitivity)')
@@ -1619,6 +1699,7 @@ def plot_calibration(
     ax.set_ylabel('Density')
     ax.legend(fontsize=8)
     ax.grid(alpha=0.3)
+    _add_panel_label(ax, '(A)')
 
     # --- Right: reliability diagram ---
     ax2 = axes[1]
@@ -1640,6 +1721,7 @@ def plot_calibration(
     ax2.set_ylabel('Fraction of positives')
     ax2.legend(fontsize=8, loc='upper left')
     ax2.grid(alpha=0.3)
+    _add_panel_label(ax2, '(B)')
 
     # --- Quantitative calibration metrics: Brier score + Cox calibration ---
     # regression (intercept = calibration-in-the-large, ideal 0; slope =
@@ -1652,10 +1734,12 @@ def plot_calibration(
     ax2.annotate(
         f"Test set (N={len(y_test)})\n"
         f"Brier = {brier_test:.4f}\n"
-        f"Intercept = {calib_test['intercept']:.3f} "
-        f"[{calib_test['intercept_ci_lo']:.3f}, {calib_test['intercept_ci_hi']:.3f}]\n"
-        f"Slope = {calib_test['slope']:.3f} "
-        f"[{calib_test['slope_ci_lo']:.3f}, {calib_test['slope_ci_hi']:.3f}]",
+        f"Intercept = {_format_decimal_half_up(calib_test['intercept'], 3, 4)} "
+        f"[{_format_decimal_half_up(calib_test['intercept_ci_lo'], 3, 4)}, "
+        f"{_format_decimal_half_up(calib_test['intercept_ci_hi'], 3, 4)}]\n"
+        f"Slope = {_format_decimal_half_up(calib_test['slope'], 3, 4)} "
+        f"[{_format_decimal_half_up(calib_test['slope_ci_lo'], 3, 4)}, "
+        f"{_format_decimal_half_up(calib_test['slope_ci_hi'], 3, 4)}]",
         xy=(0.95, 0.95), xycoords='axes fraction', ha='right', va='top', fontsize=8,
         bbox=dict(boxstyle='round', fc='white', ec='gray', alpha=0.9),
     )
@@ -1951,12 +2035,14 @@ def plot_sa_roc(y_test, y_test_prob, tau_safe_pos, tau_safe_neg, zone_stats=None
             density=True, label='Positive (actual)')
 
     # Shade the three operational zones.
+    tau_neg_label = _format_decimal_half_up(tau_safe_neg, 3, 4)
+    tau_pos_label = _format_decimal_half_up(tau_safe_pos, 3, 4)
     ax.axvspan(0, tau_safe_neg, color='blue', alpha=0.1,
-               label=f'Rule-out Safe (< {tau_safe_neg:.3f})')
+               label=f'Rule-out Safe (< {tau_neg_label})')
     ax.axvspan(tau_safe_neg, tau_safe_pos, color='gray', alpha=0.2,
                label='Gray Zone (human review)')
     ax.axvspan(tau_safe_pos, 1, color='red', alpha=0.1,
-               label=f'Rule-in Safe (>= {tau_safe_pos:.3f})')
+               label=f'Rule-in Safe (>= {tau_pos_label})')
 
     # Mark the two safety thresholds.
     ax.axvline(tau_safe_neg, color='blue', linestyle='--', linewidth=2)
@@ -2079,6 +2165,8 @@ def plot_confusion_comparison(
     axes[1].set_xlabel('Predicted')
     axes[0].set_ylabel('Actual')
     axes[1].set_ylabel('')
+    _add_panel_label(axes[0], '(A)')
+    _add_panel_label(axes[1], '(B)')
     fig.suptitle('Confusion matrix comparison (test set)')
     plt.tight_layout()
     save_figure(fig, filename, figures_dir=figures_dir)
@@ -2235,12 +2323,13 @@ def plot_subgroup_fairness_heatmap(
     color_clip=0.70,
     title='Diagnostic performance by subgroup (test set)',
     age_block_title='Age group',
-    sex_block_title='Sex',
+    sex_block_title='Sex group',
     font_family=None,
     value_fontsize=13,
     ci_fontsize=11,
     subgroup_fontsize=11,
     legend_fontsize=11,
+    age_display_labels=None,
 ):
     """Plot diagnostic performance for age and sex subgroups versus General.
 
@@ -2309,9 +2398,19 @@ def plot_subgroup_fairness_heatmap(
     else:
         subgroup_order = [s for s in subgroup_order if s != "General"]
 
+    if age_display_labels is None:
+        age_display_labels = AGE_SUBGROUP_DISPLAY_LABELS
+
     blocks = [(None, ["General"], age_df, {})]
     if subgroup_order:
-        blocks.append((age_block_title, list(subgroup_order), age_df, {}))
+        blocks.append(
+            (
+                age_block_title,
+                list(subgroup_order),
+                age_df,
+                age_display_labels,
+            )
+        )
     else:
         print("[plot_subgroup_fairness_heatmap] WARNING: no age subgroup rows found; "
               "plotting the available blocks only.")
@@ -2444,7 +2543,7 @@ def plot_subgroup_fairness_heatmap(
             'Deviation vs General (oriented)', fontsize=legend_fontsize
         )
         if title:
-            fig.suptitle(title, fontsize=14, fontweight='bold', y=0.965)
+            fig.suptitle(title, fontsize=14, fontweight='bold', y=1.01)
         save_figure(fig, filename, figures_dir=figures_dir)
         plt.show()
     return fig
@@ -2571,10 +2670,21 @@ def print_test_metrics_with_ci(
     fig_pr, ax_pr = plt.subplots(figsize=(7, 6))
     ax_pr.plot(rec_curve, prec_curve, color='darkorange', lw=2,
                label=f'PR curve  (PR-AUC = {pr_auc:.4f})')
-    ax_pr.axhline(baseline, color='gray', linestyle='--',
-                   label=f'Baseline (prevalence) = {baseline:.3f}')
+    ax_pr.axhline(
+        baseline,
+        color='gray',
+        linestyle='--',
+        label=(
+            'Baseline (prevalence) = '
+            f'{_format_decimal_half_up(baseline, 3, 4)}'
+        ),
+    )
     ax_pr.scatter([rec], [prec], color='black', zorder=5, s=80,
-                  label=f'Threshold = {threshold:.4f}  |  P={prec:.3f}  R={rec:.3f}')
+                  label=(
+                      f'Threshold = {threshold:.4f}  |  '
+                      f'P={_format_decimal_half_up(prec, 3, 4)}  '
+                      f'R={_format_decimal_half_up(rec, 3, 4)}'
+                  ))
     ax_pr.set_xlabel('Recall (Sensitivity)', fontsize=11)
     ax_pr.set_ylabel('Precision (PPV)', fontsize=11)
     ax_pr.set_title('Precision-Recall Curve (Test Set)', fontsize=13)
@@ -2582,6 +2692,7 @@ def print_test_metrics_with_ci(
     ax_pr.set_xlim([0.0, 1.0])
     ax_pr.set_ylim([0.0, 1.02])
     ax_pr.grid(alpha=0.3)
+    _add_panel_label(ax_pr, '(B)')
     plt.tight_layout()
     save_figure(fig_pr, 'pr_curve.png')
     plt.show()

@@ -9,6 +9,15 @@ from IPython.display import display
 
 from kbase.config import settings
 
+AGE_SUBGROUP_TABLE_LABELS = {
+    "Youth": "Youth (15–24 years)",
+    "Young Adults": "Young Adults (25–44 years)",
+    "Middle-aged Adults": "Middle-aged Adults (45–59 years)",
+    "Elderly": "Elderly (60–74 years)",
+    "Seniors": "Seniors (≥75 years)",
+}
+
+
 def evaluate_diagnostic_performance(
     df, y_real_col, y_pred_col,
     sex_group=False, age_group=False, triage_group=False,
@@ -326,9 +335,14 @@ def evaluate_diagnostic_performance(
 
     display_rows = []
     for _, row in results_df.iterrows():
+        subgroup_label = row["Subgroup"]
+        if age_group:
+            subgroup_label = AGE_SUBGROUP_TABLE_LABELS.get(
+                subgroup_label, subgroup_label
+            )
         d = {
             "Triage Group": row["Triage Group"],
-            "Subgroup":     row["Subgroup"],
+            "Subgroup":     subgroup_label,
         }
         for m in _METRIC_COLS:
             d[f"{m} (%)"] = _fmt(row, m)
