@@ -1620,9 +1620,11 @@ def optimize_clinical_threshold(
 def _fit_calibration_logreg(y, p, eps=1e-6, max_iter=100, tol=1e-10):
     """
     Cox calibration regression: fits y ~ logit(p) by unregularized logistic
-    regression (Newton-Raphson / IRLS) and returns the calibration intercept
-    (calibration-in-the-large, ideal=0) and slope (ideal=1), each with a 95%
-    Wald CI derived from the observed Fisher information at convergence.
+    regression (Newton-Raphson / IRLS) and returns the intercept with a freely
+    estimated slope and the calibration slope (ideal=1), each with a 95% Wald
+    CI derived from the observed Fisher information at convergence. This
+    intercept is calibration at logit(p)=0 (p=0.5), not
+    calibration-in-the-large, because the slope is not fixed at 1.
 
     Implemented manually (no statsmodels dependency) since this only needs a
     2-parameter (intercept + slope) unregularized logistic fit.
@@ -1663,12 +1665,60 @@ def _fit_calibration_logreg(y, p, eps=1e-6, max_iter=100, tol=1e-10):
         "slope_ci_hi": slope + z * se_slope,
     }
 
+
+def _fit_calibration_in_the_large(y, p, eps=1e-6, max_iter=100, tol=1e-10):
+    """Fit calibration-in-the-large with the prediction logit as an offset.
+
+    Fits ``P(y=1) = expit(a + logit(p))`` by Newton-Raphson, so the
+    calibration slope is fixed at 1. Returns the CITL estimate (ideal=0), its
+    95% Wald confidence interval, and the observed/expected event ratio.
+    """
+    p = np.asarray(p, dtype=float)
+    p_clipped = np.clip(p, eps, 1 - eps)
+    logit_p = np.log(p_clipped / (1 - p_clipped))
+    y = np.asarray(y, dtype=float)
+
+    intercept = 0.0
+    for _ in range(max_iter):
+        linear_predictor = intercept + logit_p
+        mu = 1.0 / (1.0 + np.exp(-linear_predictor))
+        information = np.sum(mu * (1 - mu))
+        if information <= 0:
+            break
+        delta = np.sum(y - mu) / information
+        intercept = intercept + delta
+        if abs(delta) < tol:
+            break
+
+    linear_predictor = intercept + logit_p
+    mu = 1.0 / (1.0 + np.exp(-linear_predictor))
+    information = np.sum(mu * (1 - mu))
+    se = 1.0 / np.sqrt(information)
+    z = 1.959963984540054  # 97.5th percentile of N(0, 1)
+
+    return {
+        "citl": intercept,
+        "citl_ci_lo": intercept - z * se,
+        "citl_ci_hi": intercept + z * se,
+        "oe_ratio": np.mean(y) / np.mean(p),
+    }
+
+
+def _calculate_calibration_metrics(y, p):
+    """Collect probability calibration metrics for one dataset."""
+    return {
+        "n": len(y),
+        "brier": brier_score_loss(y, p),
+        **_fit_calibration_in_the_large(y, p),
+        **_fit_calibration_logreg(y, p),
+    }
+
 def plot_calibration(
     y_train, y_train_prob,
     y_test,  y_test_prob,
     threshold: float,
     n_bins: int = 15,
-) -> None:
+) -> dict:
     """
     Two-panel calibration figure:
       Left  — predicted probability distributions by class (train vs test).
@@ -1685,13 +1735,13 @@ def plot_calibration(
     # --- Left: probability distributions by class ---
     ax = axes[0]
     ax.hist(y_train_prob[y_train == 0], bins=80, alpha=0.5, color='steelblue',
-            density=True, label='Negative (train)')
+            density=True, label='Non-P1 (train)')
     ax.hist(y_train_prob[y_train == 1], bins=80, alpha=0.5, color='red',
-            density=True, label='Positive (train)')
+            density=True, label='Real P1 (train)')
     ax.hist(y_test_prob[y_test == 0],   bins=80, alpha=0.3, color='navy',
-            density=True, label='Negative (test)', linestyle='--')
+            density=True, label='Non-P1 (test)', linestyle='--')
     ax.hist(y_test_prob[y_test == 1],   bins=80, alpha=0.3, color='darkred',
-            density=True, label='Positive (test)', linestyle='--')
+            density=True, label='Real P1 (test)', linestyle='--')
     ax.axvline(threshold, color='black', linestyle='--', linewidth=1.5,
                label=f'Threshold = {threshold:.4f}')
     ax.set_title('Predicted probability distribution\n(train vs test)')
@@ -1716,27 +1766,23 @@ def plot_calibration(
              label='Perfect calibration')
     ax2.axvline(threshold, color='black', linestyle='--', linewidth=1.5,
                 label=f'Threshold = {threshold:.4f}')
-    ax2.set_title('Calibration curve\n(are predicted probabilities reliable?)')
+    ax2.set_title('Calibration curve\n(predicted vs observed proportion of real P1)')
     ax2.set_xlabel('Mean predicted probability')
     ax2.set_ylabel('Fraction of positives')
     ax2.legend(fontsize=8, loc='upper left')
     ax2.grid(alpha=0.3)
     _add_panel_label(ax2, '(B)')
 
-    # --- Quantitative calibration metrics: Brier score + Cox calibration ---
-    # regression (intercept = calibration-in-the-large, ideal 0; slope =
-    # calibration slope, ideal 1), fit on logit(predicted probability).
-    brier_train = brier_score_loss(y_train, y_train_prob)
-    brier_test = brier_score_loss(y_test, y_test_prob)
-    calib_train = _fit_calibration_logreg(y_train, y_train_prob)
-    calib_test = _fit_calibration_logreg(y_test, y_test_prob)
+    # --- Quantitative calibration metrics ---
+    calib_train = _calculate_calibration_metrics(y_train, y_train_prob)
+    calib_test = _calculate_calibration_metrics(y_test, y_test_prob)
 
     ax2.annotate(
         f"Test set (N={len(y_test)})\n"
-        f"Brier = {brier_test:.4f}\n"
-        f"Intercept = {_format_decimal_half_up(calib_test['intercept'], 3, 4)} "
-        f"[{_format_decimal_half_up(calib_test['intercept_ci_lo'], 3, 4)}, "
-        f"{_format_decimal_half_up(calib_test['intercept_ci_hi'], 3, 4)}]\n"
+        f"Brier = {calib_test['brier']:.4f}\n"
+        f"CITL = {_format_decimal_half_up(calib_test['citl'], 3, 4)} "
+        f"[{_format_decimal_half_up(calib_test['citl_ci_lo'], 3, 4)}, "
+        f"{_format_decimal_half_up(calib_test['citl_ci_hi'], 3, 4)}]\n"
         f"Slope = {_format_decimal_half_up(calib_test['slope'], 3, 4)} "
         f"[{_format_decimal_half_up(calib_test['slope_ci_lo'], 3, 4)}, "
         f"{_format_decimal_half_up(calib_test['slope_ci_hi'], 3, 4)}]",
@@ -1748,37 +1794,57 @@ def plot_calibration(
     save_figure(fig, 'calibration_curve.png')
     plt.show()
 
-    overestimation = calib_test['slope'] < 1 and calib_test['intercept'] < 0
     print("\n=== CALIBRATION METRICS (logit-scale Cox regression) ===")
-    print(f"Brier score  -> train: {brier_train:.4f}  |  test: {brier_test:.4f}  "
-          f"(diff = {brier_test - brier_train:+.4f}; higher test Brier suggests "
+    print(f"Brier score  -> train: {calib_train['brier']:.4f}  |  test: {calib_test['brier']:.4f}  "
+          f"(diff = {calib_test['brier'] - calib_train['brier']:+.4f}; higher test Brier suggests "
           f"calibration overfit)")
     print("-" * 60)
     print(f"Test set (N={len(y_test)}):")
-    print(f"  Calibration intercept (calibration-in-the-large, ideal = 0): "
-          f"{calib_test['intercept']:.4f}  "
-          f"[95% CI {calib_test['intercept_ci_lo']:.4f}, {calib_test['intercept_ci_hi']:.4f}]")
+    print(f"  Brier score:                                             {calib_test['brier']:.4f}")
+    print(f"  CITL                    (ideal = 0):                     "
+          f"{calib_test['citl']:.4f}  "
+          f"[95% CI {calib_test['citl_ci_lo']:.4f}, {calib_test['citl_ci_hi']:.4f}]")
+    print(f"  O/E ratio               (ideal = 1):                     "
+          f"{calib_test['oe_ratio']:.4f}")
     print(f"  Calibration slope     (ideal = 1):                           "
           f"{calib_test['slope']:.4f}  "
           f"[95% CI {calib_test['slope_ci_lo']:.4f}, {calib_test['slope_ci_hi']:.4f}]")
+    print(f"  Intercept (slope-free model, secondary):                 "
+          f"{calib_test['intercept']:.4f}  "
+          f"[95% CI {calib_test['intercept_ci_lo']:.4f}, {calib_test['intercept_ci_hi']:.4f}]")
     print(f"Train set (N={len(y_train)}, reference for overfitting check):")
-    print(f"  Calibration intercept: {calib_train['intercept']:.4f}  "
-          f"[95% CI {calib_train['intercept_ci_lo']:.4f}, {calib_train['intercept_ci_hi']:.4f}]")
-    print(f"  Calibration slope:     {calib_train['slope']:.4f}  "
+    print(f"  Brier score:                                             {calib_train['brier']:.4f}")
+    print(f"  CITL                    (ideal = 0):                     "
+          f"{calib_train['citl']:.4f}  "
+          f"[95% CI {calib_train['citl_ci_lo']:.4f}, {calib_train['citl_ci_hi']:.4f}]")
+    print(f"  O/E ratio               (ideal = 1):                     "
+          f"{calib_train['oe_ratio']:.4f}")
+    print(f"  Calibration slope       (ideal = 1):                     "
+          f"{calib_train['slope']:.4f}  "
           f"[95% CI {calib_train['slope_ci_lo']:.4f}, {calib_train['slope_ci_hi']:.4f}]")
+    print(f"  Intercept (slope-free model, secondary):                 "
+          f"{calib_train['intercept']:.4f}  "
+          f"[95% CI {calib_train['intercept_ci_lo']:.4f}, {calib_train['intercept_ci_hi']:.4f}]")
     print("-" * 60)
-    if overestimation:
-        print("Interpretation: test slope < 1 with intercept < 0 -> the model "
-              "systematically OVERESTIMATES P(P1) (predicted probabilities are "
-              "too extreme/high relative to observed frequencies), consistent "
-              "with the reliability curve falling below the diagonal.")
-    elif calib_test['slope'] < 1:
-        print("Interpretation: test slope < 1 -> predicted probabilities are "
-              "too extreme (overconfident) at the tails, but the intercept "
-              "does not indicate a clear systematic over/under-estimation.")
+    if calib_test['citl_ci_lo'] <= 0 <= calib_test['citl_ci_hi']:
+        print("Interpretation (mean calibration): the CITL 95% CI includes the "
+              "ideal value 0; no clear mean over- or underestimation.")
+    elif calib_test['citl'] < 0:
+        print("Interpretation (mean calibration): CITL < 0 -> the model "
+              "overestimates the event probability on average.")
     else:
-        print("Interpretation: slope >= 1 and/or intercept >= 0 -> no clear "
-              "systematic overestimation pattern detected on the test set.")
+        print("Interpretation (mean calibration): CITL > 0 -> the model "
+              "underestimates the event probability on average.")
+
+    if calib_test['slope_ci_lo'] <= 1 <= calib_test['slope_ci_hi']:
+        print("Interpretation (extremity): the slope 95% CI includes the ideal "
+              "value 1; no clear departure from ideal extremity.")
+    elif calib_test['slope'] < 1:
+        print("Interpretation (extremity): slope < 1 -> predictions are too extreme.")
+    else:
+        print("Interpretation (extremity): slope > 1 -> predictions are too moderate.")
+
+    return {"train": calib_train, "test": calib_test}
 
 
 # ===============================================================
@@ -4281,7 +4347,15 @@ def run_binary_automl_model(
 
     # Calibration plot
     if plot_calibration_curve:
-        plot_calibration(y_train, y_train_prob, y_test, y_test_prob, threshold=best_threshold)
+        calibration_metrics = plot_calibration(
+            y_train, y_train_prob, y_test, y_test_prob,
+            threshold=best_threshold,
+        )
+    else:
+        calibration_metrics = {
+            "train": _calculate_calibration_metrics(y_train, y_train_prob),
+            "test": _calculate_calibration_metrics(y_test, y_test_prob),
+        }
 
     # Operational safety zones (SA-ROC)
     if plot_sa_roc_curve:
@@ -4514,6 +4588,7 @@ def run_binary_automl_model(
     return ModelingResult({
         "automl": automl,
         "metrics": metrics,
+        "calibration": calibration_metrics,
         "threshold": best_threshold,
         "search_iterations": getattr(automl, "search_iterations_", None),
         "search_elapsed_time": getattr(automl, "search_elapsed_time_", None),
