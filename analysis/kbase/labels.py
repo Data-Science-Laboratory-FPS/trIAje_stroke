@@ -66,6 +66,35 @@ TRIAGE_LABELS_BY_DEMAND = {
     "cardiac_arrest": {},
 }
 
+# Manual fixes for labels that were misspelled, concatenated or in Spanish (validated 2026-10-08). Toxicos and Otherquiru pending clinical confirmation.
+LABEL_OVERRIDES = {
+    "hist_1_7_toxicos": "Substance Use",
+    "hist_2_3_polimedicado": "Polypharmacy",
+    "hist_3_7_sincope": "Syncope",
+    "hist_4_4_etev": "Venous Thromboembolism",
+    "hist_7_2_other_inmunodepressive": "Other Immunodepressive",
+    "hist_3_4_peripheral_vasc": "Peripheral Vascular",
+    "hist_3_5_chronicaortic": "Chronic Aortic",
+    "hist_3_6_othercardiovascular": "Other Cardiovascular",
+    "hist_4_5_respiratoryfailure": "Respiratory Failure",
+    "hist_5_4_neurochronic": "Chronic Neurological",
+    "hist_6_6_renalchronic": "Chronic Renal",
+    "hist_7_1_otherquiru": "Other Surgical",
+    "hist_7_4_otherinfec": "Other Infectious",
+    "hist_7_5_othertrauma": "Other Trauma",
+    "hist_8_mentalhealth": "Mental Health",
+    "hist_10_11_pain_chronic": "Chronic Pain",
+    "hist_4_1_copd": "COPD",
+    "atc_group_nsaids": "NSAIDs",
+    "atc_group_ace_inhibitors_and_arbs": "ACE Inhibitors And ARBs",
+    "atc_group_drugs_for_peptic_ulcer_and_gerd": "Drugs For Peptic Ulcer And GERD",
+    "atc_group_psychostimulants_adhd_and_nootropics": "Psychostimulants ADHD And Nootropics",
+    "atc_group_oral_antidiabetic_drugs_excl_insulins": "Oral Antidiabetic Drugs Excl. Insulins",
+    "atc_group_other_urologicals_incl_antispasmodics": "Other Urologicals Incl. Antispasmodics",
+    "lr_fragility_social_telecare": "Frailty Social Telecare",
+    "lr_fragility_baseline_dependency": "Frailty Baseline Dependency",
+}
+
 
 def resolve_demand_key(demand_code):
     """Maps a demand_code (int, list/tuple of ints, or None) to a TRIAGE_LABELS_BY_DEMAND key."""
@@ -119,6 +148,19 @@ def get_labels_map(demand_code=None, columns=None) -> dict:
             for col in columns:
                 if col.startswith(prefix) and col not in labels:
                     labels[col] = label_fn(col, prefix)
+
+    available_columns = None if columns is None else set(columns)
+    overrides = dict(LABEL_OVERRIDES)
+    overrides.update({
+        key.replace("hist_", "com_", 1): label
+        for key, label in LABEL_OVERRIDES.items()
+        if key.startswith("hist_")
+    })
+    labels.update({
+        key: label
+        for key, label in overrides.items()
+        if available_columns is None or key in available_columns
+    })
 
     return labels
 
